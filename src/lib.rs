@@ -11,6 +11,12 @@ use molecule::Molecule;
 
 pub type DisplayColor = [f32; 4];
 
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct NamedSelectionStyle {
+    pub color: Option<DisplayColor>,
+    pub visibility: VisibilityOverride,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ColoringMode {
     #[default]
@@ -83,10 +89,12 @@ pub struct DisplayState {
     pub coloring_mode: ColoringMode,
     pub uniform_color: DisplayColor,
     base_colors: Vec<DisplayColor>,
+    named_colors: Vec<Option<DisplayColor>>,
     chain_colors: Vec<Option<DisplayColor>>,
     residue_colors: Vec<Option<DisplayColor>>,
     atom_colors: Vec<Option<DisplayColor>>,
     chain_visibility: Vec<VisibilityOverride>,
+    named_visibility: Vec<VisibilityOverride>,
     residue_visibility: Vec<VisibilityOverride>,
     atom_visibility: Vec<VisibilityOverride>,
 }
@@ -113,10 +121,12 @@ impl DisplayState {
             coloring_mode: ColoringMode::Element,
             uniform_color: [0.55, 0.67, 0.82, 1.0],
             base_colors,
+            named_colors: vec![None; atom_count],
             chain_colors: vec![None; atom_count],
             residue_colors: vec![None; atom_count],
             atom_colors: vec![None; atom_count],
             chain_visibility: vec![VisibilityOverride::Inherit; atom_count],
+            named_visibility: vec![VisibilityOverride::Inherit; atom_count],
             residue_visibility: vec![VisibilityOverride::Inherit; atom_count],
             atom_visibility: vec![VisibilityOverride::Inherit; atom_count],
         }
@@ -152,6 +162,29 @@ impl DisplayState {
             self.base_colors = vec![self.uniform_color; molecule.atoms.len()];
             self.recompute_colors();
         }
+    }
+
+    /// Rebuilds named-selection layers in the supplied deterministic order.
+    /// Hierarchy overrides remain higher priority than these parent-level layers.
+    pub fn replace_named_layers(&mut self, layers: &[(Vec<usize>, NamedSelectionStyle)]) {
+        self.named_colors.fill(None);
+        self.named_visibility.fill(VisibilityOverride::Inherit);
+        for (indices, style) in layers {
+            for &index in indices {
+                if let Some(value) = self.named_colors.get_mut(index)
+                    && let Some(color) = style.color
+                {
+                    *value = Some(opaque(color));
+                }
+                if let Some(value) = self.named_visibility.get_mut(index)
+                    && style.visibility != VisibilityOverride::Inherit
+                {
+                    *value = style.visibility;
+                }
+            }
+        }
+        self.recompute_colors();
+        self.recompute_visibility();
     }
 
     pub fn set_color_override(
@@ -225,6 +258,12 @@ impl DisplayState {
             .get(atom_index)
             .copied()
             .unwrap_or([0.5, 0.5, 0.5, 1.0]);
+        let base = self
+            .named_colors
+            .get(atom_index)
+            .copied()
+            .flatten()
+            .unwrap_or(base);
         let chain = self
             .chain_colors
             .get(atom_index)
@@ -329,6 +368,7 @@ impl DisplayState {
             self.colors[index] = self.atom_colors[index]
                 .or(self.residue_colors[index])
                 .or(self.chain_colors[index])
+                .or(self.named_colors[index])
                 .unwrap_or(self.base_colors[index]);
         }
     }
@@ -339,6 +379,12 @@ impl DisplayState {
             .get(atom_index)
             .copied()
             .unwrap_or([0.5, 0.5, 0.5, 1.0]);
+        let base = self
+            .named_colors
+            .get(atom_index)
+            .copied()
+            .flatten()
+            .unwrap_or(base);
         match level {
             DisplayLevel::Chain => base,
             DisplayLevel::Residue => self
@@ -360,6 +406,7 @@ impl DisplayState {
     fn recompute_visibility(&mut self) {
         for index in 0..self.visible.len() {
             let state = [
+                self.named_visibility[index],
                 self.chain_visibility[index],
                 self.residue_visibility[index],
                 self.atom_visibility[index],
@@ -570,5 +617,28 @@ mod display_tests {
         display.set_color_override(&[0, 1], DisplayLevel::Chain, Some(color));
         display.set_color_overrides_forced(&[(vec![0], DisplayLevel::Atom, color)]);
         assert!(display.color_is_overridden(0, DisplayLevel::Atom));
+    }
+
+    #[test]
+    fn hierarchy_children_override_named_selection_style() {
+        let molecule = molecule();
+        let mut display = DisplayState::for_molecule(&molecule);
+        let named_color = [0.8, 0.2, 0.6, 1.0];
+        display.replace_named_layers(&[(
+            vec![0, 1],
+            NamedSelectionStyle {
+                color: Some(named_color),
+                visibility: VisibilityOverride::Hide,
+            },
+        )]);
+        assert_eq!(display.colors, vec![named_color; 2]);
+        assert_eq!(display.visible, vec![false, false]);
+
+        let child_color = [0.1, 0.9, 0.2, 1.0];
+        display.set_color_override(&[0], DisplayLevel::Atom, Some(child_color));
+        display.set_visibility_override(&[0], DisplayLevel::Atom, VisibilityOverride::Show);
+        assert_eq!(display.colors[0], child_color);
+        assert!(display.visible[0]);
+        assert!(!display.visible[1]);
     }
 }

@@ -17,7 +17,7 @@ instancing with a small egui interface.
 - Click-to-pick atoms with atom/residue/chain property inspection
 - Chain → residue → atom hierarchy with independent selection/expansion controls
 - Hierarchical HSV color overrides and inherited tri-state visibility controls
-- Named selections that can be reactivated, deleted, and reused in expressions
+- Named selections with color/visibility attributes and a preserved internal hierarchy
 - Camera panel with clipping and thin-lens optical bokeh controls
 - Element/CPK, chain, residue, residue-type, B-factor, and uniform color schemes
 - Native open dialog, command-line path, and `.pdb` drag-and-drop
@@ -106,10 +106,15 @@ color square or eye of any selected row applies the new value to the whole set.
 Right-click either attribute for **Reset to default** or **Set to children**. The
 latter recursively forces the row's effective value onto its residues and atoms.
 
+Named selections use the same color square, visibility eye, reset, and propagation
+controls. Expanding one shows only its selected atoms while preserving their
+chain → residue → atom hierarchy. A named-selection style is a parent layer, so
+explicit chain, residue, and atom overrides still take priority.
+
 ## Selection language
 
-Keywords are ASCII case-insensitive. `not` binds most tightly, then `and`, then
-`or`; parentheses override precedence.
+Keywords are ASCII case-insensitive. Boolean precedence is `not`, `and`, `xor`,
+then `or`; parentheses override precedence.
 
 ```text
 all                     none
@@ -122,9 +127,19 @@ selection active_site
 
 not <expression>
 <expression> and <expression>
+<expression> xor <expression>
 <expression> or <expression>
 (<expression>)
+
+Chain A/LEU*                 residue-name wildcard
+Chain B/[20:22, 70:71]       residue list and inclusive ranges
+Chain A/LEU*/C*              optional atom-name wildcard
+../LEU* AND [20:30, 45:50]   combine masks and residue ranges
 ```
+
+Path masks are case-insensitive. `*` matches any sequence, `?` matches one
+character, and `..` means any chain. Commas inside `[]` do not conflict with the
+colon separating a named selection from its expression.
 
 ## Commands
 
@@ -132,7 +147,7 @@ Selection expressions and commands are separate typed parsers:
 
 ```text
 select <expression>
-select <name>, <expression>
+select <name>: <expression>
 color <name-or-#RRGGBB>, <expression>
 show spheres|sticks, <expression>
 hide spheres|sticks, <expression>
@@ -142,7 +157,10 @@ Try these with `examples/minimal.pdb`:
 
 ```text
 select chain A and resi 1-2
-select active_site, chain A and resi 1-2
+select active_site: chain A and resi 1-2
+select leucines: Chain A/LEU*
+select loops: Chain B/[20:22, 70:71]
+select leucine_loops: ../LEU* AND [20:30, 45:50]
 color magenta, selection active_site
 select hetatm and not element H
 color red, element O
@@ -154,6 +172,10 @@ hide sticks, chain B
 
 Named colors currently include red, green, blue, yellow, orange, magenta, cyan,
 white, and gray/grey.
+
+The legacy comma form for named selections remains accepted. Right-click a named
+selection in the manager and choose **Edit expression** to reevaluate it while
+keeping its color and visibility settings.
 
 ## Architecture
 

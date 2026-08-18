@@ -1,7 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use molview::{
-    ColoringMode, DisplayColor, DisplayLevel, DisplayState, VisibilityOverride,
+    ColoringMode, DisplayColor, DisplayLevel, DisplayState, NamedSelectionStyle,
+    VisibilityOverride,
     camera::OrbitCamera,
     molecule::{Atom, Molecule, MoleculeHierarchy, ResidueGroup},
     selection::Selection,
@@ -16,6 +17,8 @@ pub struct UiState {
     camera_open: bool,
     coloring_open: bool,
     color_editor: Option<ColorEditor>,
+    named_color_editor: Option<NamedColorEditor>,
+    named_expression_editor: Option<NamedExpressionEditor>,
     focus_kind: FocusKind,
     focus_chain: String,
     focus_residue_number: String,
@@ -28,6 +31,18 @@ struct ColorEditor {
     targets: Vec<InspectionTarget>,
     label: String,
     hsva: egui::ecolor::Hsva,
+}
+
+#[derive(Debug, Clone)]
+struct NamedColorEditor {
+    name: String,
+    hsva: egui::ecolor::Hsva,
+}
+
+#[derive(Debug, Clone)]
+struct NamedExpressionEditor {
+    name: String,
+    expression: String,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -107,9 +122,33 @@ pub enum ManagerAction {
     },
     PropagateColor(Vec<InspectionTarget>),
     PropagateVisibility(Vec<InspectionTarget>),
+    SetNamedColor {
+        name: String,
+        color: Option<DisplayColor>,
+    },
+    SetNamedVisibility {
+        name: String,
+        state: VisibilityOverride,
+    },
+    PropagateNamedColor {
+        name: String,
+        color: DisplayColor,
+    },
+    PropagateNamedVisibility {
+        name: String,
+        state: VisibilityOverride,
+    },
+    SelectNamedSubset {
+        indices: Vec<usize>,
+        inspection: InspectionTarget,
+    },
     SetColoringMode(ColoringMode),
     SetUniformColor(DisplayColor),
     ActivateNamed(String),
+    UpdateNamedExpression {
+        name: String,
+        expression: String,
+    },
     RemoveNamed(String),
 }
 
@@ -152,6 +191,8 @@ pub struct UiInfo<'a> {
     pub hierarchy: Option<&'a MoleculeHierarchy>,
     pub display: Option<&'a DisplayState>,
     pub named_selections: &'a BTreeMap<String, Selection>,
+    pub named_selection_expressions: &'a BTreeMap<String, String>,
+    pub named_selection_styles: &'a BTreeMap<String, NamedSelectionStyle>,
     pub inspection: Option<InspectionTarget>,
     pub hierarchy_selection: &'a BTreeSet<InspectionTarget>,
     pub camera: &'a OrbitCamera,
@@ -194,7 +235,13 @@ impl UiState {
                     ui.colored_label(egui::Color32::from_rgb(245, 95, 95), error);
                 }
                 ui.separator();
-                named_selections(ui, info.named_selections, &mut actions);
+                named_selections(
+                    ui,
+                    info,
+                    &mut actions,
+                    &mut self.named_color_editor,
+                    &mut self.named_expression_editor,
+                );
                 ui.separator();
                 egui::ScrollArea::vertical()
                     .id_salt("molecule hierarchy scroll")
@@ -210,6 +257,8 @@ impl UiState {
         self.camera_window(root.ctx(), info, &mut actions);
         self.coloring_window(root.ctx(), info, &mut actions);
         self.color_editor_window(root.ctx(), &mut actions);
+        self.named_color_editor_window(root.ctx(), &mut actions);
+        self.named_expression_editor_window(root.ctx(), &mut actions);
         actions.viewport = root.available_rect_before_wrap();
         actions
     }
@@ -509,11 +558,82 @@ impl UiState {
         }
     }
 
+    fn named_color_editor_window(&mut self, context: &egui::Context, actions: &mut UiActions) {
+        let Some(mut editor) = self.named_color_editor.take() else {
+            return;
+        };
+        let mut open = true;
+        let mut restore_default = false;
+        egui::Window::new(format!("HSV color · selection {}", editor.name))
+            .id(egui::Id::new("named selection HSV color editor"))
+            .open(&mut open)
+            .resizable(false)
+            .show(context, |ui| {
+                if egui::color_picker::color_picker_hsva_2d(
+                    ui,
+                    &mut editor.hsva,
+                    egui::color_picker::Alpha::Opaque,
+                ) {
+                    actions.manager = Some(ManagerAction::SetNamedColor {
+                        name: editor.name.clone(),
+                        color: Some(color_from_hsva(editor.hsva)),
+                    });
+                }
+                if ui.button("Default").clicked() {
+                    restore_default = true;
+                }
+            });
+        if restore_default {
+            actions.manager = Some(ManagerAction::SetNamedColor {
+                name: editor.name,
+                color: None,
+            });
+        } else if open {
+            self.named_color_editor = Some(editor);
+        }
+    }
+
+    fn named_expression_editor_window(&mut self, context: &egui::Context, actions: &mut UiActions) {
+        let Some(mut editor) = self.named_expression_editor.take() else {
+            return;
+        };
+        let mut open = true;
+        let mut close = false;
+        egui::Window::new(format!("Edit expression · {}", editor.name))
+            .id(egui::Id::new("named selection expression editor"))
+            .open(&mut open)
+            .default_width(440.0)
+            .resizable(true)
+            .show(context, |ui| {
+                ui.label("Selection expression");
+                ui.add(
+                    egui::TextEdit::multiline(&mut editor.expression)
+                        .desired_rows(3)
+                        .desired_width(f32::INFINITY),
+                );
+                ui.small("Operators: NOT, AND, XOR, OR");
+                ui.horizontal(|ui| {
+                    if ui.button("Apply").clicked() {
+                        actions.manager = Some(ManagerAction::UpdateNamedExpression {
+                            name: editor.name.clone(),
+                            expression: editor.expression.trim().to_string(),
+                        });
+                    }
+                    if ui.button("Close").clicked() {
+                        close = true;
+                    }
+                });
+            });
+        if open && !close {
+            self.named_expression_editor = Some(editor);
+        }
+    }
+
     fn command_editor(&mut self, ui: &mut egui::Ui, actions: &mut UiActions) {
         ui.heading("Selection / Command");
         let response = ui.add(
             egui::TextEdit::singleline(&mut self.command_input)
-                .hint_text("select active_site, chain A")
+                .hint_text("select active_site: Chain A/LEU*")
                 .desired_width(f32::INFINITY),
         );
         let enter =
@@ -603,27 +723,274 @@ fn focus_chain_number_fields(ui: &mut egui::Ui, chain: &mut String, residue_numb
 
 fn named_selections(
     ui: &mut egui::Ui,
-    selections: &BTreeMap<String, Selection>,
+    info: UiInfo<'_>,
     actions: &mut UiActions,
+    color_editor: &mut Option<NamedColorEditor>,
+    expression_editor: &mut Option<NamedExpressionEditor>,
 ) {
     ui.heading("Named selections");
-    if selections.is_empty() {
-        ui.weak("Create with: select name, expression");
+    if info.named_selections.is_empty() {
+        ui.weak("Create with: select name: Chain A/LEU*");
         return;
     }
-    for (name, selection) in selections {
-        ui.horizontal(|ui| {
-            let label = format!("{name}  ({})", selection.count());
-            if ui.selectable_label(false, label).clicked() {
-                actions.manager = Some(ManagerAction::ActivateNamed(name.clone()));
-            }
-            if ui
-                .small_button("×")
-                .on_hover_text("Remove selection")
-                .clicked()
-            {
-                actions.manager = Some(ManagerAction::RemoveNamed(name.clone()));
-            }
+    let (Some(molecule), Some(hierarchy), Some(display)) =
+        (info.molecule, info.hierarchy, info.display)
+    else {
+        return;
+    };
+    for (name, selection) in info.named_selections {
+        let indices: Vec<_> = selection.indices().collect();
+        let Some(first_atom) = indices.first().copied() else {
+            ui.horizontal(|ui| {
+                let response = ui.weak(format!("{name}  (empty)"));
+                named_expression_menu(
+                    response,
+                    name,
+                    info.named_selection_expressions.get(name),
+                    expression_editor,
+                );
+                if ui.small_button("×").clicked() {
+                    actions.manager = Some(ManagerAction::RemoveNamed(name.clone()));
+                }
+            });
+            continue;
+        };
+        let style = info
+            .named_selection_styles
+            .get(name)
+            .copied()
+            .unwrap_or_default();
+        let color = style.color.unwrap_or_else(|| {
+            display
+                .colors
+                .get(first_atom)
+                .copied()
+                .unwrap_or([0.5, 0.5, 0.5, 1.0])
+        });
+        let state = egui::collapsing_header::CollapsingState::load_with_default_open(
+            ui.ctx(),
+            ui.make_persistent_id(("named selection", name)),
+            false,
+        );
+        state
+            .show_header(ui, |ui| {
+                let color_response = color_square(ui, color, style.color.is_some())
+                    .on_hover_text("Named selection color");
+                color_response.context_menu(|ui| {
+                    if ui.button("Reset to default").clicked() {
+                        actions.manager = Some(ManagerAction::SetNamedColor {
+                            name: name.clone(),
+                            color: None,
+                        });
+                        ui.close();
+                    }
+                    if ui.button("Set to children").clicked() {
+                        actions.manager = Some(ManagerAction::PropagateNamedColor {
+                            name: name.clone(),
+                            color,
+                        });
+                        ui.close();
+                    }
+                });
+                if color_response.clicked() {
+                    *color_editor = Some(NamedColorEditor {
+                        name: name.clone(),
+                        hsva: hsva_from_color(color),
+                    });
+                }
+
+                let visibility_response = visibility_button(ui, style.visibility);
+                visibility_response.context_menu(|ui| {
+                    if ui.button("Reset to default").clicked() {
+                        actions.manager = Some(ManagerAction::SetNamedVisibility {
+                            name: name.clone(),
+                            state: VisibilityOverride::Inherit,
+                        });
+                        ui.close();
+                    }
+                    if ui.button("Set to children").clicked() {
+                        let effective = match style.visibility {
+                            VisibilityOverride::Inherit => {
+                                if display.visible.get(first_atom).copied().unwrap_or(true) {
+                                    VisibilityOverride::Show
+                                } else {
+                                    VisibilityOverride::Hide
+                                }
+                            }
+                            state => state,
+                        };
+                        actions.manager = Some(ManagerAction::PropagateNamedVisibility {
+                            name: name.clone(),
+                            state: effective,
+                        });
+                        ui.close();
+                    }
+                });
+                if visibility_response.clicked() {
+                    actions.manager = Some(ManagerAction::SetNamedVisibility {
+                        name: name.clone(),
+                        state: style.visibility.next(),
+                    });
+                }
+
+                let label = format!("{name}  ({})", selection.count());
+                let name_response = ui
+                    .selectable_label(false, label)
+                    .on_hover_text("Activate selection · right-click to edit expression");
+                if name_response.clicked() {
+                    actions.manager = Some(ManagerAction::ActivateNamed(name.clone()));
+                }
+                named_expression_menu(
+                    name_response,
+                    name,
+                    info.named_selection_expressions.get(name),
+                    expression_editor,
+                );
+                if ui
+                    .small_button("×")
+                    .on_hover_text("Remove selection")
+                    .clicked()
+                {
+                    actions.manager = Some(ManagerAction::RemoveNamed(name.clone()));
+                }
+            })
+            .body(|ui| {
+                named_selection_hierarchy(ui, name, selection, molecule, hierarchy, info, actions);
+            });
+    }
+}
+
+fn named_expression_menu(
+    response: egui::Response,
+    name: &str,
+    expression: Option<&String>,
+    editor: &mut Option<NamedExpressionEditor>,
+) {
+    response.context_menu(|ui| {
+        if ui.button("Edit expression").clicked() {
+            *editor = Some(NamedExpressionEditor {
+                name: name.to_string(),
+                expression: expression.cloned().unwrap_or_default(),
+            });
+            ui.close();
+        }
+    });
+}
+
+fn named_selection_hierarchy(
+    ui: &mut egui::Ui,
+    selection_name: &str,
+    selection: &Selection,
+    molecule: &Molecule,
+    hierarchy: &MoleculeHierarchy,
+    info: UiInfo<'_>,
+    actions: &mut UiActions,
+) {
+    for (chain_index, chain) in hierarchy.chains.iter().enumerate() {
+        let chain_indices: Vec<_> = chain
+            .residues
+            .iter()
+            .flat_map(|residue| residue.atom_indices.iter().copied())
+            .filter(|index| selection.flags().get(*index).copied().unwrap_or(false))
+            .collect();
+        if chain_indices.is_empty() {
+            continue;
+        }
+        let target = InspectionTarget::Chain(chain_index);
+        let state = egui::collapsing_header::CollapsingState::load_with_default_open(
+            ui.ctx(),
+            ui.make_persistent_id(("named chain", selection_name, chain_index)),
+            false,
+        );
+        state
+            .show_header(ui, |ui| {
+                named_subset_label(
+                    ui,
+                    format!(
+                        "Chain {} · {} atoms",
+                        display_chain(&chain.id),
+                        chain_indices.len()
+                    ),
+                    chain_indices.clone(),
+                    target,
+                    info.inspection == Some(target),
+                    actions,
+                );
+            })
+            .body(|ui| {
+                for (residue_index, residue) in chain.residues.iter().enumerate() {
+                    let residue_indices: Vec<_> = residue
+                        .atom_indices
+                        .iter()
+                        .copied()
+                        .filter(|index| selection.flags().get(*index).copied().unwrap_or(false))
+                        .collect();
+                    if residue_indices.is_empty() {
+                        continue;
+                    }
+                    let residue_target = InspectionTarget::Residue {
+                        chain_index,
+                        residue_index,
+                    };
+                    let residue_state =
+                        egui::collapsing_header::CollapsingState::load_with_default_open(
+                            ui.ctx(),
+                            ui.make_persistent_id((
+                                "named residue",
+                                selection_name,
+                                chain_index,
+                                residue_index,
+                            )),
+                            false,
+                        );
+                    residue_state
+                        .show_header(ui, |ui| {
+                            named_subset_label(
+                                ui,
+                                format!("{} · {} atoms", residue.id.label(), residue_indices.len()),
+                                residue_indices.clone(),
+                                residue_target,
+                                info.inspection == Some(residue_target),
+                                actions,
+                            );
+                        })
+                        .body(|ui| {
+                            for &atom_index in &residue_indices {
+                                if let Some(atom) = molecule.atoms.get(atom_index) {
+                                    let target = InspectionTarget::Atom(atom_index);
+                                    named_subset_label(
+                                        ui,
+                                        format!(
+                                            "#{:<5} {:<4} · {}",
+                                            atom.serial,
+                                            atom.name,
+                                            atom.element.symbol()
+                                        ),
+                                        vec![atom_index],
+                                        target,
+                                        info.inspection == Some(target),
+                                        actions,
+                                    );
+                                }
+                            }
+                        });
+                }
+            });
+    }
+}
+
+fn named_subset_label(
+    ui: &mut egui::Ui,
+    label: String,
+    indices: Vec<usize>,
+    inspection: InspectionTarget,
+    selected: bool,
+    actions: &mut UiActions,
+) {
+    if ui.selectable_label(selected, label).clicked() {
+        actions.manager = Some(ManagerAction::SelectNamedSubset {
+            indices,
+            inspection,
         });
     }
 }

@@ -15,6 +15,7 @@ pub struct Color(pub [f32; 4]);
 pub enum Command {
     Select {
         name: Option<String>,
+        source: String,
         selection: SelectionExpr,
     },
     Color {
@@ -68,19 +69,25 @@ pub fn parse_command(input: &str) -> Result<Command, CommandError> {
                     usage: "select <expression>",
                 });
             }
-            if arguments.contains(',') {
-                let (name, selection) =
-                    comma_arguments(arguments, "select", "select <name>, <expression>")?;
+            if let Some((name, selection)) = split_named_selection(arguments) {
+                if name.is_empty() || selection.is_empty() {
+                    return Err(CommandError::InvalidShape {
+                        command: "select",
+                        usage: "select <name>: <expression>",
+                    });
+                }
                 if !valid_selection_name(name) {
                     return Err(CommandError::InvalidSelectionName(name.to_string()));
                 }
                 Ok(Command::Select {
                     name: Some(name.to_string()),
+                    source: selection.to_string(),
                     selection: parse_selection(selection)?,
                 })
             } else {
                 Ok(Command::Select {
                     name: None,
+                    source: arguments.to_string(),
                     selection: parse_selection(arguments)?,
                 })
             }
@@ -139,6 +146,31 @@ fn comma_arguments<'a>(
     Ok((first, second))
 }
 
+fn split_named_selection(arguments: &str) -> Option<(&str, &str)> {
+    split_top_level(arguments, ':').or_else(|| split_top_level(arguments, ','))
+}
+
+fn split_top_level(arguments: &str, separator: char) -> Option<(&str, &str)> {
+    let mut bracket_depth = 0_u32;
+    let mut parenthesis_depth = 0_u32;
+    for (index, character) in arguments.char_indices() {
+        match character {
+            '[' => bracket_depth += 1,
+            ']' => bracket_depth = bracket_depth.saturating_sub(1),
+            '(' if bracket_depth == 0 => parenthesis_depth += 1,
+            ')' if bracket_depth == 0 => {
+                parenthesis_depth = parenthesis_depth.saturating_sub(1);
+            }
+            value if value == separator && bracket_depth == 0 && parenthesis_depth == 0 => {
+                let (left, right) = arguments.split_at(index);
+                return Some((left.trim(), right[character.len_utf8()..].trim()));
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 fn parse_representation(value: &str) -> Result<Representation, CommandError> {
     match value.to_ascii_lowercase().as_str() {
         "spheres" => Ok(Representation::Spheres),
@@ -193,19 +225,45 @@ mod tests {
             parse_command("select chain A").unwrap(),
             Command::Select {
                 name: None,
+                source: "chain A".into(),
                 selection: SelectionExpr::Chain("A".into()),
             }
         );
         assert_eq!(
-            parse_command("select active_site, chain A and resi 10-20").unwrap(),
+            parse_command("select active_site: chain A and resi 10-20").unwrap(),
             Command::Select {
                 name: Some("active_site".into()),
+                source: "chain A and resi 10-20".into(),
                 selection: SelectionExpr::And(
                     Box::new(SelectionExpr::Chain("A".into())),
                     Box::new(SelectionExpr::ResidueRange(10, 20)),
                 ),
             }
         );
+        assert!(matches!(
+            parse_command("select leucines, Chain A/LEU*").unwrap(),
+            Command::Select {
+                name: Some(name),
+                source,
+                selection: SelectionExpr::And(_, _),
+            } if name == "leucines" && source == "Chain A/LEU*"
+        ));
+        assert!(matches!(
+            parse_command("select Chain B/[20:22, 70:71]").unwrap(),
+            Command::Select {
+                name: None,
+                source,
+                selection: SelectionExpr::And(_, _),
+            } if source == "Chain B/[20:22, 70:71]"
+        ));
+        assert!(matches!(
+            parse_command("select loops: ../LEU* AND [20:30, 45:50]").unwrap(),
+            Command::Select {
+                name: Some(name),
+                source,
+                selection: SelectionExpr::And(_, _),
+            } if name == "loops" && source == "../LEU* AND [20:30, 45:50]"
+        ));
         assert!(matches!(
             parse_command("color red, chain A and element C").unwrap(),
             Command::Color {

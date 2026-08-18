@@ -9,13 +9,14 @@ use std::{
 use anyhow::{Context, Result};
 use glam::{Vec2, Vec3};
 use molview::{
-    DisplayColor, DisplayLevel, DisplayState, RepresentationMask, VisibilityOverride,
+    DisplayColor, DisplayLevel, DisplayState, NamedSelectionStyle, RepresentationMask,
+    VisibilityOverride,
     camera::{OrbitCamera, Viewport},
     command::{Command, Representation, parse_command},
     molecule::{Molecule, MoleculeHierarchy, parse_pdb},
     picking::pick_atom_filtered,
     render::{RenderError, Renderer, SurfaceIssue},
-    selection::{Selection, evaluate_with_named},
+    selection::{Selection, evaluate_with_named, parse_selection},
 };
 use winit::{
     application::ApplicationHandler,
@@ -93,6 +94,8 @@ struct Runtime {
     hierarchy: Option<MoleculeHierarchy>,
     display: Option<DisplayState>,
     named_selections: BTreeMap<String, Selection>,
+    named_selection_expressions: BTreeMap<String, String>,
+    named_selection_styles: BTreeMap<String, NamedSelectionStyle>,
     inspection: Option<InspectionTarget>,
     hierarchy_selection: BTreeSet<InspectionTarget>,
     hierarchy_selection_anchor: Option<InspectionTarget>,
@@ -142,6 +145,8 @@ impl Runtime {
             hierarchy: None,
             display: None,
             named_selections: BTreeMap::new(),
+            named_selection_expressions: BTreeMap::new(),
+            named_selection_styles: BTreeMap::new(),
             inspection: None,
             hierarchy_selection: BTreeSet::new(),
             hierarchy_selection_anchor: None,
@@ -274,6 +279,8 @@ impl Runtime {
             hierarchy: self.hierarchy.as_ref(),
             display: self.display.as_ref(),
             named_selections: &self.named_selections,
+            named_selection_expressions: &self.named_selection_expressions,
+            named_selection_styles: &self.named_selection_styles,
             inspection: self.inspection,
             hierarchy_selection: &self.hierarchy_selection,
             camera: &self.camera,
@@ -342,6 +349,13 @@ impl Runtime {
             && let (Some(molecule), Some(display)) = (&self.molecule, &mut self.display)
         {
             display.reset_colors(molecule);
+            for style in self.named_selection_styles.values_mut() {
+                style.color = None;
+            }
+            display.replace_named_layers(&named_display_layers(
+                &self.named_selections,
+                &self.named_selection_styles,
+            ));
             self.renderer.update_instances(molecule, display);
             self.ui.latest_error = None;
         }
@@ -398,6 +412,8 @@ impl Runtime {
         self.hierarchy = Some(hierarchy);
         self.display = Some(display);
         self.named_selections.clear();
+        self.named_selection_expressions.clear();
+        self.named_selection_styles.clear();
         self.inspection = None;
         self.hierarchy_selection.clear();
         self.hierarchy_selection_anchor = None;
@@ -420,11 +436,22 @@ impl Runtime {
             anyhow::bail!("load a PDB file before executing commands");
         };
         match command {
-            Command::Select { name, selection } => {
+            Command::Select {
+                name,
+                source,
+                selection,
+            } => {
                 let selection = evaluate_with_named(&selection, molecule, &self.named_selections)?;
                 display.selection = selection.flags().to_vec();
                 if let Some(name) = name {
-                    self.named_selections.insert(name, selection);
+                    self.named_selections.insert(name.clone(), selection);
+                    self.named_selection_expressions
+                        .insert(name.clone(), source);
+                    self.named_selection_styles.entry(name.clone()).or_default();
+                    display.replace_named_layers(&named_display_layers(
+                        &self.named_selections,
+                        &self.named_selection_styles,
+                    ));
                 }
                 self.inspection = None;
                 self.hierarchy_selection.clear();
@@ -546,6 +573,43 @@ impl Runtime {
             }
             ManagerAction::PropagateColor(targets) => self.propagate_color(&targets),
             ManagerAction::PropagateVisibility(targets) => self.propagate_visibility(&targets),
+            ManagerAction::SetNamedColor { name, color } => {
+                if self.named_selections.contains_key(&name) {
+                    self.named_selection_styles.entry(name).or_default().color = color;
+                    self.rebuild_named_display_layers();
+                }
+            }
+            ManagerAction::SetNamedVisibility { name, state } => {
+                if self.named_selections.contains_key(&name) {
+                    self.named_selection_styles
+                        .entry(name)
+                        .or_default()
+                        .visibility = state;
+                    self.rebuild_named_display_layers();
+                }
+            }
+            ManagerAction::PropagateNamedColor { name, color } => {
+                let indices = self.named_selection_indices(&name);
+                if let Some(display) = &mut self.display {
+                    display.set_color_overrides_forced(&[(indices, DisplayLevel::Atom, color)]);
+                }
+                self.refresh_instances();
+            }
+            ManagerAction::PropagateNamedVisibility { name, state } => {
+                let indices = self.named_selection_indices(&name);
+                if let Some(display) = &mut self.display {
+                    display.set_visibility_override(&indices, DisplayLevel::Atom, state);
+                }
+                self.refresh_instances();
+            }
+            ManagerAction::SelectNamedSubset {
+                indices,
+                inspection,
+            } => {
+                self.hierarchy_selection.clear();
+                self.hierarchy_selection_anchor = None;
+                self.select_indices(indices, Some(inspection));
+            }
             ManagerAction::SetColoringMode(mode) => {
                 if let (Some(molecule), Some(display)) = (&self.molecule, &mut self.display) {
                     display.set_coloring_mode(molecule, mode);
@@ -565,8 +629,41 @@ impl Runtime {
                     self.set_selection(selection.flags().to_vec(), None);
                 }
             }
+            ManagerAction::UpdateNamedExpression { name, expression } => {
+                let result = (|| -> Result<()> {
+                    let molecule = self
+                        .molecule
+                        .as_ref()
+                        .context("load a PDB file before editing a selection")?;
+                    if !self.named_selections.contains_key(&name) {
+                        anyhow::bail!("named selection '{name}' does not exist");
+                    }
+                    let parsed = parse_selection(&expression)?;
+                    let selection = evaluate_with_named(&parsed, molecule, &self.named_selections)?;
+                    self.named_selections
+                        .insert(name.clone(), selection.clone());
+                    self.named_selection_expressions
+                        .insert(name.clone(), expression);
+                    self.named_selection_styles.entry(name).or_default();
+                    self.hierarchy_selection.clear();
+                    self.hierarchy_selection_anchor = None;
+                    self.inspection = None;
+                    if let Some(display) = &mut self.display {
+                        display.selection = selection.flags().to_vec();
+                    }
+                    self.rebuild_named_display_layers();
+                    Ok(())
+                })();
+                match result {
+                    Ok(()) => self.ui.latest_error = None,
+                    Err(error) => self.ui.latest_error = Some(error.to_string()),
+                }
+            }
             ManagerAction::RemoveNamed(name) => {
                 self.named_selections.remove(&name);
+                self.named_selection_expressions.remove(&name);
+                self.named_selection_styles.remove(&name);
+                self.rebuild_named_display_layers();
             }
         }
     }
@@ -588,6 +685,21 @@ impl Runtime {
             .flat_map(|target| self.display_target(target).0)
             .collect();
         self.select_indices(indices, inspection);
+    }
+
+    fn named_selection_indices(&self, name: &str) -> Vec<usize> {
+        self.named_selections
+            .get(name)
+            .map(|selection| selection.indices().collect())
+            .unwrap_or_default()
+    }
+
+    fn rebuild_named_display_layers(&mut self) {
+        let layers = named_display_layers(&self.named_selections, &self.named_selection_styles);
+        if let Some(display) = &mut self.display {
+            display.replace_named_layers(&layers);
+        }
+        self.refresh_instances();
     }
 
     fn hierarchy_range(
@@ -995,6 +1107,21 @@ fn representation_mask(representation: Representation) -> RepresentationMask {
         Representation::Spheres => RepresentationMask::SPHERES,
         Representation::Sticks => RepresentationMask::STICKS,
     }
+}
+
+fn named_display_layers(
+    selections: &BTreeMap<String, Selection>,
+    styles: &BTreeMap<String, NamedSelectionStyle>,
+) -> Vec<(Vec<usize>, NamedSelectionStyle)> {
+    selections
+        .iter()
+        .map(|(name, selection)| {
+            (
+                selection.indices().collect(),
+                styles.get(name).copied().unwrap_or_default(),
+            )
+        })
+        .collect()
 }
 
 fn update_hierarchy_selection(
