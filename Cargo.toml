@@ -1,0 +1,22 @@
+[package]
+name = "molview"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "A lightweight native molecular viewer built with Rust and wgpu"
+
+[dependencies]
+anyhow = "1"
+bytemuck = { version = "1", features = ["derive"] }
+egui = "0.36"
+egui-wgpu = "0.36"
+egui-winit = "0.36"
+glam = "0.33"
+pollster = "1"
+rfd = "0.17"
+thiserror = "2"
+wgpu = "30"
+winit = "0.30"
+
+[profile.release]
+lto = "thin"

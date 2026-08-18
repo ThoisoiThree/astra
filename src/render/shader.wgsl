@@ -1,0 +1,52 @@
+struct Camera {
+    view_projection: mat4x4<f32>,
+    eye_position: vec4<f32>,
+};
+
+@group(0) @binding(0)
+var<uniform> camera: Camera;
+
+struct VertexInput {
+    @location(0) position: vec3<f32>,
+    @location(1) normal: vec3<f32>,
+    @location(2) model_0: vec4<f32>,
+    @location(3) model_1: vec4<f32>,
+    @location(4) model_2: vec4<f32>,
+    @location(5) model_3: vec4<f32>,
+    @location(6) color: vec4<f32>,
+    @location(7) highlight: vec4<f32>,
+};
+
+struct VertexOutput {
+    @builtin(position) clip_position: vec4<f32>,
+    @location(0) world_position: vec3<f32>,
+    @location(1) normal: vec3<f32>,
+    @location(2) color: vec4<f32>,
+    @location(3) highlight: f32,
+};
+
+@vertex
+fn vertex_main(input: VertexInput) -> VertexOutput {
+    let model = mat4x4<f32>(input.model_0, input.model_1, input.model_2, input.model_3);
+    let world = model * vec4<f32>(input.position, 1.0);
+    var output: VertexOutput;
+    output.clip_position = camera.view_projection * world;
+    output.world_position = world.xyz;
+    output.normal = normalize((model * vec4<f32>(input.normal, 0.0)).xyz);
+    output.color = input.color;
+    output.highlight = input.highlight.x;
+    return output;
+}
+
+@fragment
+fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
+    let normal = normalize(input.normal);
+    let light_direction = normalize(vec3<f32>(0.35, 0.65, 0.70));
+    let diffuse = max(dot(normal, light_direction), 0.0);
+    let view_direction = normalize(camera.eye_position.xyz - input.world_position);
+    let half_vector = normalize(light_direction + view_direction);
+    let specular = pow(max(dot(normal, half_vector), 0.0), 28.0) * 0.32;
+    let selected_color = mix(input.color.rgb, vec3<f32>(1.0, 0.78, 0.08), input.highlight * 0.72);
+    let lit = selected_color * (0.28 + 0.72 * diffuse) + vec3<f32>(specular);
+    return vec4<f32>(lit, input.color.a);
+}
