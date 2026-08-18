@@ -9,9 +9,9 @@ use wgpu::util::DeviceExt;
 use winit::{dpi::PhysicalSize, window::Window};
 
 use crate::{
-    DisplayState, RepresentationMask,
+    DisplayMode, DisplayState, RepresentationMask,
     camera::{OrbitCamera, Viewport},
-    molecule::Molecule,
+    molecule::{Molecule, MoleculeHierarchy, ResidueGroup},
 };
 
 use super::mesh::{self, Vertex};
@@ -370,10 +370,13 @@ pub struct Renderer {
     camera_bind_group: wgpu::BindGroup,
     sphere: GpuMesh,
     cylinder: GpuMesh,
+    ribbon: GpuMesh,
     atom_instances: wgpu::Buffer,
     bond_instances: wgpu::Buffer,
+    cartoon_instances: wgpu::Buffer,
     atom_instance_count: u32,
     bond_instance_count: u32,
+    cartoon_instance_count: u32,
     depth: DepthTarget,
     post_process: PostProcess,
     egui_renderer: egui_wgpu::Renderer,
@@ -485,8 +488,10 @@ impl Renderer {
 
         let sphere = GpuMesh::new(&device, "sphere", mesh::uv_sphere(14, 22));
         let cylinder = GpuMesh::new(&device, "cylinder", mesh::cylinder(16));
+        let ribbon = GpuMesh::new(&device, "cartoon ribbon segment", mesh::cube());
         let atom_instances = empty_instance_buffer(&device, "atom instances");
         let bond_instances = empty_instance_buffer(&device, "bond instances");
+        let cartoon_instances = empty_instance_buffer(&device, "cartoon instances");
         let depth = DepthTarget::new(&device, config.width, config.height);
         let post_process = PostProcess::new(
             &device,
@@ -510,10 +515,13 @@ impl Renderer {
             camera_bind_group,
             sphere,
             cylinder,
+            ribbon,
             atom_instances,
             bond_instances,
+            cartoon_instances,
             atom_instance_count: 0,
             bond_instance_count: 0,
+            cartoon_instance_count: 0,
             depth,
             post_process,
             egui_renderer,
@@ -543,12 +551,14 @@ impl Renderer {
     }
 
     pub fn update_instances(&mut self, molecule: &Molecule, display: &DisplayState) {
+        let (cartoons, ball_and_stick) = cartoon_render_data(molecule, display);
         let atoms: Vec<_> = molecule
             .atoms
             .iter()
             .enumerate()
             .filter(|(index, _)| {
                 display.visible[*index]
+                    && ball_and_stick[*index]
                     && display.representations[*index].contains(RepresentationMask::SPHERES)
             })
             .map(|(index, atom)| {
@@ -573,6 +583,8 @@ impl Renderer {
             .filter(|bond| {
                 display.visible[bond.a]
                     && display.visible[bond.b]
+                    && ball_and_stick[bond.a]
+                    && ball_and_stick[bond.b]
                     && display.representations[bond.a].contains(RepresentationMask::STICKS)
                     && display.representations[bond.b].contains(RepresentationMask::STICKS)
             })
@@ -608,8 +620,10 @@ impl Renderer {
 
         self.atom_instances = instance_buffer(&self.device, "atom instances", &atoms);
         self.bond_instances = instance_buffer(&self.device, "bond instances", &bonds);
+        self.cartoon_instances = instance_buffer(&self.device, "cartoon instances", &cartoons);
         self.atom_instance_count = atoms.len() as u32;
         self.bond_instance_count = bonds.len() as u32;
+        self.cartoon_instance_count = cartoons.len() as u32;
     }
 
     pub fn render(
@@ -696,9 +710,10 @@ impl Renderer {
                     depth_slice: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.025,
-                            g: 0.032,
-                            b: 0.045,
+                            // sRGB #21272C converted to linear RGB for Rgba16Float.
+                            r: 0.015_209,
+                            g: 0.020_289,
+                            b: 0.025_187,
                             a: 1.0,
                         }),
                         store: wgpu::StoreOp::Store,
@@ -739,6 +754,15 @@ impl Renderer {
                 .min(self.config.height.saturating_sub(scissor_y) as f32)
                 as u32;
             pass.set_scissor_rect(scissor_x, scissor_y, scissor_width, scissor_height);
+
+            pass.set_vertex_buffer(0, self.ribbon.vertices.slice(..));
+            pass.set_vertex_buffer(1, self.cartoon_instances.slice(..));
+            pass.set_index_buffer(self.ribbon.indices.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(
+                0..self.ribbon.index_count,
+                0,
+                0..self.cartoon_instance_count,
+            );
 
             pass.set_vertex_buffer(0, self.cylinder.vertices.slice(..));
             pass.set_vertex_buffer(1, self.bond_instances.slice(..));
@@ -785,6 +809,205 @@ impl Renderer {
     }
 }
 
+#[derive(Clone, Copy)]
+struct BackboneAnchor {
+    atom_index: usize,
+    residue_index: usize,
+    position: Vec3,
+    guide: Vec3,
+    nucleic: bool,
+}
+
+fn cartoon_render_data(
+    molecule: &Molecule,
+    display: &DisplayState,
+) -> (Vec<InstanceRaw>, Vec<bool>) {
+    let hierarchy = MoleculeHierarchy::from_molecule(molecule);
+    let mut cartoons = Vec::new();
+    let mut cartoon_residue_atoms = vec![false; molecule.atoms.len()];
+    for chain in &hierarchy.chains {
+        let mut anchors = Vec::new();
+        for (residue_index, residue) in chain.residues.iter().enumerate() {
+            let Some((atom_index, nucleic)) = backbone_atom(molecule, residue) else {
+                continue;
+            };
+            for &index in &residue.atom_indices {
+                if let Some(value) = cartoon_residue_atoms.get_mut(index) {
+                    *value = true;
+                }
+            }
+            let position = molecule.atoms[atom_index].position;
+            let guide = residue
+                .atom_indices
+                .iter()
+                .filter_map(|index| molecule.atoms.get(*index))
+                .find(|atom| {
+                    if nucleic {
+                        matches!(atom.name.as_str(), "C4'" | "C4*")
+                    } else {
+                        atom.name == "O"
+                    }
+                })
+                .map_or(Vec3::ZERO, |atom| atom.position - position);
+            anchors.push(BackboneAnchor {
+                atom_index,
+                residue_index,
+                position,
+                guide,
+                nucleic,
+            });
+        }
+
+        let mut run = Vec::new();
+        for anchor in anchors {
+            let drawable = display
+                .visible
+                .get(anchor.atom_index)
+                .copied()
+                .unwrap_or(false)
+                && display.modes.get(anchor.atom_index) == Some(&DisplayMode::Cartoon);
+            let continuous = run.last().is_none_or(|previous: &BackboneAnchor| {
+                anchor.residue_index == previous.residue_index + 1
+                    && anchor.nucleic == previous.nucleic
+                    && anchor.position.distance(previous.position)
+                        <= if anchor.nucleic { 8.5 } else { 5.0 }
+            });
+            if !drawable || !continuous {
+                append_ribbon_run(&run, display, &mut cartoons);
+                run.clear();
+            }
+            if drawable {
+                run.push(anchor);
+            }
+        }
+        append_ribbon_run(&run, display, &mut cartoons);
+    }
+
+    let ball_and_stick = display
+        .modes
+        .iter()
+        .enumerate()
+        .map(|(index, mode)| *mode == DisplayMode::BallAndStick || !cartoon_residue_atoms[index])
+        .collect();
+    (cartoons, ball_and_stick)
+}
+
+fn backbone_atom(molecule: &Molecule, residue: &ResidueGroup) -> Option<(usize, bool)> {
+    residue
+        .atom_indices
+        .iter()
+        .copied()
+        .find(|index| {
+            molecule
+                .atoms
+                .get(*index)
+                .is_some_and(|atom| !atom.hetero && atom.name == "CA")
+        })
+        .map(|index| (index, false))
+        .or_else(|| {
+            residue
+                .atom_indices
+                .iter()
+                .copied()
+                .find(|index| {
+                    molecule
+                        .atoms
+                        .get(*index)
+                        .is_some_and(|atom| !atom.hetero && atom.name == "P")
+                })
+                .map(|index| (index, true))
+        })
+}
+
+fn append_ribbon_run(
+    run: &[BackboneAnchor],
+    display: &DisplayState,
+    instances: &mut Vec<InstanceRaw>,
+) {
+    if run.len() < 2 {
+        return;
+    }
+    let mut guides: Vec<Vec3> = run
+        .iter()
+        .map(|anchor| anchor.guide.normalize_or_zero())
+        .collect();
+    for index in 0..guides.len() {
+        if guides[index] == Vec3::ZERO {
+            guides[index] = guides
+                .get(index.wrapping_sub(1))
+                .copied()
+                .filter(|guide| *guide != Vec3::ZERO)
+                .unwrap_or(Vec3::X);
+        }
+        if index > 0 && guides[index].dot(guides[index - 1]) < 0.0 {
+            guides[index] = -guides[index];
+        }
+    }
+
+    const SAMPLES_PER_RESIDUE: usize = 6;
+    for segment in 0..run.len() - 1 {
+        for sample in 0..SAMPLES_PER_RESIDUE {
+            let t0 = sample as f32 / SAMPLES_PER_RESIDUE as f32;
+            let t1 = (sample + 1) as f32 / SAMPLES_PER_RESIDUE as f32;
+            let start = catmull_rom(run, segment, t0);
+            let end = catmull_rom(run, segment, t1);
+            let tangent = (end - start).normalize_or_zero();
+            if tangent == Vec3::ZERO {
+                continue;
+            }
+            let midpoint_t = (t0 + t1) * 0.5;
+            let guide = guides[segment]
+                .lerp(guides[segment + 1], midpoint_t)
+                .normalize_or_zero();
+            let mut side = (guide - tangent * guide.dot(tangent)).normalize_or_zero();
+            if side == Vec3::ZERO {
+                let fallback = if tangent.x.abs() < 0.8 {
+                    Vec3::X
+                } else {
+                    Vec3::Z
+                };
+                side = (fallback - tangent * fallback.dot(tangent)).normalize_or_zero();
+            }
+            let normal = side.cross(tangent).normalize_or_zero();
+            side = tangent.cross(normal).normalize_or_zero();
+            let length = start.distance(end);
+            let width = if run[segment].nucleic { 1.05 } else { 0.82 };
+            let thickness = if run[segment].nucleic { 0.22 } else { 0.16 };
+            let model = Mat4::from_cols(
+                (side * width).extend(0.0),
+                (tangent * length).extend(0.0),
+                (normal * thickness).extend(0.0),
+                ((start + end) * 0.5).extend(1.0),
+            );
+            let left = display.colors[run[segment].atom_index];
+            let right = display.colors[run[segment + 1].atom_index];
+            let color = [
+                left[0] + (right[0] - left[0]) * midpoint_t,
+                left[1] + (right[1] - left[1]) * midpoint_t,
+                left[2] + (right[2] - left[2]) * midpoint_t,
+                1.0,
+            ];
+            let selected = display.selection[run[segment].atom_index]
+                || display.selection[run[segment + 1].atom_index];
+            instances.push(InstanceRaw::new(model, color, selected));
+        }
+    }
+}
+
+fn catmull_rom(run: &[BackboneAnchor], segment: usize, t: f32) -> Vec3 {
+    let p0 = run[segment.saturating_sub(1)].position;
+    let p1 = run[segment].position;
+    let p2 = run[segment + 1].position;
+    let p3 = run[(segment + 2).min(run.len() - 1)].position;
+    let t2 = t * t;
+    let t3 = t2 * t;
+    (p1 * 2.0
+        + (p2 - p0) * t
+        + (p0 * 2.0 - p1 * 5.0 + p2 * 4.0 - p3) * t2
+        + (-p0 + p1 * 3.0 - p2 * 3.0 + p3) * t3)
+        * 0.5
+}
+
 fn instance_buffer(device: &wgpu::Device, label: &str, instances: &[InstanceRaw]) -> wgpu::Buffer {
     if instances.is_empty() {
         return empty_instance_buffer(device, label);
@@ -803,4 +1026,76 @@ fn empty_instance_buffer(device: &wgpu::Device, label: &str) -> wgpu::Buffer {
         usage: wgpu::BufferUsages::VERTEX,
         mapped_at_creation: false,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        DisplayLevel, ModeOverride,
+        molecule::{Atom, Element},
+    };
+
+    fn atom(serial: u32, name: &str, residue: i32, position: Vec3, hetero: bool) -> Atom {
+        Atom {
+            serial,
+            name: name.into(),
+            element: if name == "O" { Element::O } else { Element::C },
+            residue_name: if hetero { "LIG".into() } else { "ALA".into() },
+            residue_number: residue,
+            insertion_code: None,
+            chain_id: "A".into(),
+            position,
+            occupancy: 1.0,
+            b_factor: 0.0,
+            hetero,
+        }
+    }
+
+    fn backbone_molecule() -> Molecule {
+        let mut atoms = Vec::new();
+        for residue in 0..3 {
+            let x = residue as f32 * 3.8;
+            atoms.push(atom(
+                atoms.len() as u32 + 1,
+                "CA",
+                residue + 1,
+                Vec3::new(x, 0.0, 0.0),
+                false,
+            ));
+            atoms.push(atom(
+                atoms.len() as u32 + 1,
+                "O",
+                residue + 1,
+                Vec3::new(x, 1.0, 0.0),
+                false,
+            ));
+        }
+        atoms.push(atom(7, "C1", 10, Vec3::new(0.0, 4.0, 0.0), true));
+        Molecule {
+            atoms,
+            bonds: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn cartoon_builds_smooth_ribbon_and_keeps_ligands_atomic() {
+        let molecule = backbone_molecule();
+        let display = DisplayState::for_molecule(&molecule);
+        let (cartoons, atomic) = cartoon_render_data(&molecule, &display);
+        assert_eq!(cartoons.len(), 12);
+        assert_eq!(&atomic[..6], &[false; 6]);
+        assert!(atomic[6]);
+    }
+
+    #[test]
+    fn hierarchy_mode_override_switches_a_residue_to_ball_and_stick() {
+        let molecule = backbone_molecule();
+        let mut display = DisplayState::for_molecule(&molecule);
+        display.set_mode_override(&[2, 3], DisplayLevel::Residue, ModeOverride::BallAndStick);
+        let (cartoons, atomic) = cartoon_render_data(&molecule, &display);
+        assert!(cartoons.is_empty());
+        assert!(atomic[2] && atomic[3]);
+        assert!(!atomic[0] && !atomic[4]);
+    }
 }

@@ -17,6 +17,7 @@ instancing with a small egui interface.
 - Click-to-pick atoms with atom/residue/chain property inspection
 - Chain → residue → atom hierarchy with independent selection/expansion controls
 - Hierarchical HSV color overrides and inherited tri-state visibility controls
+- Global and hierarchical Cartoon/Ball & stick display modes
 - Named selections with color/visibility attributes and a preserved internal hierarchy
 - Camera panel with clipping and thin-lens optical bokeh controls
 - Element/CPK, chain, residue, residue-type, B-factor, and uniform color schemes
@@ -73,6 +74,26 @@ Ctrl/Cmd+Z undoes edits to selections, named selections, colors, visibility,
 representations, and other display state. Ctrl/Cmd+R reapplies them. The newest
 50 edits are retained; camera changes and loading a different structure are not
 part of this history.
+
+### Display mode
+
+The top toolbar menus are ordered **Mode**, **Coloring**, **Camera**. Cartoon is
+the default and draws a smoothed backbone ribbon through protein `CA` atoms and
+nucleic-acid `P` atoms; disconnected residues and chains are never bridged.
+Ligands and residues without a cartoon backbone remain in Ball & stick. The
+second global mode is **Ball & stick**, matching the viewer's original rendering.
+
+The default Cartoon color is the same blue-gray Uniform color shown in the
+Coloring window. Picking an atom in the viewport reveals its hierarchy path and
+highlights the atom, its residue, and its chain without adding the ancestors to
+the editable multi-selection.
+
+Every chain, residue, and atom has a mode badge before its color and visibility
+attributes. A gray badge inherits; an orange badge is a local override. Clicking
+switches between inheritance and the mode opposite to the global mode. Right-click
+provides **Reset to default** and **Set to children**. Effective priority is atom
+→ residue → chain → named selection → global; a value equal to the global mode is
+stored as inheritance rather than as an unnecessary override.
 
 ### Camera and optical depth of field
 

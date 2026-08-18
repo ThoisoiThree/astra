@@ -9,8 +9,8 @@ use std::{
 use anyhow::{Context, Result};
 use glam::{Vec2, Vec3};
 use molview::{
-    DisplayColor, DisplayLevel, DisplayState, NamedSelectionStyle, RepresentationMask,
-    VisibilityOverride,
+    DisplayColor, DisplayLevel, DisplayMode, DisplayState, ModeOverride, NamedSelectionStyle,
+    RepresentationMask, VisibilityOverride,
     camera::{OrbitCamera, Viewport},
     command::{Command, Representation, parse_command},
     molecule::{Molecule, MoleculeHierarchy, parse_structure},
@@ -664,9 +664,16 @@ impl Runtime {
             .screen_ray(point, self.viewport)
             .and_then(|ray| {
                 self.molecule.as_ref().and_then(|molecule| {
-                    let visible = self.display.as_ref().map(|display| &display.visible);
                     pick_atom_filtered(molecule, ray, |index| {
-                        visible.is_none_or(|flags| flags.get(index).copied().unwrap_or(false))
+                        self.display.as_ref().is_none_or(|display| {
+                            let Some(atom) = molecule.atoms.get(index) else {
+                                return false;
+                            };
+                            display.visible.get(index).copied().unwrap_or(false)
+                                && (display.modes.get(index) == Some(&DisplayMode::BallAndStick)
+                                    || atom.hetero
+                                    || matches!(atom.name.as_str(), "CA" | "P"))
+                        })
                     })
                 })
             });
@@ -715,8 +722,20 @@ impl Runtime {
                 }
                 self.refresh_instances();
             }
+            ManagerAction::SetMode { targets, state } => {
+                let operations: Vec<_> = targets
+                    .into_iter()
+                    .map(|target| self.display_target(target))
+                    .map(|(indices, level)| (indices, level, state))
+                    .collect();
+                if let Some(display) = &mut self.display {
+                    display.set_mode_overrides(&operations);
+                }
+                self.refresh_instances();
+            }
             ManagerAction::PropagateColor(targets) => self.propagate_color(&targets),
             ManagerAction::PropagateVisibility(targets) => self.propagate_visibility(&targets),
+            ManagerAction::PropagateMode(targets) => self.propagate_mode(&targets),
             ManagerAction::SetNamedColor { name, color } => {
                 if self.named_selections.contains_key(&name) {
                     self.named_selection_styles.entry(name).or_default().color = color;
@@ -729,6 +748,21 @@ impl Runtime {
                         .entry(name)
                         .or_default()
                         .visibility = state;
+                    self.rebuild_named_display_layers();
+                }
+            }
+            ManagerAction::SetNamedMode { name, state } => {
+                if self.named_selections.contains_key(&name) {
+                    let global = self
+                        .display
+                        .as_ref()
+                        .map_or(DisplayMode::Cartoon, |display| display.global_mode);
+                    self.named_selection_styles.entry(name).or_default().mode =
+                        if state.mode() == Some(global) {
+                            ModeOverride::Inherit
+                        } else {
+                            state
+                        };
                     self.rebuild_named_display_layers();
                 }
             }
@@ -746,6 +780,13 @@ impl Runtime {
                 }
                 self.refresh_instances();
             }
+            ManagerAction::PropagateNamedMode { name, state } => {
+                let indices = self.named_selection_indices(&name);
+                if let Some(display) = &mut self.display {
+                    display.set_mode_override(&indices, DisplayLevel::Atom, state);
+                }
+                self.refresh_instances();
+            }
             ManagerAction::SelectNamedSubset {
                 indices,
                 inspection,
@@ -759,6 +800,18 @@ impl Runtime {
                     display.set_coloring_mode(molecule, mode);
                 }
                 self.refresh_instances();
+            }
+            ManagerAction::SetGlobalMode(mode) => {
+                if let Some(display) = &mut self.display {
+                    display.set_global_mode(mode);
+                }
+                let redundant = ModeOverride::from_mode(mode);
+                for style in self.named_selection_styles.values_mut() {
+                    if style.mode == redundant {
+                        style.mode = ModeOverride::Inherit;
+                    }
+                }
+                self.rebuild_named_display_layers();
             }
             ManagerAction::SetUniformColor(color) => {
                 if let (Some(molecule), Some(display)) = (&self.molecule, &mut self.display) {
@@ -934,6 +987,31 @@ impl Runtime {
         }
         if let Some(display) = &mut self.display {
             display.set_visibility_overrides(&operations);
+        }
+        self.refresh_instances();
+    }
+
+    fn propagate_mode(&mut self, targets: &[InspectionTarget]) {
+        let mut operations = Vec::<(Vec<usize>, DisplayLevel, ModeOverride)>::new();
+        for &target in targets {
+            let (source_indices, source_level) = self.display_target(target);
+            let Some(source_atom) = source_indices.first().copied() else {
+                continue;
+            };
+            let Some(mode) = self
+                .display
+                .as_ref()
+                .map(|display| display.mode_at_level(source_atom, source_level))
+            else {
+                continue;
+            };
+            for child in self.descendant_targets(target) {
+                let (indices, level) = self.display_target(child);
+                operations.push((indices, level, ModeOverride::from_mode(mode)));
+            }
+        }
+        if let Some(display) = &mut self.display {
+            display.set_mode_overrides(&operations);
         }
         self.refresh_instances();
     }

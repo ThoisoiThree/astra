@@ -1,8 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use molview::{
-    ColoringMode, DisplayColor, DisplayLevel, DisplayState, NamedSelectionStyle,
-    VisibilityOverride,
+    ColoringMode, DisplayColor, DisplayLevel, DisplayMode, DisplayState, ModeOverride,
+    NamedSelectionStyle, VisibilityOverride,
     camera::OrbitCamera,
     molecule::{Atom, Molecule, MoleculeHierarchy, ResidueGroup},
     selection::Selection,
@@ -16,6 +16,7 @@ pub struct UiState {
     history_cursor: Option<usize>,
     camera_open: bool,
     coloring_open: bool,
+    mode_open: bool,
     color_editor: Option<ColorEditor>,
     named_color_editor: Option<NamedColorEditor>,
     named_expression_editor: Option<NamedExpressionEditor>,
@@ -120,8 +121,13 @@ pub enum ManagerAction {
         targets: Vec<InspectionTarget>,
         state: VisibilityOverride,
     },
+    SetMode {
+        targets: Vec<InspectionTarget>,
+        state: ModeOverride,
+    },
     PropagateColor(Vec<InspectionTarget>),
     PropagateVisibility(Vec<InspectionTarget>),
+    PropagateMode(Vec<InspectionTarget>),
     SetNamedColor {
         name: String,
         color: Option<DisplayColor>,
@@ -129,6 +135,10 @@ pub enum ManagerAction {
     SetNamedVisibility {
         name: String,
         state: VisibilityOverride,
+    },
+    SetNamedMode {
+        name: String,
+        state: ModeOverride,
     },
     PropagateNamedColor {
         name: String,
@@ -138,11 +148,16 @@ pub enum ManagerAction {
         name: String,
         state: VisibilityOverride,
     },
+    PropagateNamedMode {
+        name: String,
+        state: ModeOverride,
+    },
     SelectNamedSubset {
         indices: Vec<usize>,
         inspection: InspectionTarget,
     },
     SetColoringMode(ColoringMode),
+    SetGlobalMode(DisplayMode),
     SetUniformColor(DisplayColor),
     ActivateNamed(String),
     UpdateNamedExpression {
@@ -208,14 +223,17 @@ impl UiState {
                 actions.open = ui.button("Open structure").clicked();
                 actions.fit = ui.button("Fit").clicked();
                 actions.reset_colors = ui.button("Reset colors").clicked();
-                if ui.selectable_label(self.camera_open, "Camera").clicked() {
-                    self.camera_open = !self.camera_open;
+                if ui.selectable_label(self.mode_open, "Mode").clicked() {
+                    self.mode_open = !self.mode_open;
                 }
                 if ui
                     .selectable_label(self.coloring_open, "Coloring")
                     .clicked()
                 {
                     self.coloring_open = !self.coloring_open;
+                }
+                if ui.selectable_label(self.camera_open, "Camera").clicked() {
+                    self.camera_open = !self.camera_open;
                 }
                 ui.separator();
                 ui.strong(info.filename.unwrap_or("No molecule loaded"));
@@ -254,13 +272,48 @@ impl UiState {
                         hierarchy_tree(ui, info, &mut actions, &mut self.color_editor);
                     });
             });
-        self.camera_window(root.ctx(), info, &mut actions);
+        self.mode_window(root.ctx(), info, &mut actions);
         self.coloring_window(root.ctx(), info, &mut actions);
+        self.camera_window(root.ctx(), info, &mut actions);
         self.color_editor_window(root.ctx(), &mut actions);
         self.named_color_editor_window(root.ctx(), &mut actions);
         self.named_expression_editor_window(root.ctx(), &mut actions);
         actions.viewport = root.available_rect_before_wrap();
         actions
+    }
+
+    fn mode_window(&mut self, context: &egui::Context, info: UiInfo<'_>, actions: &mut UiActions) {
+        if !self.mode_open {
+            return;
+        }
+        let mut open = self.mode_open;
+        egui::Window::new("Mode")
+            .id(egui::Id::new("display mode window"))
+            .open(&mut open)
+            .default_width(280.0)
+            .resizable(false)
+            .show(context, |ui| {
+                let Some(display) = info.display else {
+                    ui.weak("Open a structure to choose its display mode");
+                    return;
+                };
+                let mut mode = display.global_mode;
+                egui::ComboBox::from_label("Global mode")
+                    .selected_text(mode.label())
+                    .show_ui(ui, |ui| {
+                        for candidate in DisplayMode::ALL {
+                            ui.selectable_value(&mut mode, candidate, candidate.label());
+                        }
+                    });
+                if mode != display.global_mode {
+                    actions.manager = Some(ManagerAction::SetGlobalMode(mode));
+                }
+                ui.separator();
+                ui.small(
+                    "Hierarchy overrides have priority: atom > residue > chain > named selection > global.",
+                );
+            });
+        self.mode_open = open;
     }
 
     fn camera_window(
@@ -776,6 +829,32 @@ fn named_selections(
         );
         state
             .show_header(ui, |ui| {
+                let effective_mode = style.mode.mode().unwrap_or(display.global_mode);
+                let mode_response = mode_button(ui, effective_mode, style.mode)
+                    .on_hover_text("Named selection display mode");
+                mode_response.context_menu(|ui| {
+                    if ui.button("Reset to default").clicked() {
+                        actions.manager = Some(ManagerAction::SetNamedMode {
+                            name: name.clone(),
+                            state: ModeOverride::Inherit,
+                        });
+                        ui.close();
+                    }
+                    if ui.button("Set to children").clicked() {
+                        actions.manager = Some(ManagerAction::PropagateNamedMode {
+                            name: name.clone(),
+                            state: ModeOverride::from_mode(effective_mode),
+                        });
+                        ui.close();
+                    }
+                });
+                if mode_response.clicked() {
+                    actions.manager = Some(ManagerAction::SetNamedMode {
+                        name: name.clone(),
+                        state: next_mode_override(style.mode, display.global_mode),
+                    });
+                }
+
                 let color_response = color_square(ui, color, style.color.is_some())
                     .on_hover_text("Named selection color");
                 color_response.context_menu(|ui| {
@@ -1112,6 +1191,23 @@ fn hierarchy_tree(
         ui.weak("Open a PDB file to browse chains and residues");
         return;
     };
+    let inspected_atom_path = info.inspection.and_then(|inspection| {
+        let InspectionTarget::Atom(atom_index) = inspection else {
+            return None;
+        };
+        hierarchy
+            .chains
+            .iter()
+            .enumerate()
+            .find_map(|(chain_index, chain)| {
+                chain
+                    .residues
+                    .iter()
+                    .enumerate()
+                    .find(|(_, residue)| residue.atom_indices.contains(&atom_index))
+                    .map(|(residue_index, _)| (chain_index, residue_index, atom_index))
+            })
+    });
     for (chain_index, chain) in hierarchy.chains.iter().enumerate() {
         let chain_label = format!(
             "Chain {} · {} residues · {} atoms",
@@ -1124,11 +1220,16 @@ fn hierarchy_tree(
             .residues
             .iter()
             .find_map(|residue| residue.atom_indices.first().copied());
-        let chain_state = egui::collapsing_header::CollapsingState::load_with_default_open(
+        let chain_on_inspected_path = inspected_atom_path
+            .is_some_and(|(inspected_chain, _, _)| inspected_chain == chain_index);
+        let mut chain_state = egui::collapsing_header::CollapsingState::load_with_default_open(
             ui.ctx(),
             ui.make_persistent_id(("chain", chain_index)),
             false,
         );
+        if chain_on_inspected_path {
+            chain_state.set_open(true);
+        }
         chain_state
             .show_header(ui, |ui| {
                 hierarchy_row(
@@ -1138,7 +1239,7 @@ fn hierarchy_tree(
                     DisplayLevel::Chain,
                     first_atom,
                     &chain_label,
-                    info.hierarchy_selection.contains(&chain_target),
+                    info.hierarchy_selection.contains(&chain_target) || chain_on_inspected_path,
                     info.hierarchy_selection,
                     actions,
                     color_editor,
@@ -1155,12 +1256,20 @@ fn hierarchy_tree(
                         chain_index,
                         residue_index,
                     };
-                    let residue_state =
+                    let residue_on_inspected_path = inspected_atom_path.is_some_and(
+                        |(inspected_chain, inspected_residue, _)| {
+                            inspected_chain == chain_index && inspected_residue == residue_index
+                        },
+                    );
+                    let mut residue_state =
                         egui::collapsing_header::CollapsingState::load_with_default_open(
                             ui.ctx(),
                             ui.make_persistent_id(("residue", chain_index, residue_index)),
                             false,
                         );
+                    if residue_on_inspected_path {
+                        residue_state.set_open(true);
+                    }
                     residue_state
                         .show_header(ui, |ui| {
                             hierarchy_row(
@@ -1170,7 +1279,8 @@ fn hierarchy_tree(
                                 DisplayLevel::Residue,
                                 residue.atom_indices.first().copied(),
                                 &residue_label,
-                                info.hierarchy_selection.contains(&residue_target),
+                                info.hierarchy_selection.contains(&residue_target)
+                                    || residue_on_inspected_path,
                                 info.hierarchy_selection,
                                 actions,
                                 color_editor,
@@ -1227,11 +1337,41 @@ fn hierarchy_row(
     };
     let color = display.color_at_level(atom_index, level);
     let overridden = display.color_is_overridden(atom_index, level);
-    let attribute_targets = if selected {
+    let attribute_targets = if hierarchy_selection.contains(&target) {
         hierarchy_selection.iter().copied().collect::<Vec<_>>()
     } else {
         vec![target]
     };
+    let direct_mode = display.mode_override(atom_index, level);
+    let effective_mode = display.mode_at_level(atom_index, level);
+    let mode_response = mode_button(ui, effective_mode, direct_mode);
+    mode_response.context_menu(|ui| {
+        if ui.button("Reset to default").clicked() {
+            actions.manager = Some(ManagerAction::SetMode {
+                targets: attribute_targets.clone(),
+                state: ModeOverride::Inherit,
+            });
+            ui.close();
+        }
+        if ui
+            .add_enabled(
+                attribute_targets
+                    .iter()
+                    .any(|target| target_has_children(*target)),
+                egui::Button::new("Set to children"),
+            )
+            .clicked()
+        {
+            actions.manager = Some(ManagerAction::PropagateMode(attribute_targets.clone()));
+            ui.close();
+        }
+    });
+    if mode_response.clicked() {
+        actions.manager = Some(ManagerAction::SetMode {
+            targets: attribute_targets.clone(),
+            state: next_mode_override(direct_mode, display.global_mode),
+        });
+    }
     let color_response = color_square(ui, color, overridden).on_hover_text(if overridden {
         "Custom HSV color (click to edit; orange border = override)"
     } else {
@@ -1316,6 +1456,43 @@ fn hierarchy_row(
 
 fn target_has_children(target: InspectionTarget) -> bool {
     !matches!(target, InspectionTarget::Atom(_))
+}
+
+fn next_mode_override(current: ModeOverride, global: DisplayMode) -> ModeOverride {
+    if current == ModeOverride::Inherit {
+        ModeOverride::from_mode(match global {
+            DisplayMode::Cartoon => DisplayMode::BallAndStick,
+            DisplayMode::BallAndStick => DisplayMode::Cartoon,
+        })
+    } else {
+        ModeOverride::Inherit
+    }
+}
+
+fn mode_button(ui: &mut egui::Ui, effective: DisplayMode, direct: ModeOverride) -> egui::Response {
+    let label = match effective {
+        DisplayMode::Cartoon => "C",
+        DisplayMode::BallAndStick => "B",
+    };
+    let color = if direct == ModeOverride::Inherit {
+        egui::Color32::from_gray(125)
+    } else {
+        egui::Color32::from_rgb(255, 172, 55)
+    };
+    ui.add(
+        egui::Button::new(egui::RichText::new(label).strong().color(color))
+            .min_size(egui::vec2(20.0, 17.0)),
+    )
+    .on_hover_text(match (effective, direct) {
+        (DisplayMode::Cartoon, ModeOverride::Inherit) => {
+            "Mode: inherited Cartoon (click → Ball & stick override)"
+        }
+        (DisplayMode::BallAndStick, ModeOverride::Inherit) => {
+            "Mode: inherited Ball & stick (click → Cartoon override)"
+        }
+        (DisplayMode::Cartoon, _) => "Mode override: Cartoon (click → inherit)",
+        (DisplayMode::BallAndStick, _) => "Mode override: Ball & stick (click → inherit)",
+    })
 }
 
 fn color_square(ui: &mut egui::Ui, color: DisplayColor, overridden: bool) -> egui::Response {

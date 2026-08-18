@@ -11,10 +11,56 @@ use molecule::Molecule;
 
 pub type DisplayColor = [f32; 4];
 
+const DEFAULT_UNIFORM_COLOR: DisplayColor = [0.55, 0.67, 0.82, 1.0];
+
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct NamedSelectionStyle {
     pub color: Option<DisplayColor>,
     pub visibility: VisibilityOverride,
+    pub mode: ModeOverride,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DisplayMode {
+    #[default]
+    Cartoon,
+    BallAndStick,
+}
+
+impl DisplayMode {
+    pub const ALL: [Self; 2] = [Self::Cartoon, Self::BallAndStick];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Cartoon => "Cartoon",
+            Self::BallAndStick => "Ball & stick",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ModeOverride {
+    #[default]
+    Inherit,
+    Cartoon,
+    BallAndStick,
+}
+
+impl ModeOverride {
+    pub const fn from_mode(mode: DisplayMode) -> Self {
+        match mode {
+            DisplayMode::Cartoon => Self::Cartoon,
+            DisplayMode::BallAndStick => Self::BallAndStick,
+        }
+    }
+
+    pub const fn mode(self) -> Option<DisplayMode> {
+        match self {
+            Self::Inherit => None,
+            Self::Cartoon => Some(DisplayMode::Cartoon),
+            Self::BallAndStick => Some(DisplayMode::BallAndStick),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -86,6 +132,8 @@ pub struct DisplayState {
     pub visible: Vec<bool>,
     pub representations: Vec<RepresentationMask>,
     pub selection: Vec<bool>,
+    pub modes: Vec<DisplayMode>,
+    pub global_mode: DisplayMode,
     pub coloring_mode: ColoringMode,
     pub uniform_color: DisplayColor,
     base_colors: Vec<DisplayColor>,
@@ -97,12 +145,16 @@ pub struct DisplayState {
     named_visibility: Vec<VisibilityOverride>,
     residue_visibility: Vec<VisibilityOverride>,
     atom_visibility: Vec<VisibilityOverride>,
+    named_modes: Vec<ModeOverride>,
+    chain_modes: Vec<ModeOverride>,
+    residue_modes: Vec<ModeOverride>,
+    atom_modes: Vec<ModeOverride>,
 }
 
 impl DisplayState {
     pub fn for_molecule(molecule: &Molecule) -> Self {
         let atom_count = molecule.atoms.len();
-        let base_colors = element_colors(molecule);
+        let base_colors = vec![DEFAULT_UNIFORM_COLOR; atom_count];
         Self {
             colors: base_colors.clone(),
             visible: vec![true; atom_count],
@@ -118,8 +170,10 @@ impl DisplayState {
                 })
                 .collect(),
             selection: vec![false; atom_count],
-            coloring_mode: ColoringMode::Element,
-            uniform_color: [0.55, 0.67, 0.82, 1.0],
+            modes: vec![DisplayMode::Cartoon; atom_count],
+            global_mode: DisplayMode::Cartoon,
+            coloring_mode: ColoringMode::Uniform,
+            uniform_color: DEFAULT_UNIFORM_COLOR,
             base_colors,
             named_colors: vec![None; atom_count],
             chain_colors: vec![None; atom_count],
@@ -129,6 +183,10 @@ impl DisplayState {
             named_visibility: vec![VisibilityOverride::Inherit; atom_count],
             residue_visibility: vec![VisibilityOverride::Inherit; atom_count],
             atom_visibility: vec![VisibilityOverride::Inherit; atom_count],
+            named_modes: vec![ModeOverride::Inherit; atom_count],
+            chain_modes: vec![ModeOverride::Inherit; atom_count],
+            residue_modes: vec![ModeOverride::Inherit; atom_count],
+            atom_modes: vec![ModeOverride::Inherit; atom_count],
         }
     }
 
@@ -169,6 +227,7 @@ impl DisplayState {
     pub fn replace_named_layers(&mut self, layers: &[(Vec<usize>, NamedSelectionStyle)]) {
         self.named_colors.fill(None);
         self.named_visibility.fill(VisibilityOverride::Inherit);
+        self.named_modes.fill(ModeOverride::Inherit);
         for (indices, style) in layers {
             for &index in indices {
                 if let Some(value) = self.named_colors.get_mut(index)
@@ -181,10 +240,17 @@ impl DisplayState {
                 {
                     *value = style.visibility;
                 }
+                if let Some(value) = self.named_modes.get_mut(index)
+                    && style.mode != ModeOverride::Inherit
+                    && style.mode.mode() != Some(self.global_mode)
+                {
+                    *value = style.mode;
+                }
             }
         }
         self.recompute_colors();
         self.recompute_visibility();
+        self.recompute_modes();
     }
 
     pub fn set_color_override(
@@ -352,11 +418,110 @@ impl DisplayState {
         .unwrap_or_default()
     }
 
+    pub fn set_global_mode(&mut self, mode: DisplayMode) {
+        self.global_mode = mode;
+        let redundant = ModeOverride::from_mode(mode);
+        for overrides in [
+            &mut self.named_modes,
+            &mut self.chain_modes,
+            &mut self.residue_modes,
+            &mut self.atom_modes,
+        ] {
+            for value in overrides {
+                if *value == redundant {
+                    *value = ModeOverride::Inherit;
+                }
+            }
+        }
+        self.recompute_modes();
+    }
+
+    pub fn set_mode_override(
+        &mut self,
+        indices: &[usize],
+        level: DisplayLevel,
+        state: ModeOverride,
+    ) {
+        let state = if state.mode() == Some(self.global_mode) {
+            ModeOverride::Inherit
+        } else {
+            state
+        };
+        let overrides = match level {
+            DisplayLevel::Chain => &mut self.chain_modes,
+            DisplayLevel::Residue => &mut self.residue_modes,
+            DisplayLevel::Atom => &mut self.atom_modes,
+        };
+        for &index in indices {
+            if let Some(value) = overrides.get_mut(index) {
+                *value = state;
+            }
+        }
+        self.recompute_modes();
+    }
+
+    pub fn set_mode_overrides(&mut self, operations: &[(Vec<usize>, DisplayLevel, ModeOverride)]) {
+        for (indices, level, state) in operations {
+            let state = if state.mode() == Some(self.global_mode) {
+                ModeOverride::Inherit
+            } else {
+                *state
+            };
+            let overrides = match level {
+                DisplayLevel::Chain => &mut self.chain_modes,
+                DisplayLevel::Residue => &mut self.residue_modes,
+                DisplayLevel::Atom => &mut self.atom_modes,
+            };
+            for &index in indices {
+                if let Some(value) = overrides.get_mut(index) {
+                    *value = state;
+                }
+            }
+        }
+        self.recompute_modes();
+    }
+
+    pub fn mode_override(&self, atom_index: usize, level: DisplayLevel) -> ModeOverride {
+        match level {
+            DisplayLevel::Chain => self.chain_modes.get(atom_index),
+            DisplayLevel::Residue => self.residue_modes.get(atom_index),
+            DisplayLevel::Atom => self.atom_modes.get(atom_index),
+        }
+        .copied()
+        .unwrap_or_default()
+    }
+
+    pub fn mode_at_level(&self, atom_index: usize, level: DisplayLevel) -> DisplayMode {
+        let named = self
+            .named_modes
+            .get(atom_index)
+            .copied()
+            .and_then(ModeOverride::mode)
+            .unwrap_or(self.global_mode);
+        let chain = self
+            .chain_modes
+            .get(atom_index)
+            .copied()
+            .and_then(ModeOverride::mode)
+            .unwrap_or(named);
+        match level {
+            DisplayLevel::Chain => chain,
+            DisplayLevel::Residue => self
+                .residue_modes
+                .get(atom_index)
+                .copied()
+                .and_then(ModeOverride::mode)
+                .unwrap_or(chain),
+            DisplayLevel::Atom => self.modes.get(atom_index).copied().unwrap_or(chain),
+        }
+    }
+
     pub fn reset_colors(&mut self, molecule: &Molecule) {
         self.chain_colors.fill(None);
         self.residue_colors.fill(None);
         self.atom_colors.fill(None);
-        self.set_coloring_mode(molecule, ColoringMode::Element);
+        self.uniform_color = DEFAULT_UNIFORM_COLOR;
+        self.set_coloring_mode(molecule, ColoringMode::Uniform);
     }
 
     pub fn selection_count(&self) -> usize {
@@ -416,6 +581,21 @@ impl DisplayState {
             .find(|state| *state != VisibilityOverride::Inherit)
             .unwrap_or(VisibilityOverride::Show);
             self.visible[index] = state == VisibilityOverride::Show;
+        }
+    }
+
+    fn recompute_modes(&mut self) {
+        for index in 0..self.modes.len() {
+            self.modes[index] = [
+                self.named_modes[index],
+                self.chain_modes[index],
+                self.residue_modes[index],
+                self.atom_modes[index],
+            ]
+            .into_iter()
+            .rev()
+            .find_map(ModeOverride::mode)
+            .unwrap_or(self.global_mode);
         }
     }
 }
@@ -580,6 +760,23 @@ mod display_tests {
     }
 
     #[test]
+    fn default_and_reset_colors_use_the_uniform_cartoon_color() {
+        let molecule = molecule();
+        let mut display = DisplayState::for_molecule(&molecule);
+        assert_eq!(display.coloring_mode, ColoringMode::Uniform);
+        assert_eq!(display.colors, vec![DEFAULT_UNIFORM_COLOR; 2]);
+
+        display.set_coloring_mode(&molecule, ColoringMode::Element);
+        display.set_uniform_color(&molecule, [1.0, 0.0, 0.0, 1.0]);
+        display.set_color_override(&[0], DisplayLevel::Atom, Some([0.0, 1.0, 0.0, 1.0]));
+        display.reset_colors(&molecule);
+
+        assert_eq!(display.coloring_mode, ColoringMode::Uniform);
+        assert_eq!(display.uniform_color, DEFAULT_UNIFORM_COLOR);
+        assert_eq!(display.colors, vec![DEFAULT_UNIFORM_COLOR; 2]);
+    }
+
+    #[test]
     fn lower_color_override_has_priority_and_can_inherit_again() {
         let molecule = molecule();
         let mut display = DisplayState::for_molecule(&molecule);
@@ -629,10 +826,12 @@ mod display_tests {
             NamedSelectionStyle {
                 color: Some(named_color),
                 visibility: VisibilityOverride::Hide,
+                mode: ModeOverride::BallAndStick,
             },
         )]);
         assert_eq!(display.colors, vec![named_color; 2]);
         assert_eq!(display.visible, vec![false, false]);
+        assert_eq!(display.modes, vec![DisplayMode::BallAndStick; 2]);
 
         let child_color = [0.1, 0.9, 0.2, 1.0];
         display.set_color_override(&[0], DisplayLevel::Atom, Some(child_color));
@@ -640,5 +839,26 @@ mod display_tests {
         assert_eq!(display.colors[0], child_color);
         assert!(display.visible[0]);
         assert!(!display.visible[1]);
+    }
+
+    #[test]
+    fn lower_mode_override_wins_and_global_matches_inherit() {
+        let molecule = molecule();
+        let mut display = DisplayState::for_molecule(&molecule);
+        assert_eq!(display.global_mode, DisplayMode::Cartoon);
+        display.set_mode_override(&[0, 1], DisplayLevel::Chain, ModeOverride::BallAndStick);
+        display.set_mode_override(&[0], DisplayLevel::Atom, ModeOverride::Cartoon);
+        assert_eq!(
+            display.mode_override(0, DisplayLevel::Atom),
+            ModeOverride::Inherit
+        );
+        assert_eq!(display.modes, vec![DisplayMode::BallAndStick; 2]);
+
+        display.set_global_mode(DisplayMode::BallAndStick);
+        assert_eq!(display.modes, vec![DisplayMode::BallAndStick; 2]);
+        assert_eq!(
+            display.mode_override(0, DisplayLevel::Chain),
+            ModeOverride::Inherit
+        );
     }
 }
