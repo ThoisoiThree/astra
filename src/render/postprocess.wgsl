@@ -94,10 +94,9 @@ fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let center_depth = textureLoad(scene_depth, pixel, 0);
     let center_coc = circle_of_confusion(optical_depth(uv, center_depth), dimensions.y);
 
-    // A source-based aperture gather approximates optical scatter: a sample
-    // contributes only when this pixel lies inside that source's physical CoC.
-    // Foreground discs may occlude any background; far discs never bleed over
-    // an in-focus or foreground center sample.
+    // A source-based aperture gather approximates optical scatter. Coverage and
+    // near/far classification are deliberately continuous: binary CoC tests make
+    // small atoms and highlights pop as the camera crosses a sample boundary.
     const SAMPLE_COUNT = 64u;
     var accumulated = center;
     var accumulated_weight = 1.0;
@@ -112,18 +111,22 @@ fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
             dimensions.y,
         );
         let required_radius = aperture_metric(aperture_point) * post.lens.z;
-        let near_contribution = sample_coc < -0.35 && required_radius <= -sample_coc;
-        let far_contribution = center_coc > 0.35
-            && sample_coc > 0.35
-            && required_radius <= sample_coc;
-        if near_contribution || far_contribution {
-            let sample_color = textureSampleLevel(scene_color, scene_sampler, sample_uv, 0.0);
-            // A mildly weighted rim reproduces real iris edge brightness while
-            // normalization keeps overall exposure stable.
-            let weight = 0.8 + 0.4 * aperture_metric(aperture_point);
-            accumulated += sample_color * weight;
-            accumulated_weight += weight;
-        }
+        let coc_radius = abs(sample_coc);
+        let coverage = 1.0 - smoothstep(
+            max(coc_radius - 1.25, 0.0),
+            coc_radius + 1.25,
+            required_radius,
+        );
+        let near_strength = smoothstep(0.0, 1.5, -sample_coc);
+        let far_source_strength = smoothstep(0.0, 1.5, sample_coc);
+        let far_receiver_strength = smoothstep(0.0, 1.5, center_coc);
+        let layer_strength = near_strength
+            + (1.0 - near_strength) * far_source_strength * far_receiver_strength;
+        let rim_weight = 0.8 + 0.4 * aperture_metric(aperture_point);
+        let weight = coverage * layer_strength * rim_weight;
+        let sample_color = textureSampleLevel(scene_color, scene_sampler, sample_uv, 0.0);
+        accumulated += sample_color * weight;
+        accumulated_weight += weight;
     }
     return accumulated / accumulated_weight;
 }

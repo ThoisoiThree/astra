@@ -21,7 +21,8 @@ use winit::{
 };
 
 use crate::ui::{
-    CameraUpdate, FocusRequest, InspectionTarget, ManagerAction, UiActions, UiInfo, UiState,
+    CameraUpdate, FocusRequest, InspectionTarget, ManagerAction, PivotRequest, UiActions, UiInfo,
+    UiState,
 };
 
 pub fn run(initial_path: Option<PathBuf>) -> Result<()> {
@@ -88,6 +89,7 @@ struct Runtime {
     named_selections: BTreeMap<String, Selection>,
     inspection: Option<InspectionTarget>,
     focus_description: String,
+    pivot_description: String,
     loaded_filename: Option<String>,
     camera: OrbitCamera,
     ui: UiState,
@@ -134,6 +136,7 @@ impl Runtime {
             named_selections: BTreeMap::new(),
             inspection: None,
             focus_description: "World origin".into(),
+            pivot_description: "World origin".into(),
             loaded_filename: None,
             camera,
             ui: UiState::default(),
@@ -210,7 +213,12 @@ impl Runtime {
                         if self.left_drag {
                             self.left_drag_distance += delta.length();
                         }
-                        if self.right_drag || (self.left_drag && self.modifiers.shift_key()) {
+                        let modifier_pan = (self.right_drag || self.left_drag)
+                            && (self.modifiers.control_key() || self.modifiers.super_key());
+                        if modifier_pan
+                            || self.right_drag
+                            || (self.left_drag && self.modifiers.shift_key())
+                        {
                             self.camera.pan(delta, self.viewport.height);
                             self.window.request_redraw();
                         } else if self.left_drag && self.left_drag_distance > 4.0 {
@@ -259,6 +267,7 @@ impl Runtime {
             inspection: self.inspection,
             camera: &self.camera,
             focus_description: &self.focus_description,
+            pivot_description: &self.pivot_description,
         };
         let context = self.egui_context.clone();
         let mut actions = UiActions::default();
@@ -350,6 +359,16 @@ impl Runtime {
                 Err(error) => self.ui.latest_error = Some(error.to_string()),
             }
         }
+        if let Some(request) = actions.pivot_request {
+            match self.resolve_pivot(request) {
+                Ok((point, description)) => {
+                    self.camera.set_pivot(point);
+                    self.pivot_description = description;
+                    self.ui.latest_error = None;
+                }
+                Err(error) => self.ui.latest_error = Some(error.to_string()),
+            }
+        }
     }
 
     fn load_path(&mut self, path: &Path) -> Result<()> {
@@ -372,6 +391,7 @@ impl Runtime {
         self.fit();
         self.camera.depth_of_field.focus_point = self.camera.target;
         self.focus_description = "Molecule center".into();
+        self.pivot_description = "Molecule center".into();
         self.ui.latest_error = None;
         Ok(())
     }
@@ -701,6 +721,22 @@ impl Runtime {
                 Ok((atom.position, format!("Atom #{} {}", serial, atom.name)))
             }
             FocusRequest::Inspected => self.focus_from_inspection(molecule),
+        }
+    }
+
+    fn resolve_pivot(&self, request: PivotRequest) -> Result<(Vec3, String)> {
+        let molecule = self
+            .molecule
+            .as_ref()
+            .context("load a PDB file before setting the pivot")?;
+        match request {
+            PivotRequest::Inspected => self.focus_from_inspection(molecule),
+            PivotRequest::Reset => {
+                let (minimum, maximum) = molecule
+                    .bounds()
+                    .context("the loaded molecule contains no atoms")?;
+                Ok(((minimum + maximum) * 0.5, "Molecule center".into()))
+            }
         }
     }
 

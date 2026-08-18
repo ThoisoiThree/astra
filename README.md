@@ -55,13 +55,16 @@ cargo build --release
 ```
 
 Controls: click an atom to select and inspect it, left-drag orbits, right-drag or
-Shift+left-drag pans, and the mouse wheel/trackpad zooms. The hierarchy manager
-can select whole chains, residues, or individual atoms. **Fit** reframes the
-molecule and **Reset colors** restores element/CPK coloring.
+Shift+left-drag pans, and the mouse wheel/trackpad zooms. Ctrl/Cmd with either
+right-drag or macOS three-finger drag translates the camera and pivot in screen
+space, so the gesture always follows visible left/right/up/down. The
+hierarchy manager can select whole chains, residues, or individual atoms. **Fit**
+reframes the molecule and **Reset colors** restores element/CPK coloring.
 
 ### Camera and optical depth of field
 
-Open **Camera** in the top toolbar to edit the near and far clipping planes. The
+Open **Camera** in the top toolbar to edit the near and far clipping planes,
+which default to 1 and 1000. The
 DOF renderer uses a thin-lens circle-of-confusion equation and a 64-sample
 source-aware aperture gather instead of a generic radial blur. Focal length,
 sensor height, f-stop, maximum CoC, iris blade count, and iris rotation are
@@ -78,6 +81,9 @@ The focus point can be resolved from:
 - the chain, residue, or atom currently shown in the Inspector.
 
 Focus points remain attached to molecular coordinates while the camera orbits.
+**Set pivot from inspected** moves the orbit pivot to the selected atom or to the
+centroid of the selected residue/chain without moving the eye. **Reset pivot**
+returns it to the molecule center.
 
 ### Coloring and hierarchy overrides
 

@@ -69,6 +69,12 @@ pub enum FocusRequest {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PivotRequest {
+    Inspected,
+    Reset,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InspectionTarget {
     Chain(usize),
     Residue {
@@ -106,6 +112,7 @@ pub struct UiActions {
     pub manager: Option<ManagerAction>,
     pub camera_update: Option<CameraUpdate>,
     pub focus_request: Option<FocusRequest>,
+    pub pivot_request: Option<PivotRequest>,
     pub viewport: egui::Rect,
 }
 
@@ -119,6 +126,7 @@ impl Default for UiActions {
             manager: None,
             camera_update: None,
             focus_request: None,
+            pivot_request: None,
             viewport: egui::Rect::NOTHING,
         }
     }
@@ -137,6 +145,7 @@ pub struct UiInfo<'a> {
     pub inspection: Option<InspectionTarget>,
     pub camera: &'a OrbitCamera,
     pub focus_description: &'a str,
+    pub pivot_description: &'a str,
 }
 
 impl UiState {
@@ -338,6 +347,26 @@ impl UiState {
                         actions.focus_request = Some(FocusRequest::Inspected);
                     }
                 });
+                ui.separator();
+                ui.heading("Orbit pivot");
+                ui.label(format!("Pivot: {}", info.pivot_description));
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(
+                            info.inspection.is_some(),
+                            egui::Button::new("Set pivot from inspected"),
+                        )
+                        .clicked()
+                    {
+                        actions.pivot_request = Some(PivotRequest::Inspected);
+                    }
+                    if ui
+                        .add_enabled(info.molecule.is_some(), egui::Button::new("Reset pivot"))
+                        .clicked()
+                    {
+                        actions.pivot_request = Some(PivotRequest::Reset);
+                    }
+                });
             });
         self.camera_open = open;
         if changed {
@@ -501,7 +530,7 @@ impl UiState {
                 actions.execute = Some(command);
             }
         }
-        ui.small("Click atom to inspect · drag to orbit · right/Shift+drag to pan");
+        ui.small("Click inspect · drag orbit · RMB pan · Ctrl/Cmd+drag screen-space pan");
     }
 
     fn history_previous(&mut self) {

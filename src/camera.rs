@@ -81,8 +81,8 @@ impl OrbitCamera {
             pitch: 0.35,
             aspect: aspect.max(0.01),
             field_of_view_y: 2.0 * (24.0_f32 / (2.0 * 60.0)).atan(),
-            near: 0.05,
-            far: 10_000.0,
+            near: 1.0,
+            far: 1_000.0,
             depth_of_field: DepthOfField::default(),
         }
     }
@@ -119,6 +119,21 @@ impl OrbitCamera {
         let world_per_pixel =
             2.0 * self.distance * (self.field_of_view_y * 0.5).tan() / viewport_height.max(1.0);
         self.target += (-right * delta.x + up * delta.y) * world_per_pixel;
+    }
+
+    /// Changes the orbit pivot while preserving the current eye position.
+    pub fn set_pivot(&mut self, pivot: Vec3) {
+        let eye = self.eye();
+        let offset = eye - pivot;
+        let distance = offset.length();
+        if distance <= f32::EPSILON {
+            return;
+        }
+        let direction = offset / distance;
+        self.target = pivot;
+        self.distance = distance;
+        self.pitch = direction.y.asin().clamp(-1.54, 1.54);
+        self.yaw = direction.x.atan2(direction.z);
     }
 
     pub fn zoom(&mut self, scroll_delta: f32) {
@@ -206,8 +221,6 @@ impl OrbitCamera {
             self.field_of_view_y
         };
         self.distance = (radius / (limiting_fov * 0.5).sin() * 1.15).max(2.0);
-        self.near = (self.distance - radius * 1.5).max(0.02);
-        self.far = (self.distance + radius * 4.0).max(100.0);
     }
 }
 
@@ -221,7 +234,7 @@ mod tests {
         camera.fit_bounds(Vec3::new(-2.0, -1.0, 0.0), Vec3::new(4.0, 3.0, 2.0));
         assert_eq!(camera.target, Vec3::new(1.0, 1.0, 1.0));
         assert!(camera.distance > 4.0);
-        assert!(camera.near > 0.0);
+        assert_eq!((camera.near, camera.far), (1.0, 1_000.0));
     }
 
     #[test]
@@ -262,5 +275,15 @@ mod tests {
         camera.depth_of_field.f_stop = 8.0;
         let narrow = camera.circle_of_confusion_pixels(distance, 800.0).abs();
         assert!(wide > narrow);
+    }
+
+    #[test]
+    fn changing_pivot_preserves_eye_position() {
+        let mut camera = OrbitCamera::new(1.0);
+        let eye = camera.eye();
+        let pivot = Vec3::new(2.0, -1.0, 3.0);
+        camera.set_pivot(pivot);
+        assert!(camera.eye().distance(eye) < 1e-4);
+        assert_eq!(camera.target, pivot);
     }
 }
