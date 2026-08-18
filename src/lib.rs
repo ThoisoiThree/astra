@@ -167,6 +167,45 @@ impl DisplayState {
             })
         });
         let color = color.filter(|_| differs_from_inherited);
+        self.write_color_override(indices, level, color);
+    }
+
+    /// Writes an explicit override even when it currently matches inheritance.
+    /// This is used by the hierarchy's "Set to children" operation.
+    pub fn set_color_override_forced(
+        &mut self,
+        indices: &[usize],
+        level: DisplayLevel,
+        color: DisplayColor,
+    ) {
+        self.write_color_override(indices, level, Some(opaque(color)));
+    }
+
+    pub fn set_color_overrides_forced(
+        &mut self,
+        operations: &[(Vec<usize>, DisplayLevel, DisplayColor)],
+    ) {
+        for (indices, level, color) in operations {
+            let overrides = match level {
+                DisplayLevel::Chain => &mut self.chain_colors,
+                DisplayLevel::Residue => &mut self.residue_colors,
+                DisplayLevel::Atom => &mut self.atom_colors,
+            };
+            for &index in indices {
+                if let Some(value) = overrides.get_mut(index) {
+                    *value = Some(opaque(*color));
+                }
+            }
+        }
+        self.recompute_colors();
+    }
+
+    fn write_color_override(
+        &mut self,
+        indices: &[usize],
+        level: DisplayLevel,
+        color: Option<DisplayColor>,
+    ) {
         let overrides = match level {
             DisplayLevel::Chain => &mut self.chain_colors,
             DisplayLevel::Residue => &mut self.residue_colors,
@@ -236,6 +275,25 @@ impl DisplayState {
         for &index in indices {
             if let Some(value) = overrides.get_mut(index) {
                 *value = state;
+            }
+        }
+        self.recompute_visibility();
+    }
+
+    pub fn set_visibility_overrides(
+        &mut self,
+        operations: &[(Vec<usize>, DisplayLevel, VisibilityOverride)],
+    ) {
+        for (indices, level, state) in operations {
+            let overrides = match level {
+                DisplayLevel::Chain => &mut self.chain_visibility,
+                DisplayLevel::Residue => &mut self.residue_visibility,
+                DisplayLevel::Atom => &mut self.atom_visibility,
+            };
+            for &index in indices {
+                if let Some(value) = overrides.get_mut(index) {
+                    *value = *state;
+                }
             }
         }
         self.recompute_visibility();
@@ -502,5 +560,15 @@ mod display_tests {
         let inherited = display.color_at_level(0, DisplayLevel::Atom);
         display.set_color_override(&[0], DisplayLevel::Atom, Some(inherited));
         assert!(!display.color_is_overridden(0, DisplayLevel::Atom));
+    }
+
+    #[test]
+    fn forced_child_color_remains_an_override_when_equal_to_parent() {
+        let molecule = molecule();
+        let mut display = DisplayState::for_molecule(&molecule);
+        let color = [0.2, 0.4, 0.8, 1.0];
+        display.set_color_override(&[0, 1], DisplayLevel::Chain, Some(color));
+        display.set_color_overrides_forced(&[(vec![0], DisplayLevel::Atom, color)]);
+        assert!(display.color_is_overridden(0, DisplayLevel::Atom));
     }
 }

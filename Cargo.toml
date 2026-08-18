@@ -2,7 +2,7 @@
 name = "molview"
 version = "0.1.0"
 edition = "2024"
-license = "MIT"
+license = "GPL-3.0-only"
 description = "A lightweight native molecular viewer built with Rust and wgpu"
 
 [dependencies]

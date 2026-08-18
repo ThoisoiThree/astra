@@ -99,6 +99,13 @@ force visible, hide, inherit. A lower-level state wins, so a green residue or at
 remains visible inside a red chain. Clicking a row selects/highlights it without
 opening it; only its disclosure triangle expands or collapses the node.
 
+Shift-click selects the inclusive same-level range from the last normal-click
+anchor: chains between chains, residues between residues, or atoms between
+atoms. Ctrl/Cmd-click toggles one row without moving that anchor. Editing the
+color square or eye of any selected row applies the new value to the whole set.
+Right-click either attribute for **Reset to default** or **Set to children**. The
+latter recursively forces the row's effective value onto its residues and atoms.
+
 ## Selection language
 
 Keywords are ASCII case-insensitive. `not` binds most tightly, then `and`, then
@@ -198,4 +205,4 @@ cargo clippy --all-targets --all-features -- -D warnings
 
 ## License
 
-MIT. See `LICENSE`.
+GNU General Public License v3.0 only. See `LICENSE`.

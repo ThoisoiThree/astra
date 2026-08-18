@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use molview::{
     ColoringMode, DisplayColor, DisplayLevel, DisplayState, VisibilityOverride,
@@ -25,7 +25,7 @@ pub struct UiState {
 
 #[derive(Debug, Clone)]
 struct ColorEditor {
-    target: InspectionTarget,
+    targets: Vec<InspectionTarget>,
     label: String,
     hsva: egui::ecolor::Hsva,
 }
@@ -74,7 +74,7 @@ pub enum PivotRequest {
     Reset,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum InspectionTarget {
     Chain(usize),
     Residue {
@@ -84,19 +84,29 @@ pub enum InspectionTarget {
     Atom(usize),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HierarchySelectionGesture {
+    Replace,
+    Range,
+    Toggle,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum ManagerAction {
-    SelectChain(usize),
-    SelectResidue {
-        chain_index: usize,
-        residue_index: usize,
-    },
-    SelectAtom(usize),
-    SetColor {
+    SelectHierarchy {
         target: InspectionTarget,
+        gesture: HierarchySelectionGesture,
+    },
+    SetColor {
+        targets: Vec<InspectionTarget>,
         color: Option<DisplayColor>,
     },
-    CycleVisibility(InspectionTarget),
+    SetVisibility {
+        targets: Vec<InspectionTarget>,
+        state: VisibilityOverride,
+    },
+    PropagateColor(Vec<InspectionTarget>),
+    PropagateVisibility(Vec<InspectionTarget>),
     SetColoringMode(ColoringMode),
     SetUniformColor(DisplayColor),
     ActivateNamed(String),
@@ -143,6 +153,7 @@ pub struct UiInfo<'a> {
     pub display: Option<&'a DisplayState>,
     pub named_selections: &'a BTreeMap<String, Selection>,
     pub inspection: Option<InspectionTarget>,
+    pub hierarchy_selection: &'a BTreeSet<InspectionTarget>,
     pub camera: &'a OrbitCamera,
     pub focus_description: &'a str,
     pub pivot_description: &'a str,
@@ -468,7 +479,7 @@ impl UiState {
                     egui::color_picker::Alpha::Opaque,
                 ) {
                     actions.manager = Some(ManagerAction::SetColor {
-                        target: editor.target,
+                        targets: editor.targets.clone(),
                         color: Some(color_from_hsva(editor.hsva)),
                     });
                 }
@@ -490,7 +501,7 @@ impl UiState {
             });
         if restore_default {
             actions.manager = Some(ManagerAction::SetColor {
-                target: editor.target,
+                targets: editor.targets.clone(),
                 color: None,
             });
         } else if open {
@@ -725,6 +736,7 @@ fn hierarchy_tree(
     color_editor: &mut Option<ColorEditor>,
 ) {
     ui.heading("Hierarchy");
+    ui.small("Shift: select range · Ctrl/Cmd: toggle one object");
     let (Some(molecule), Some(hierarchy), Some(display)) =
         (info.molecule, info.hierarchy, info.display)
     else {
@@ -757,7 +769,8 @@ fn hierarchy_tree(
                     DisplayLevel::Chain,
                     first_atom,
                     &chain_label,
-                    info.inspection == Some(chain_target),
+                    info.hierarchy_selection.contains(&chain_target),
+                    info.hierarchy_selection,
                     actions,
                     color_editor,
                 );
@@ -788,7 +801,8 @@ fn hierarchy_tree(
                                 DisplayLevel::Residue,
                                 residue.atom_indices.first().copied(),
                                 &residue_label,
-                                info.inspection == Some(residue_target),
+                                info.hierarchy_selection.contains(&residue_target),
+                                info.hierarchy_selection,
                                 actions,
                                 color_editor,
                             );
@@ -811,7 +825,8 @@ fn hierarchy_tree(
                                             DisplayLevel::Atom,
                                             Some(atom_index),
                                             &label,
-                                            info.inspection == Some(target),
+                                            info.hierarchy_selection.contains(&target),
+                                            info.hierarchy_selection,
                                             actions,
                                             color_editor,
                                         );
@@ -833,6 +848,7 @@ fn hierarchy_row(
     first_atom: Option<usize>,
     label: &str,
     selected: bool,
+    hierarchy_selection: &BTreeSet<InspectionTarget>,
     actions: &mut UiActions,
     color_editor: &mut Option<ColorEditor>,
 ) {
@@ -842,37 +858,95 @@ fn hierarchy_row(
     };
     let color = display.color_at_level(atom_index, level);
     let overridden = display.color_is_overridden(atom_index, level);
-    if color_square(ui, color, overridden)
-        .on_hover_text(if overridden {
-            "Custom HSV color (click to edit; orange border = override)"
+    let attribute_targets = if selected {
+        hierarchy_selection.iter().copied().collect::<Vec<_>>()
+    } else {
+        vec![target]
+    };
+    let color_response = color_square(ui, color, overridden).on_hover_text(if overridden {
+        "Custom HSV color (click to edit; orange border = override)"
+    } else {
+        "Inherited/default color (click to override in HSV)"
+    });
+    color_response.context_menu(|ui| {
+        if ui.button("Reset to default").clicked() {
+            actions.manager = Some(ManagerAction::SetColor {
+                targets: attribute_targets.clone(),
+                color: None,
+            });
+            ui.close();
+        }
+        if ui
+            .add_enabled(
+                attribute_targets
+                    .iter()
+                    .any(|target| target_has_children(*target)),
+                egui::Button::new("Set to children"),
+            )
+            .clicked()
+        {
+            actions.manager = Some(ManagerAction::PropagateColor(attribute_targets.clone()));
+            ui.close();
+        }
+    });
+    if color_response.clicked() {
+        let editor_label = if attribute_targets.len() > 1 {
+            format!("{} selected objects", attribute_targets.len())
         } else {
-            "Inherited/default color (click to override in HSV)"
-        })
-        .clicked()
-    {
+            label.to_owned()
+        };
         *color_editor = Some(ColorEditor {
-            target,
-            label: label.to_owned(),
+            targets: attribute_targets.clone(),
+            label: editor_label,
             hsva: hsva_from_color(color),
         });
     }
     let visibility = display.visibility_override(atom_index, level);
-    if visibility_button(ui, visibility).clicked() {
-        actions.manager = Some(ManagerAction::CycleVisibility(target));
-    }
-    if ui.selectable_label(selected, label).clicked() {
-        actions.manager = Some(match target {
-            InspectionTarget::Chain(index) => ManagerAction::SelectChain(index),
-            InspectionTarget::Residue {
-                chain_index,
-                residue_index,
-            } => ManagerAction::SelectResidue {
-                chain_index,
-                residue_index,
-            },
-            InspectionTarget::Atom(index) => ManagerAction::SelectAtom(index),
+    let visibility_response = visibility_button(ui, visibility);
+    visibility_response.context_menu(|ui| {
+        if ui.button("Reset to default").clicked() {
+            actions.manager = Some(ManagerAction::SetVisibility {
+                targets: attribute_targets.clone(),
+                state: VisibilityOverride::Inherit,
+            });
+            ui.close();
+        }
+        if ui
+            .add_enabled(
+                attribute_targets
+                    .iter()
+                    .any(|target| target_has_children(*target)),
+                egui::Button::new("Set to children"),
+            )
+            .clicked()
+        {
+            actions.manager = Some(ManagerAction::PropagateVisibility(
+                attribute_targets.clone(),
+            ));
+            ui.close();
+        }
+    });
+    if visibility_response.clicked() {
+        actions.manager = Some(ManagerAction::SetVisibility {
+            targets: attribute_targets,
+            state: visibility.next(),
         });
     }
+    if ui.selectable_label(selected, label).clicked() {
+        let modifiers = ui.ctx().input(|input| input.modifiers);
+        let gesture = if modifiers.shift {
+            HierarchySelectionGesture::Range
+        } else if modifiers.command || modifiers.ctrl || modifiers.mac_cmd {
+            HierarchySelectionGesture::Toggle
+        } else {
+            HierarchySelectionGesture::Replace
+        };
+        actions.manager = Some(ManagerAction::SelectHierarchy { target, gesture });
+    }
+}
+
+fn target_has_children(target: InspectionTarget) -> bool {
+    !matches!(target, InspectionTarget::Atom(_))
 }
 
 fn color_square(ui: &mut egui::Ui, color: DisplayColor, overridden: bool) -> egui::Response {

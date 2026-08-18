@@ -1,9 +1,15 @@
-use std::{collections::BTreeMap, fs, path::Path, path::PathBuf, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs,
+    path::Path,
+    path::PathBuf,
+    sync::Arc,
+};
 
 use anyhow::{Context, Result};
 use glam::{Vec2, Vec3};
 use molview::{
-    DisplayLevel, DisplayState, RepresentationMask,
+    DisplayColor, DisplayLevel, DisplayState, RepresentationMask, VisibilityOverride,
     camera::{OrbitCamera, Viewport},
     command::{Command, Representation, parse_command},
     molecule::{Molecule, MoleculeHierarchy, parse_pdb},
@@ -21,8 +27,8 @@ use winit::{
 };
 
 use crate::ui::{
-    CameraUpdate, FocusRequest, InspectionTarget, ManagerAction, PivotRequest, UiActions, UiInfo,
-    UiState,
+    CameraUpdate, FocusRequest, HierarchySelectionGesture, InspectionTarget, ManagerAction,
+    PivotRequest, UiActions, UiInfo, UiState,
 };
 
 pub fn run(initial_path: Option<PathBuf>) -> Result<()> {
@@ -88,6 +94,8 @@ struct Runtime {
     display: Option<DisplayState>,
     named_selections: BTreeMap<String, Selection>,
     inspection: Option<InspectionTarget>,
+    hierarchy_selection: BTreeSet<InspectionTarget>,
+    hierarchy_selection_anchor: Option<InspectionTarget>,
     focus_description: String,
     pivot_description: String,
     loaded_filename: Option<String>,
@@ -135,6 +143,8 @@ impl Runtime {
             display: None,
             named_selections: BTreeMap::new(),
             inspection: None,
+            hierarchy_selection: BTreeSet::new(),
+            hierarchy_selection_anchor: None,
             focus_description: "World origin".into(),
             pivot_description: "World origin".into(),
             loaded_filename: None,
@@ -265,6 +275,7 @@ impl Runtime {
             display: self.display.as_ref(),
             named_selections: &self.named_selections,
             inspection: self.inspection,
+            hierarchy_selection: &self.hierarchy_selection,
             camera: &self.camera,
             focus_description: &self.focus_description,
             pivot_description: &self.pivot_description,
@@ -388,6 +399,8 @@ impl Runtime {
         self.display = Some(display);
         self.named_selections.clear();
         self.inspection = None;
+        self.hierarchy_selection.clear();
+        self.hierarchy_selection_anchor = None;
         self.fit();
         self.camera.depth_of_field.focus_point = self.camera.target;
         self.focus_description = "Molecule center".into();
@@ -414,6 +427,8 @@ impl Runtime {
                     self.named_selections.insert(name, selection);
                 }
                 self.inspection = None;
+                self.hierarchy_selection.clear();
+                self.hierarchy_selection_anchor = None;
             }
             Command::Color { color, selection } => {
                 let indices: Vec<_> =
@@ -486,65 +501,51 @@ impl Runtime {
             });
         match picked {
             Some(atom_index) => {
-                self.select_indices(vec![atom_index], Some(InspectionTarget::Atom(atom_index)))
+                let target = InspectionTarget::Atom(atom_index);
+                self.hierarchy_selection.clear();
+                self.hierarchy_selection.insert(target);
+                self.hierarchy_selection_anchor = Some(target);
+                self.select_indices(vec![atom_index], Some(target));
             }
-            None if self.viewport.contains(point) => self.select_indices(Vec::new(), None),
+            None if self.viewport.contains(point) => {
+                self.hierarchy_selection.clear();
+                self.hierarchy_selection_anchor = None;
+                self.select_indices(Vec::new(), None);
+            }
             None => {}
         }
     }
 
     fn handle_manager_action(&mut self, action: ManagerAction) {
         match action {
-            ManagerAction::SelectChain(chain_index) => {
-                let indices = self
-                    .hierarchy
-                    .as_ref()
-                    .and_then(|hierarchy| hierarchy.chains.get(chain_index))
-                    .map(|chain| {
-                        chain
-                            .residues
-                            .iter()
-                            .flat_map(|residue| residue.atom_indices.iter().copied())
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                self.select_indices(indices, Some(InspectionTarget::Chain(chain_index)));
+            ManagerAction::SelectHierarchy { target, gesture } => {
+                self.select_hierarchy(target, gesture);
             }
-            ManagerAction::SelectResidue {
-                chain_index,
-                residue_index,
-            } => {
-                let indices = self
-                    .hierarchy
-                    .as_ref()
-                    .and_then(|hierarchy| hierarchy.residue(chain_index, residue_index))
-                    .map(|residue| residue.atom_indices.clone())
-                    .unwrap_or_default();
-                self.select_indices(
-                    indices,
-                    Some(InspectionTarget::Residue {
-                        chain_index,
-                        residue_index,
-                    }),
-                );
-            }
-            ManagerAction::SelectAtom(atom_index) => {
-                self.select_indices(vec![atom_index], Some(InspectionTarget::Atom(atom_index)))
-            }
-            ManagerAction::SetColor { target, color } => {
-                let (indices, level) = self.display_target(target);
+            ManagerAction::SetColor { targets, color } => {
+                let operations: Vec<_> = targets
+                    .into_iter()
+                    .map(|target| self.display_target(target))
+                    .collect();
                 if let Some(display) = &mut self.display {
-                    display.set_color_override(&indices, level, color);
+                    for (indices, level) in operations {
+                        display.set_color_override(&indices, level, color);
+                    }
                 }
                 self.refresh_instances();
             }
-            ManagerAction::CycleVisibility(target) => {
-                let (indices, level) = self.display_target(target);
+            ManagerAction::SetVisibility { targets, state } => {
+                let operations: Vec<_> = targets
+                    .into_iter()
+                    .map(|target| self.display_target(target))
+                    .map(|(indices, level)| (indices, level, state))
+                    .collect();
                 if let Some(display) = &mut self.display {
-                    display.cycle_visibility(&indices, level);
+                    display.set_visibility_overrides(&operations);
                 }
                 self.refresh_instances();
             }
+            ManagerAction::PropagateColor(targets) => self.propagate_color(&targets),
+            ManagerAction::PropagateVisibility(targets) => self.propagate_visibility(&targets),
             ManagerAction::SetColoringMode(mode) => {
                 if let (Some(molecule), Some(display)) = (&self.molecule, &mut self.display) {
                     display.set_coloring_mode(molecule, mode);
@@ -559,12 +560,172 @@ impl Runtime {
             }
             ManagerAction::ActivateNamed(name) => {
                 if let Some(selection) = self.named_selections.get(&name) {
+                    self.hierarchy_selection.clear();
+                    self.hierarchy_selection_anchor = None;
                     self.set_selection(selection.flags().to_vec(), None);
                 }
             }
             ManagerAction::RemoveNamed(name) => {
                 self.named_selections.remove(&name);
             }
+        }
+    }
+
+    fn select_hierarchy(&mut self, target: InspectionTarget, gesture: HierarchySelectionGesture) {
+        let range = self
+            .hierarchy_selection_anchor
+            .and_then(|anchor| self.hierarchy_range(anchor, target));
+        let inspection = update_hierarchy_selection(
+            &mut self.hierarchy_selection,
+            &mut self.hierarchy_selection_anchor,
+            target,
+            gesture,
+            range.as_deref(),
+        );
+        let targets: Vec<_> = self.hierarchy_selection.iter().copied().collect();
+        let indices = targets
+            .into_iter()
+            .flat_map(|target| self.display_target(target).0)
+            .collect();
+        self.select_indices(indices, inspection);
+    }
+
+    fn hierarchy_range(
+        &self,
+        anchor: InspectionTarget,
+        target: InspectionTarget,
+    ) -> Option<Vec<InspectionTarget>> {
+        if std::mem::discriminant(&anchor) != std::mem::discriminant(&target) {
+            return None;
+        }
+        let hierarchy = self.hierarchy.as_ref()?;
+        let ordered: Vec<InspectionTarget> = match target {
+            InspectionTarget::Chain(_) => (0..hierarchy.chains.len())
+                .map(InspectionTarget::Chain)
+                .collect(),
+            InspectionTarget::Residue { .. } => hierarchy
+                .chains
+                .iter()
+                .enumerate()
+                .flat_map(|(chain_index, chain)| {
+                    (0..chain.residues.len()).map(move |residue_index| InspectionTarget::Residue {
+                        chain_index,
+                        residue_index,
+                    })
+                })
+                .collect(),
+            InspectionTarget::Atom(_) => hierarchy
+                .chains
+                .iter()
+                .flat_map(|chain| &chain.residues)
+                .flat_map(|residue| residue.atom_indices.iter().copied())
+                .map(InspectionTarget::Atom)
+                .collect(),
+        };
+        inclusive_target_range(&ordered, anchor, target)
+    }
+
+    fn propagate_color(&mut self, targets: &[InspectionTarget]) {
+        let mut operations = Vec::<(Vec<usize>, DisplayLevel, DisplayColor)>::new();
+        for &target in targets {
+            let (source_indices, source_level) = self.display_target(target);
+            let Some(source_atom) = source_indices.first().copied() else {
+                continue;
+            };
+            let Some(color) = self
+                .display
+                .as_ref()
+                .map(|display| display.color_at_level(source_atom, source_level))
+            else {
+                continue;
+            };
+            for child in self.descendant_targets(target) {
+                let (indices, level) = self.display_target(child);
+                operations.push((indices, level, color));
+            }
+        }
+        if let Some(display) = &mut self.display {
+            display.set_color_overrides_forced(&operations);
+        }
+        self.refresh_instances();
+    }
+
+    fn propagate_visibility(&mut self, targets: &[InspectionTarget]) {
+        let mut operations = Vec::<(Vec<usize>, DisplayLevel, VisibilityOverride)>::new();
+        for &target in targets {
+            let (source_indices, source_level) = self.display_target(target);
+            let Some(source_atom) = source_indices.first().copied() else {
+                continue;
+            };
+            let Some(display) = &self.display else {
+                continue;
+            };
+            let direct = display.visibility_override(source_atom, source_level);
+            let state = match direct {
+                VisibilityOverride::Inherit => {
+                    if display.visible.get(source_atom).copied().unwrap_or(true) {
+                        VisibilityOverride::Show
+                    } else {
+                        VisibilityOverride::Hide
+                    }
+                }
+                state => state,
+            };
+            for child in self.descendant_targets(target) {
+                let (indices, level) = self.display_target(child);
+                operations.push((indices, level, state));
+            }
+        }
+        if let Some(display) = &mut self.display {
+            display.set_visibility_overrides(&operations);
+        }
+        self.refresh_instances();
+    }
+
+    fn descendant_targets(&self, target: InspectionTarget) -> Vec<InspectionTarget> {
+        match target {
+            InspectionTarget::Chain(chain_index) => self
+                .hierarchy
+                .as_ref()
+                .and_then(|hierarchy| hierarchy.chains.get(chain_index))
+                .map(|chain| {
+                    chain
+                        .residues
+                        .iter()
+                        .enumerate()
+                        .flat_map(|(residue_index, residue)| {
+                            std::iter::once(InspectionTarget::Residue {
+                                chain_index,
+                                residue_index,
+                            })
+                            .chain(
+                                residue
+                                    .atom_indices
+                                    .iter()
+                                    .copied()
+                                    .map(InspectionTarget::Atom),
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+            InspectionTarget::Residue {
+                chain_index,
+                residue_index,
+            } => self
+                .hierarchy
+                .as_ref()
+                .and_then(|hierarchy| hierarchy.residue(chain_index, residue_index))
+                .map(|residue| {
+                    residue
+                        .atom_indices
+                        .iter()
+                        .copied()
+                        .map(InspectionTarget::Atom)
+                        .collect()
+                })
+                .unwrap_or_default(),
+            InspectionTarget::Atom(_) => Vec::new(),
         }
     }
 
@@ -833,5 +994,114 @@ fn representation_mask(representation: Representation) -> RepresentationMask {
     match representation {
         Representation::Spheres => RepresentationMask::SPHERES,
         Representation::Sticks => RepresentationMask::STICKS,
+    }
+}
+
+fn update_hierarchy_selection(
+    selection: &mut BTreeSet<InspectionTarget>,
+    anchor: &mut Option<InspectionTarget>,
+    target: InspectionTarget,
+    gesture: HierarchySelectionGesture,
+    range: Option<&[InspectionTarget]>,
+) -> Option<InspectionTarget> {
+    match gesture {
+        HierarchySelectionGesture::Replace => {
+            selection.clear();
+            selection.insert(target);
+            *anchor = Some(target);
+        }
+        HierarchySelectionGesture::Range => {
+            selection.clear();
+            if let Some(range) = range {
+                selection.extend(range.iter().copied());
+            } else {
+                selection.insert(target);
+                *anchor = Some(target);
+            }
+        }
+        HierarchySelectionGesture::Toggle => {
+            if !selection.insert(target) {
+                selection.remove(&target);
+            }
+            if anchor.is_none() {
+                *anchor = Some(target);
+            }
+        }
+    }
+    if selection.contains(&target) {
+        Some(target)
+    } else {
+        selection.iter().next_back().copied()
+    }
+}
+
+fn inclusive_target_range(
+    ordered: &[InspectionTarget],
+    anchor: InspectionTarget,
+    target: InspectionTarget,
+) -> Option<Vec<InspectionTarget>> {
+    let anchor_index = ordered.iter().position(|candidate| *candidate == anchor)?;
+    let target_index = ordered.iter().position(|candidate| *candidate == target)?;
+    let start = anchor_index.min(target_index);
+    let end = anchor_index.max(target_index);
+    Some(ordered[start..=end].to_vec())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shift_selects_range_and_command_toggles_one_target() {
+        let chain_0 = InspectionTarget::Chain(0);
+        let chain_1 = InspectionTarget::Chain(1);
+        let chain_2 = InspectionTarget::Chain(2);
+        let chain_3 = InspectionTarget::Chain(3);
+        let mut selection = BTreeSet::new();
+        let mut anchor = None;
+        assert_eq!(
+            update_hierarchy_selection(
+                &mut selection,
+                &mut anchor,
+                chain_0,
+                HierarchySelectionGesture::Replace,
+                None,
+            ),
+            Some(chain_0)
+        );
+        let range = [chain_0, chain_1, chain_2, chain_3];
+        assert_eq!(
+            update_hierarchy_selection(
+                &mut selection,
+                &mut anchor,
+                chain_3,
+                HierarchySelectionGesture::Range,
+                Some(&range),
+            ),
+            Some(chain_3)
+        );
+        assert_eq!(selection.len(), 4);
+        update_hierarchy_selection(
+            &mut selection,
+            &mut anchor,
+            chain_1,
+            HierarchySelectionGesture::Toggle,
+            None,
+        );
+        assert!(!selection.contains(&chain_1));
+        assert_eq!(anchor, Some(chain_0));
+    }
+
+    #[test]
+    fn hierarchy_range_is_inclusive_in_both_directions() {
+        let ordered = [
+            InspectionTarget::Atom(4),
+            InspectionTarget::Atom(8),
+            InspectionTarget::Atom(12),
+        ];
+        assert_eq!(
+            inclusive_target_range(&ordered, ordered[2], ordered[0]),
+            Some(ordered.to_vec())
+        );
     }
 }
