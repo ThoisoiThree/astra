@@ -80,7 +80,7 @@ impl VisibilityOverride {
 /// Hierarchical overrides are stored per atom so the renderer receives flat,
 /// contiguous arrays while the application remains responsible for mapping
 /// hierarchy nodes to atom indices.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct DisplayState {
     pub colors: Vec<DisplayColor>,
     pub visible: Vec<bool>,

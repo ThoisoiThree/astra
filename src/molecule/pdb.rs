@@ -128,7 +128,7 @@ fn parse_atom(line: &str, line_number: usize, hetero: bool) -> Result<Atom, PdbE
     })
 }
 
-fn infer_element(raw_name: &str) -> Element {
+pub(crate) fn infer_element(raw_name: &str) -> Element {
     let bytes = raw_name.as_bytes();
     let candidate = if bytes.first().is_some_and(u8::is_ascii_whitespace) {
         raw_name.trim().chars().next().map(|c| c.to_string())

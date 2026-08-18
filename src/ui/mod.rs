@@ -205,7 +205,7 @@ impl UiState {
         let mut actions = UiActions::default();
         egui::Panel::top("toolbar").show(root, |ui| {
             ui.horizontal(|ui| {
-                actions.open = ui.button("Open PDB").clicked();
+                actions.open = ui.button("Open structure").clicked();
                 actions.fit = ui.button("Fit").clicked();
                 actions.reset_colors = ui.button("Reset colors").clicked();
                 if ui.selectable_label(self.camera_open, "Camera").clicked() {
@@ -661,7 +661,9 @@ impl UiState {
                 actions.execute = Some(command);
             }
         }
-        ui.small("Click inspect · drag orbit · RMB pan · Ctrl/Cmd+drag screen-space pan");
+        ui.small(
+            "Click inspect · drag orbit · RMB pan · Ctrl/Cmd+drag pan · Ctrl/Cmd+Z undo · Ctrl/Cmd+R redo",
+        );
     }
 
     fn history_previous(&mut self) {

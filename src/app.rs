@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     fs,
     path::Path,
     path::PathBuf,
@@ -13,7 +13,7 @@ use molview::{
     VisibilityOverride,
     camera::{OrbitCamera, Viewport},
     command::{Command, Representation, parse_command},
-    molecule::{Molecule, MoleculeHierarchy, parse_pdb},
+    molecule::{Molecule, MoleculeHierarchy, parse_structure},
     picking::pick_atom_filtered,
     render::{RenderError, Renderer, SurfaceIssue},
     selection::{Selection, evaluate_with_named, parse_selection},
@@ -23,9 +23,11 @@ use winit::{
     dpi::{LogicalSize, PhysicalPosition},
     event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent},
     event_loop::{ActiveEventLoop, EventLoop},
-    keyboard::ModifiersState,
+    keyboard::{Key, ModifiersState},
     window::{Window, WindowAttributes, WindowId},
 };
+
+const EDIT_HISTORY_LIMIT: usize = 50;
 
 use crate::ui::{
     CameraUpdate, FocusRequest, HierarchySelectionGesture, InspectionTarget, ManagerAction,
@@ -110,6 +112,21 @@ struct Runtime {
     left_drag_distance: f32,
     right_drag: bool,
     modifiers: ModifiersState,
+    focused: bool,
+    occluded: bool,
+    undo_history: VecDeque<EditableSnapshot>,
+    redo_history: VecDeque<EditableSnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct EditableSnapshot {
+    display: Option<DisplayState>,
+    named_selections: BTreeMap<String, Selection>,
+    named_selection_expressions: BTreeMap<String, String>,
+    named_selection_styles: BTreeMap<String, NamedSelectionStyle>,
+    inspection: Option<InspectionTarget>,
+    hierarchy_selection: BTreeSet<InspectionTarget>,
+    hierarchy_selection_anchor: Option<InspectionTarget>,
 }
 
 impl Runtime {
@@ -161,6 +178,10 @@ impl Runtime {
             left_drag_distance: 0.0,
             right_drag: false,
             modifiers: ModifiersState::default(),
+            focused: true,
+            occluded: false,
+            undo_history: VecDeque::new(),
+            redo_history: VecDeque::new(),
         };
         if let Some(path) = initial_path
             && let Err(error) = runtime.load_path(&path)
@@ -185,17 +206,49 @@ impl Runtime {
                 self.window.request_redraw();
             }
             WindowEvent::DroppedFile(path) => {
-                if path
-                    .extension()
-                    .is_some_and(|extension| extension.eq_ignore_ascii_case("pdb"))
-                {
-                    if let Err(error) = self.load_path(&path) {
-                        self.ui.latest_error = Some(error.to_string());
+                if let Err(error) = self.load_path(&path) {
+                    self.ui.latest_error = Some(error.to_string());
+                }
+                self.window.request_redraw();
+            }
+            WindowEvent::Focused(focused) => {
+                self.focused = focused;
+                self.left_drag = false;
+                self.right_drag = false;
+                self.cursor = None;
+                self.modifiers = ModifiersState::default();
+                if focused {
+                    let size = self.window.inner_size();
+                    if size.width > 0 && size.height > 0 {
+                        self.window.request_redraw();
                     }
-                    self.window.request_redraw();
+                }
+            }
+            WindowEvent::Occluded(occluded) => {
+                self.occluded = occluded;
+                if !occluded && self.focused {
+                    let size = self.window.inner_size();
+                    if size.width > 0 && size.height > 0 {
+                        self.window.request_redraw();
+                    }
                 }
             }
             WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
+            WindowEvent::KeyboardInput { event, .. }
+                if event.state == ElementState::Pressed
+                    && !event.repeat
+                    && !egui_response.consumed
+                    && (self.modifiers.control_key() || self.modifiers.super_key()) =>
+            {
+                let handled = match &event.logical_key {
+                    Key::Character(value) if value.eq_ignore_ascii_case("z") => self.undo(),
+                    Key::Character(value) if value.eq_ignore_ascii_case("r") => self.redo(),
+                    _ => false,
+                };
+                if handled {
+                    self.window.request_redraw();
+                }
+            }
             WindowEvent::MouseInput { state, button, .. } => {
                 let pressed = state == ElementState::Pressed;
                 match button {
@@ -210,7 +263,9 @@ impl Runtime {
                             && !self.egui_context.is_pointer_over_egui();
                         self.left_drag = false;
                         if should_pick && let Some(position) = self.cursor {
+                            let before = self.editable_snapshot();
                             self.pick_at(position);
+                            self.commit_edit(before);
                             self.window.request_redraw();
                         }
                     }
@@ -254,7 +309,14 @@ impl Runtime {
                 self.camera.zoom(amount);
                 self.window.request_redraw();
             }
-            WindowEvent::RedrawRequested => self.redraw(event_loop),
+            WindowEvent::RedrawRequested
+                if self.focused
+                    && !self.occluded
+                    && self.window.inner_size().width > 0
+                    && self.window.inner_size().height > 0 =>
+            {
+                self.redraw(event_loop);
+            }
             _ => {}
         }
     }
@@ -324,11 +386,13 @@ impl Runtime {
                     self.window.request_redraw();
                 }
             }
-            Err(RenderError::Surface(SurfaceIssue::Timeout)) => self.window.request_redraw(),
+            // Retrying immediately can create a hot redraw loop on Metal while macOS is
+            // restoring the window's drawable after an app switch. A later OS event will
+            // schedule the next frame without monopolizing WindowServer.
+            Err(RenderError::Surface(SurfaceIssue::Timeout)) => {}
             Err(RenderError::Surface(SurfaceIssue::Occluded)) => {}
             Err(error) => {
                 self.ui.latest_error = Some(error.to_string());
-                self.window.request_redraw();
             }
         }
     }
@@ -336,7 +400,14 @@ impl Runtime {
     fn handle_ui_actions(&mut self, actions: UiActions) {
         if actions.open
             && let Some(path) = rfd::FileDialog::new()
-                .add_filter("Protein Data Bank", &["pdb", "ent"])
+                .add_filter(
+                    "Molecular structures",
+                    &["pdb", "ent", "cif", "mmcif", "bcif", "xml", "gz"],
+                )
+                .add_filter("PDBx/mmCIF", &["cif", "mmcif", "gz"])
+                .add_filter("BinaryCIF", &["bcif", "gz"])
+                .add_filter("Legacy PDB", &["pdb", "ent", "gz"])
+                .add_filter("PDBML/XML", &["xml", "gz"])
                 .pick_file()
             && let Err(error) = self.load_path(&path)
         {
@@ -348,6 +419,15 @@ impl Runtime {
         if actions.reset_colors
             && let (Some(molecule), Some(display)) = (&self.molecule, &mut self.display)
         {
+            let before = EditableSnapshot {
+                display: Some(display.clone()),
+                named_selections: self.named_selections.clone(),
+                named_selection_expressions: self.named_selection_expressions.clone(),
+                named_selection_styles: self.named_selection_styles.clone(),
+                inspection: self.inspection,
+                hierarchy_selection: self.hierarchy_selection.clone(),
+                hierarchy_selection_anchor: self.hierarchy_selection_anchor,
+            };
             display.reset_colors(molecule);
             for style in self.named_selection_styles.values_mut() {
                 style.color = None;
@@ -358,18 +438,27 @@ impl Runtime {
             ));
             self.renderer.update_instances(molecule, display);
             self.ui.latest_error = None;
+            self.commit_edit(before);
         }
         if let Some(command) = actions.execute {
-            match parse_command(&command)
-                .map_err(anyhow::Error::from)
-                .and_then(|command| self.apply_command(command))
-            {
-                Ok(()) => self.ui.latest_error = None,
+            match parse_command(&command).map_err(anyhow::Error::from) {
+                Ok(command) => {
+                    let before = self.editable_snapshot();
+                    match self.apply_command(command) {
+                        Ok(()) => {
+                            self.commit_edit(before);
+                            self.ui.latest_error = None;
+                        }
+                        Err(error) => self.ui.latest_error = Some(error.to_string()),
+                    }
+                }
                 Err(error) => self.ui.latest_error = Some(error.to_string()),
             }
         }
         if let Some(action) = actions.manager {
+            let before = self.editable_snapshot();
             self.handle_manager_action(action);
+            self.commit_edit(before);
         }
         if let Some(update) = actions.camera_update {
             self.apply_camera_update(update);
@@ -397,17 +486,18 @@ impl Runtime {
     }
 
     fn load_path(&mut self, path: &Path) -> Result<()> {
-        let contents = fs::read_to_string(path)
-            .with_context(|| format!("could not read {}", path.display()))?;
-        let molecule =
-            parse_pdb(&contents).with_context(|| format!("could not parse {}", path.display()))?;
+        let contents =
+            fs::read(path).with_context(|| format!("could not read {}", path.display()))?;
+        let filename = path.file_name().map_or_else(
+            || path.display().to_string(),
+            |name| name.to_string_lossy().into(),
+        );
+        let (molecule, _format) = parse_structure(&contents, &filename)
+            .with_context(|| format!("could not parse {}", path.display()))?;
         let hierarchy = MoleculeHierarchy::from_molecule(&molecule);
         let display = DisplayState::for_molecule(&molecule);
         self.renderer.update_instances(&molecule, &display);
-        self.loaded_filename = Some(path.file_name().map_or_else(
-            || path.display().to_string(),
-            |name| name.to_string_lossy().into(),
-        ));
+        self.loaded_filename = Some(filename);
         self.molecule = Some(molecule);
         self.hierarchy = Some(hierarchy);
         self.display = Some(display);
@@ -417,12 +507,66 @@ impl Runtime {
         self.inspection = None;
         self.hierarchy_selection.clear();
         self.hierarchy_selection_anchor = None;
+        self.undo_history.clear();
+        self.redo_history.clear();
         self.fit();
         self.camera.depth_of_field.focus_point = self.camera.target;
         self.focus_description = "Molecule center".into();
         self.pivot_description = "Molecule center".into();
         self.ui.latest_error = None;
         Ok(())
+    }
+
+    fn editable_snapshot(&self) -> EditableSnapshot {
+        EditableSnapshot {
+            display: self.display.clone(),
+            named_selections: self.named_selections.clone(),
+            named_selection_expressions: self.named_selection_expressions.clone(),
+            named_selection_styles: self.named_selection_styles.clone(),
+            inspection: self.inspection,
+            hierarchy_selection: self.hierarchy_selection.clone(),
+            hierarchy_selection_anchor: self.hierarchy_selection_anchor,
+        }
+    }
+
+    fn commit_edit(&mut self, before: EditableSnapshot) {
+        if before == self.editable_snapshot() {
+            return;
+        }
+        push_history(&mut self.undo_history, before);
+        self.redo_history.clear();
+    }
+
+    fn undo(&mut self) -> bool {
+        let Some(previous) = self.undo_history.pop_back() else {
+            return false;
+        };
+        let current = self.editable_snapshot();
+        push_history(&mut self.redo_history, current);
+        self.restore_editable_snapshot(previous);
+        true
+    }
+
+    fn redo(&mut self) -> bool {
+        let Some(next) = self.redo_history.pop_back() else {
+            return false;
+        };
+        let current = self.editable_snapshot();
+        push_history(&mut self.undo_history, current);
+        self.restore_editable_snapshot(next);
+        true
+    }
+
+    fn restore_editable_snapshot(&mut self, snapshot: EditableSnapshot) {
+        self.display = snapshot.display;
+        self.named_selections = snapshot.named_selections;
+        self.named_selection_expressions = snapshot.named_selection_expressions;
+        self.named_selection_styles = snapshot.named_selection_styles;
+        self.inspection = snapshot.inspection;
+        self.hierarchy_selection = snapshot.hierarchy_selection;
+        self.hierarchy_selection_anchor = snapshot.hierarchy_selection_anchor;
+        self.ui.latest_error = None;
+        self.refresh_instances();
     }
 
     fn fit(&mut self) {
@@ -1109,6 +1253,13 @@ fn representation_mask(representation: Representation) -> RepresentationMask {
     }
 }
 
+fn push_history(history: &mut VecDeque<EditableSnapshot>, snapshot: EditableSnapshot) {
+    if history.len() == EDIT_HISTORY_LIMIT {
+        history.pop_front();
+    }
+    history.push_back(snapshot);
+}
+
 fn named_display_layers(
     selections: &BTreeMap<String, Selection>,
     styles: &BTreeMap<String, NamedSelectionStyle>,
@@ -1229,6 +1380,34 @@ mod tests {
         assert_eq!(
             inclusive_target_range(&ordered, ordered[2], ordered[0]),
             Some(ordered.to_vec())
+        );
+    }
+
+    #[test]
+    fn edit_history_keeps_only_the_newest_fifty_events() {
+        let mut history = VecDeque::new();
+        for index in 0..60 {
+            push_history(
+                &mut history,
+                EditableSnapshot {
+                    display: None,
+                    named_selections: BTreeMap::new(),
+                    named_selection_expressions: BTreeMap::new(),
+                    named_selection_styles: BTreeMap::new(),
+                    inspection: Some(InspectionTarget::Atom(index)),
+                    hierarchy_selection: BTreeSet::new(),
+                    hierarchy_selection_anchor: None,
+                },
+            );
+        }
+        assert_eq!(history.len(), EDIT_HISTORY_LIMIT);
+        assert_eq!(
+            history.front().and_then(|state| state.inspection),
+            Some(InspectionTarget::Atom(10))
+        );
+        assert_eq!(
+            history.back().and_then(|state| state.inspection),
+            Some(InspectionTarget::Atom(59))
         );
     }
 }

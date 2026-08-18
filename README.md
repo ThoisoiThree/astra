@@ -1,7 +1,7 @@
 # molview
 
 `molview` is an early, usable native molecular viewer written in Rust. This MVP
-loads PDB files, builds renderer-independent molecular topology, evaluates a
+loads PDB, PDBx/mmCIF, BinaryCIF, and PDBML/XML structures, builds renderer-independent molecular topology, evaluates a
 composable selection language, and displays atoms and bonds through batched wgpu
 instancing with a small egui interface.
 
@@ -9,7 +9,7 @@ instancing with a small egui interface.
 
 ## Current features
 
-- Fixed-column `ATOM`, `HETATM`, `CONECT`, first-`MODEL`, and altloc A/blank parsing
+- PDB, PDBx/mmCIF, BinaryCIF, and PDBML/XML coordinate parsing, including gzip
 - Conservative element inference and common biological element properties
 - Spatial-grid covalent bond inference (no global all-pairs scan)
 - Depth-tested, lit instanced spheres and sticks
@@ -20,10 +20,11 @@ instancing with a small egui interface.
 - Named selections with color/visibility attributes and a preserved internal hierarchy
 - Camera panel with clipping and thin-lens optical bokeh controls
 - Element/CPK, chain, residue, residue-type, B-factor, and uniform color schemes
-- Native open dialog, command-line path, and `.pdb` drag-and-drop
+- Native open dialog, command-line path, and structure-file drag-and-drop
 - Boolean selection AST with useful position-bearing syntax errors
 - Per-atom color, sphere/stick visibility, and non-destructive selection highlight
 - Command history with Up/Down while the command field is focused
+- 50-step non-camera undo/redo history with Ctrl/Cmd+Z and Ctrl/Cmd+R
 
 ## Requirements
 
@@ -42,7 +43,7 @@ cargo run -- examples/minimal.pdb
 cargo run -- examples/4R8P.pdb
 ```
 
-Or start without a file and use **Open PDB**:
+Or start without a file and use **Open structure**:
 
 ```bash
 cargo run
@@ -60,6 +61,18 @@ right-drag or macOS three-finger drag translates the camera and pivot in screen
 space, so the gesture always follows visible left/right/up/down. The
 hierarchy manager can select whole chains, residues, or individual atoms. **Fit**
 reframes the molecule and **Reset colors** restores element/CPK coloring.
+
+Supported coordinate inputs are `.pdb`/`.ent`, `.cif`/`.mmcif`, `.bcif`, and
+PDBML `.xml`; each can be gzip-compressed. Biological assembly files use these
+same readers. Structure-factor and validation CIF/XML files are recognized, but
+if they contain no `atom_site` coordinates the viewer reports that they are
+non-displayable data rather than treating them as a broken structure. Validation
+PDF reports likewise have no molecular coordinates.
+
+Ctrl/Cmd+Z undoes edits to selections, named selections, colors, visibility,
+representations, and other display state. Ctrl/Cmd+R reapplies them. The newest
+50 edits are retained; camera changes and loading a different structure are not
+part of this history.
 
 ### Camera and optical depth of field
 
@@ -182,8 +195,8 @@ keeping its color and visibility settings.
 The project deliberately remains one Cargo package with strict state boundaries:
 
 ```text
-PDB -> Molecule (atoms/topology) -> selection AST/evaluation
-                                  -> DisplayState
+PDB/mmCIF/BCIF/PDBML -> Molecule (atoms/topology) -> selection AST/evaluation
+                                                    -> DisplayState
 CameraState + Molecule + DisplayState -> instanced wgpu Renderer
 HDR scene color + depth -> thin-lens aperture gather -> egui overlay
 egui UiState -> typed Command -> DisplayState mutation
@@ -196,25 +209,24 @@ See `AGENTS.md` for the contributor contract.
 
 ## Current limitations
 
-- PDB only; only the first model and altloc blank/A are loaded
+- Only the first model and altloc blank/A are loaded
 - Connectivity has no bond order and uses approximate distance perception
 - One molecular object at a time
-- No labels, measurements, undo, or saved sessions
+- No labels, measurements, or saved sessions
 - Spheres and sticks only; rendering favors responsiveness over publication quality
 - No browser build yet
 
 ## Roadmap
 
-1. mmCIF
-2. Multiple molecular objects
-3. Improved bond perception
-4. Sequence viewer
-5. Cartoon/ribbon representation
-6. Molecular surfaces
-7. Labels and measurements
-8. Trajectory support
-9. Scripting/API
-10. WASM/browser target
+1. Multiple molecular objects
+2. Improved bond perception
+3. Sequence viewer
+4. Cartoon/ribbon representation
+5. Molecular surfaces
+6. Labels and measurements
+7. Trajectory support
+8. Scripting/API
+9. WASM/browser target
 
 ## Development checks
 
