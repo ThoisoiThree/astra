@@ -1,9 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use molview::{
-    ColoringMode, DisplayColor, DisplayLevel, DisplayMode, DisplayState, ModeOverride,
-    NamedSelectionStyle, VisibilityOverride,
+    AmbientOcclusionSettings, ColoringMode, DisplayColor, DisplayLevel, DisplayMode, DisplayState,
+    ModeOverride, NamedSelectionStyle, VisibilityOverride,
     camera::OrbitCamera,
+    measurement::{MAX_MEASUREMENT_THICKNESS, MeasurementLine},
     molecule::{Atom, Molecule, MoleculeHierarchy, ResidueGroup},
     selection::Selection,
 };
@@ -17,9 +18,14 @@ pub struct UiState {
     camera_open: bool,
     coloring_open: bool,
     mode_open: bool,
+    actions_open: bool,
+    measurement_first: String,
+    measurement_second: String,
     color_editor: Option<ColorEditor>,
     named_color_editor: Option<NamedColorEditor>,
+    measurement_color_editor: Option<MeasurementColorEditor>,
     named_expression_editor: Option<NamedExpressionEditor>,
+    rename_editor: Option<RenameEditor>,
     focus_kind: FocusKind,
     focus_chain: String,
     focus_residue_number: String,
@@ -41,9 +47,28 @@ struct NamedColorEditor {
 }
 
 #[derive(Debug, Clone)]
+struct MeasurementColorEditor {
+    id: u64,
+    hsva: egui::ecolor::Hsva,
+}
+
+#[derive(Debug, Clone)]
 struct NamedExpressionEditor {
     name: String,
     expression: String,
+}
+
+#[derive(Debug, Clone)]
+struct RenameEditor {
+    target: RenameTarget,
+    name: String,
+}
+
+#[derive(Debug, Clone)]
+enum RenameTarget {
+    Hierarchy(InspectionTarget),
+    NamedSelection(String),
+    Measurement(u64),
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -158,6 +183,7 @@ pub enum ManagerAction {
     },
     SetColoringMode(ColoringMode),
     SetGlobalMode(DisplayMode),
+    SetAmbientOcclusion(AmbientOcclusionSettings),
     SetUniformColor(DisplayColor),
     ActivateNamed(String),
     UpdateNamedExpression {
@@ -165,6 +191,40 @@ pub enum ManagerAction {
         expression: String,
     },
     RemoveNamed(String),
+    CreateMeasurement {
+        first_selection: String,
+        second_selection: String,
+    },
+    SetMeasurementColor {
+        id: u64,
+        color: Option<DisplayColor>,
+    },
+    SetMeasurementVisibility {
+        id: u64,
+        state: VisibilityOverride,
+    },
+    SetMeasurementLabelSize {
+        id: u64,
+        size: f32,
+    },
+    SetMeasurementThickness {
+        id: u64,
+        thickness: f32,
+    },
+    RemoveMeasurement(u64),
+    SaveCurrentSelection(String),
+    RenameHierarchy {
+        target: InspectionTarget,
+        name: Option<String>,
+    },
+    RenameNamedSelection {
+        old_name: String,
+        new_name: String,
+    },
+    RenameMeasurement {
+        id: u64,
+        name: String,
+    },
 }
 
 #[derive(Debug)]
@@ -208,6 +268,8 @@ pub struct UiInfo<'a> {
     pub named_selections: &'a BTreeMap<String, Selection>,
     pub named_selection_expressions: &'a BTreeMap<String, String>,
     pub named_selection_styles: &'a BTreeMap<String, NamedSelectionStyle>,
+    pub measurement_lines: &'a [MeasurementLine],
+    pub hierarchy_names: &'a BTreeMap<InspectionTarget, String>,
     pub inspection: Option<InspectionTarget>,
     pub hierarchy_selection: &'a BTreeSet<InspectionTarget>,
     pub camera: &'a OrbitCamera,
@@ -235,6 +297,9 @@ impl UiState {
                 if ui.selectable_label(self.camera_open, "Camera").clicked() {
                     self.camera_open = !self.camera_open;
                 }
+                if ui.selectable_label(self.actions_open, "Actions").clicked() {
+                    self.actions_open = !self.actions_open;
+                }
                 ui.separator();
                 ui.strong(info.filename.unwrap_or("No molecule loaded"));
             });
@@ -259,6 +324,7 @@ impl UiState {
                     &mut actions,
                     &mut self.named_color_editor,
                     &mut self.named_expression_editor,
+                    &mut self.rename_editor,
                 );
                 ui.separator();
                 egui::ScrollArea::vertical()
@@ -269,16 +335,37 @@ impl UiState {
                         if info.inspection.is_some() {
                             ui.separator();
                         }
-                        hierarchy_tree(ui, info, &mut actions, &mut self.color_editor);
+                        if !info.measurement_lines.is_empty() {
+                            measurement_lines(
+                                ui,
+                                info,
+                                &mut actions,
+                                &mut self.measurement_color_editor,
+                                &mut self.rename_editor,
+                            );
+                            ui.separator();
+                        }
+                        hierarchy_tree(
+                            ui,
+                            info,
+                            &mut actions,
+                            &mut self.color_editor,
+                            &mut self.rename_editor,
+                        );
                     });
             });
+        let viewport = root.available_rect_before_wrap();
+        measurement_labels(root.painter(), viewport, info);
         self.mode_window(root.ctx(), info, &mut actions);
         self.coloring_window(root.ctx(), info, &mut actions);
         self.camera_window(root.ctx(), info, &mut actions);
+        self.actions_window(root.ctx(), info, &mut actions);
         self.color_editor_window(root.ctx(), &mut actions);
         self.named_color_editor_window(root.ctx(), &mut actions);
+        self.measurement_color_editor_window(root.ctx(), &mut actions);
         self.named_expression_editor_window(root.ctx(), &mut actions);
-        actions.viewport = root.available_rect_before_wrap();
+        self.rename_window(root.ctx(), &mut actions);
+        actions.viewport = viewport;
         actions
     }
 
@@ -308,12 +395,123 @@ impl UiState {
                 if mode != display.global_mode {
                     actions.manager = Some(ManagerAction::SetGlobalMode(mode));
                 }
+                if mode == DisplayMode::Toon {
+                    ui.small(
+                        "Analytic space-filling spheres · atom/residue/chain outlines · paper background",
+                    );
+                }
                 ui.separator();
                 ui.small(
                     "Hierarchy overrides have priority: atom > residue > chain > named selection > global.",
                 );
+                ui.separator();
+                ui.heading("Ambient occlusion");
+                let mut ao = display.ambient_occlusion;
+                let mut changed = ui.checkbox(&mut ao.enabled, "Enabled").changed();
+                ui.add_enabled_ui(ao.enabled, |ui| {
+                    changed |= ui
+                        .add(egui::Slider::new(&mut ao.strength, 0.0..=3.0).text("Strength"))
+                        .changed();
+                    changed |= ui
+                        .add(
+                            egui::Slider::new(&mut ao.radius, 0.1..=8.0)
+                                .logarithmic(true)
+                                .text("Radius, Å"),
+                        )
+                        .changed();
+                    changed |= ui
+                        .add(egui::Slider::new(&mut ao.bias, 0.0..=0.25).text("Bias"))
+                        .changed();
+                    egui::ComboBox::from_label("Quality")
+                        .selected_text(ao.quality.label())
+                        .show_ui(ui, |ui| {
+                            for quality in molview::AmbientOcclusionQuality::ALL {
+                                changed |= ui
+                                    .selectable_value(&mut ao.quality, quality, quality.label())
+                                    .changed();
+                            }
+                        });
+                });
+                ui.small("Depth-aware bilateral SSAO · annotations are excluded");
+                if changed {
+                    actions.manager = Some(ManagerAction::SetAmbientOcclusion(ao));
+                }
             });
         self.mode_open = open;
+    }
+
+    fn actions_window(
+        &mut self,
+        context: &egui::Context,
+        info: UiInfo<'_>,
+        actions: &mut UiActions,
+    ) {
+        if !self.actions_open {
+            return;
+        }
+        let names: Vec<_> = info.named_selections.keys().cloned().collect();
+        if !names.contains(&self.measurement_first) {
+            self.measurement_first = names.first().cloned().unwrap_or_default();
+        }
+        if !names.contains(&self.measurement_second) {
+            self.measurement_second = names
+                .iter()
+                .find(|name| **name != self.measurement_first)
+                .cloned()
+                .unwrap_or_default();
+        }
+
+        let mut open = self.actions_open;
+        egui::Window::new("Actions")
+            .id(egui::Id::new("actions window"))
+            .open(&mut open)
+            .default_width(340.0)
+            .resizable(false)
+            .show(context, |ui| {
+                ui.heading("Distance line");
+                ui.label("Create from two named selections:");
+                measurement_selection_combo(
+                    ui,
+                    "Endpoint A",
+                    &names,
+                    &mut self.measurement_first,
+                );
+                measurement_selection_combo(
+                    ui,
+                    "Endpoint B",
+                    &names,
+                    &mut self.measurement_second,
+                );
+                if let Some(summary) = measurement_selection_summary(
+                    info.molecule,
+                    info.named_selections.get(&self.measurement_first),
+                ) {
+                    ui.small(format!("A: {summary}"));
+                }
+                if let Some(summary) = measurement_selection_summary(
+                    info.molecule,
+                    info.named_selections.get(&self.measurement_second),
+                ) {
+                    ui.small(format!("B: {summary}"));
+                }
+                let can_create = !self.measurement_first.is_empty()
+                    && !self.measurement_second.is_empty()
+                    && self.measurement_first != self.measurement_second;
+                if ui
+                    .add_enabled(can_create, egui::Button::new("Create distance line"))
+                    .clicked()
+                {
+                    actions.manager = Some(ManagerAction::CreateMeasurement {
+                        first_selection: self.measurement_first.clone(),
+                        second_selection: self.measurement_second.clone(),
+                    });
+                }
+                ui.separator();
+                ui.small(
+                    "Each endpoint must select one atom or atoms belonging to exactly one residue/base.",
+                );
+            });
+        self.actions_open = open;
     }
 
     fn camera_window(
@@ -646,6 +844,45 @@ impl UiState {
         }
     }
 
+    fn measurement_color_editor_window(
+        &mut self,
+        context: &egui::Context,
+        actions: &mut UiActions,
+    ) {
+        let Some(mut editor) = self.measurement_color_editor.take() else {
+            return;
+        };
+        let mut open = true;
+        let mut restore_default = false;
+        egui::Window::new(format!("HSV color · line #{}", editor.id))
+            .id(egui::Id::new("measurement line HSV color editor"))
+            .open(&mut open)
+            .resizable(false)
+            .show(context, |ui| {
+                if egui::color_picker::color_picker_hsva_2d(
+                    ui,
+                    &mut editor.hsva,
+                    egui::color_picker::Alpha::Opaque,
+                ) {
+                    actions.manager = Some(ManagerAction::SetMeasurementColor {
+                        id: editor.id,
+                        color: Some(color_from_hsva(editor.hsva)),
+                    });
+                }
+                if ui.button("Default").clicked() {
+                    restore_default = true;
+                }
+            });
+        if restore_default {
+            actions.manager = Some(ManagerAction::SetMeasurementColor {
+                id: editor.id,
+                color: None,
+            });
+        } else if open {
+            self.measurement_color_editor = Some(editor);
+        }
+    }
+
     fn named_expression_editor_window(&mut self, context: &egui::Context, actions: &mut UiActions) {
         let Some(mut editor) = self.named_expression_editor.take() else {
             return;
@@ -682,8 +919,50 @@ impl UiState {
         }
     }
 
+    fn rename_window(&mut self, context: &egui::Context, actions: &mut UiActions) {
+        let Some(mut editor) = self.rename_editor.take() else {
+            return;
+        };
+        let mut open = true;
+        let mut apply = false;
+        egui::Window::new("Rename object")
+            .id(egui::Id::new("rename object window"))
+            .open(&mut open)
+            .resizable(false)
+            .show(context, |ui| {
+                ui.label("Display name");
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut editor.name)
+                        .desired_width(280.0)
+                        .hint_text("Object name"),
+                );
+                let enter = response.lost_focus()
+                    && ui.ctx().input(|input| input.key_pressed(egui::Key::Enter));
+                apply = ui
+                    .add_enabled(!editor.name.trim().is_empty(), egui::Button::new("Rename"))
+                    .clicked()
+                    || (enter && !editor.name.trim().is_empty());
+            });
+        if apply {
+            let name = editor.name.trim().to_owned();
+            actions.manager = Some(match editor.target {
+                RenameTarget::Hierarchy(target) => ManagerAction::RenameHierarchy {
+                    target,
+                    name: Some(name),
+                },
+                RenameTarget::NamedSelection(old_name) => ManagerAction::RenameNamedSelection {
+                    old_name,
+                    new_name: name,
+                },
+                RenameTarget::Measurement(id) => ManagerAction::RenameMeasurement { id, name },
+            });
+        } else if open {
+            self.rename_editor = Some(editor);
+        }
+    }
+
     fn command_editor(&mut self, ui: &mut egui::Ui, actions: &mut UiActions) {
-        ui.heading("Selection / Command");
+        ui.heading("Expression");
         let response = ui.add(
             egui::TextEdit::singleline(&mut self.command_input)
                 .hint_text("select active_site: Chain A/LEU*")
@@ -706,14 +985,19 @@ impl UiState {
         } else if down {
             self.history_next();
         }
-        if ui.button("Execute").clicked() || enter {
+        if ui.button("Select!").clicked() || enter {
             let command = self.command_input.trim().to_string();
             if !command.is_empty() {
                 self.history.push(command.clone());
                 self.history_cursor = None;
-                actions.execute = Some(command);
+                if let Some(name) = current_selection_name(&command) {
+                    actions.manager = Some(ManagerAction::SaveCurrentSelection(name.to_owned()));
+                } else {
+                    actions.execute = Some(command);
+                }
             }
         }
+        ui.small("Enter only a name to save the current selection");
         ui.small(
             "Click inspect · drag orbit · RMB pan · Ctrl/Cmd+drag pan · Ctrl/Cmd+Z undo · Ctrl/Cmd+R redo",
         );
@@ -776,14 +1060,213 @@ fn focus_chain_number_fields(ui: &mut egui::Ui, chain: &mut String, residue_numb
     });
 }
 
+fn measurement_selection_combo(
+    ui: &mut egui::Ui,
+    label: &str,
+    names: &[String],
+    selected: &mut String,
+) {
+    egui::ComboBox::from_label(label)
+        .selected_text(if selected.is_empty() {
+            "No selection"
+        } else {
+            selected.as_str()
+        })
+        .show_ui(ui, |ui| {
+            for name in names {
+                ui.selectable_value(selected, name.clone(), name);
+            }
+        });
+}
+
+fn measurement_selection_summary(
+    molecule: Option<&Molecule>,
+    selection: Option<&Selection>,
+) -> Option<String> {
+    let (molecule, selection) = (molecule?, selection?);
+    let indices: Vec<_> = selection.indices().collect();
+    let first = molecule.atoms.get(*indices.first()?)?;
+    if indices.len() == 1 {
+        return Some(format!("one atom · #{} {}", first.serial, first.name));
+    }
+    let one_residue = indices.iter().all(|index| {
+        molecule.atoms.get(*index).is_some_and(|atom| {
+            atom.chain_id == first.chain_id
+                && atom.residue_name == first.residue_name
+                && atom.residue_number == first.residue_number
+                && atom.insertion_code == first.insertion_code
+        })
+    });
+    if one_residue {
+        Some(format!(
+            "one residue/base · {} {} / chain {}",
+            first.residue_name,
+            first.residue_number,
+            display_chain(&first.chain_id)
+        ))
+    } else {
+        Some(format!("invalid · {} atoms across residues", indices.len()))
+    }
+}
+
+fn measurement_lines(
+    ui: &mut egui::Ui,
+    info: UiInfo<'_>,
+    actions: &mut UiActions,
+    color_editor: &mut Option<MeasurementColorEditor>,
+    rename_editor: &mut Option<RenameEditor>,
+) {
+    ui.heading(format!("Lines · {}", info.measurement_lines.len()));
+    for line in info.measurement_lines {
+        ui.horizontal(|ui| {
+            let color = line.effective_color();
+            let color_response = color_square(ui, color, line.color.is_some())
+                .on_hover_text("Line color (click to edit in HSV)");
+            color_response.context_menu(|ui| {
+                if ui.button("Reset to default").clicked() {
+                    actions.manager = Some(ManagerAction::SetMeasurementColor {
+                        id: line.id,
+                        color: None,
+                    });
+                    ui.close();
+                }
+            });
+            if color_response.clicked() {
+                *color_editor = Some(MeasurementColorEditor {
+                    id: line.id,
+                    hsva: hsva_from_color(color),
+                });
+            }
+
+            let visibility_response = visibility_button(ui, line.visibility);
+            visibility_response.context_menu(|ui| {
+                if ui.button("Reset to default").clicked() {
+                    actions.manager = Some(ManagerAction::SetMeasurementVisibility {
+                        id: line.id,
+                        state: VisibilityOverride::Inherit,
+                    });
+                    ui.close();
+                }
+            });
+            if visibility_response.clicked() {
+                actions.manager = Some(ManagerAction::SetMeasurementVisibility {
+                    id: line.id,
+                    state: line.visibility.next(),
+                });
+            }
+
+            let name_response = ui
+                .label(format!("{} · {:.2} Å", line.name, line.distance()))
+                .on_hover_text(format!(
+                    "{} ↔ {}",
+                    line.first.description, line.second.description
+                ));
+            name_response.context_menu(|ui| {
+                if ui.button("Rename").clicked() {
+                    *rename_editor = Some(RenameEditor {
+                        target: RenameTarget::Measurement(line.id),
+                        name: line.name.clone(),
+                    });
+                    ui.close();
+                }
+            });
+            let mut size = line.label_size;
+            if ui
+                .add(
+                    egui::DragValue::new(&mut size)
+                        .range(8.0..=48.0)
+                        .speed(0.25)
+                        .suffix(" pt"),
+                )
+                .on_hover_text("Distance label size")
+                .changed()
+            {
+                actions.manager =
+                    Some(ManagerAction::SetMeasurementLabelSize { id: line.id, size });
+            }
+            if ui.small_button("×").on_hover_text("Remove line").clicked() {
+                actions.manager = Some(ManagerAction::RemoveMeasurement(line.id));
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.add_space(39.0);
+            ui.small("Thickness");
+            let mut thickness = line.thickness;
+            if ui
+                .add(
+                    egui::DragValue::new(&mut thickness)
+                        .range(0.01..=MAX_MEASUREMENT_THICKNESS)
+                        .speed(0.05)
+                        .fixed_decimals(3)
+                        .suffix(" Å"),
+                )
+                .on_hover_text("Width of the dashed line segments")
+                .changed()
+            {
+                actions.manager = Some(ManagerAction::SetMeasurementThickness {
+                    id: line.id,
+                    thickness,
+                });
+            }
+        });
+    }
+}
+
+fn measurement_labels(painter: &egui::Painter, viewport: egui::Rect, info: UiInfo<'_>) {
+    if !viewport.is_positive() {
+        return;
+    }
+    let view_projection = info.camera.view_projection();
+    for line in info
+        .measurement_lines
+        .iter()
+        .filter(|line| line.is_visible())
+    {
+        let clip = view_projection * line.midpoint().extend(1.0);
+        if clip.w <= 0.0 {
+            continue;
+        }
+        let ndc = clip.truncate() / clip.w;
+        if !(-1.0..=1.0).contains(&ndc.x)
+            || !(-1.0..=1.0).contains(&ndc.y)
+            || !(0.0..=1.0).contains(&ndc.z)
+        {
+            continue;
+        }
+        let center = egui::pos2(
+            viewport.left() + (ndc.x + 1.0) * 0.5 * viewport.width(),
+            viewport.top() + (1.0 - ndc.y) * 0.5 * viewport.height(),
+        );
+        let galley = painter.layout_no_wrap(
+            format!("{:.2} Å", line.distance()),
+            egui::FontId::proportional(line.label_size),
+            egui::Color32::WHITE,
+        );
+        let rect = egui::Rect::from_center_size(center, galley.size() + egui::vec2(12.0, 6.0));
+        painter.rect(
+            rect,
+            4.0,
+            egui::Color32::from_rgb(29, 33, 35),
+            egui::Stroke::new(1.0, color32(line.effective_color())),
+            egui::StrokeKind::Outside,
+        );
+        painter.galley(
+            rect.center() - galley.size() * 0.5,
+            galley,
+            egui::Color32::WHITE,
+        );
+    }
+}
+
 fn named_selections(
     ui: &mut egui::Ui,
     info: UiInfo<'_>,
     actions: &mut UiActions,
     color_editor: &mut Option<NamedColorEditor>,
     expression_editor: &mut Option<NamedExpressionEditor>,
+    rename_editor: &mut Option<RenameEditor>,
 ) {
-    ui.heading("Named selections");
+    ui.heading("Selections");
     if info.named_selections.is_empty() {
         ui.weak("Create with: select name: Chain A/LEU*");
         return;
@@ -803,6 +1286,7 @@ fn named_selections(
                     name,
                     info.named_selection_expressions.get(name),
                     expression_editor,
+                    rename_editor,
                 );
                 if ui.small_button("×").clicked() {
                     actions.manager = Some(ManagerAction::RemoveNamed(name.clone()));
@@ -926,6 +1410,7 @@ fn named_selections(
                     name,
                     info.named_selection_expressions.get(name),
                     expression_editor,
+                    rename_editor,
                 );
                 if ui
                     .small_button("×")
@@ -946,8 +1431,16 @@ fn named_expression_menu(
     name: &str,
     expression: Option<&String>,
     editor: &mut Option<NamedExpressionEditor>,
+    rename_editor: &mut Option<RenameEditor>,
 ) {
     response.context_menu(|ui| {
+        if ui.button("Rename").clicked() {
+            *rename_editor = Some(RenameEditor {
+                target: RenameTarget::NamedSelection(name.to_owned()),
+                name: name.to_owned(),
+            });
+            ui.close();
+        }
         if ui.button("Edit expression").clicked() {
             *editor = Some(NamedExpressionEditor {
                 name: name.to_string(),
@@ -978,6 +1471,11 @@ fn named_selection_hierarchy(
             continue;
         }
         let target = InspectionTarget::Chain(chain_index);
+        let chain_name = info
+            .hierarchy_names
+            .get(&target)
+            .cloned()
+            .unwrap_or_else(|| format!("Chain {}", display_chain(&chain.id)));
         let state = egui::collapsing_header::CollapsingState::load_with_default_open(
             ui.ctx(),
             ui.make_persistent_id(("named chain", selection_name, chain_index)),
@@ -987,11 +1485,7 @@ fn named_selection_hierarchy(
             .show_header(ui, |ui| {
                 named_subset_label(
                     ui,
-                    format!(
-                        "Chain {} · {} atoms",
-                        display_chain(&chain.id),
-                        chain_indices.len()
-                    ),
+                    format!("{} · {} atoms", chain_name, chain_indices.len()),
                     chain_indices.clone(),
                     target,
                     info.inspection == Some(target),
@@ -1013,6 +1507,11 @@ fn named_selection_hierarchy(
                         chain_index,
                         residue_index,
                     };
+                    let residue_name = info
+                        .hierarchy_names
+                        .get(&residue_target)
+                        .cloned()
+                        .unwrap_or_else(|| residue.id.label());
                     let residue_state =
                         egui::collapsing_header::CollapsingState::load_with_default_open(
                             ui.ctx(),
@@ -1028,7 +1527,7 @@ fn named_selection_hierarchy(
                         .show_header(ui, |ui| {
                             named_subset_label(
                                 ui,
-                                format!("{} · {} atoms", residue.id.label(), residue_indices.len()),
+                                format!("{} · {} atoms", residue_name, residue_indices.len()),
                                 residue_indices.clone(),
                                 residue_target,
                                 info.inspection == Some(residue_target),
@@ -1039,14 +1538,13 @@ fn named_selection_hierarchy(
                             for &atom_index in &residue_indices {
                                 if let Some(atom) = molecule.atoms.get(atom_index) {
                                     let target = InspectionTarget::Atom(atom_index);
+                                    let atom_name =
+                                        info.hierarchy_names.get(&target).cloned().unwrap_or_else(
+                                            || format!("#{} {}", atom.serial, atom.name),
+                                        );
                                     named_subset_label(
                                         ui,
-                                        format!(
-                                            "#{:<5} {:<4} · {}",
-                                            atom.serial,
-                                            atom.name,
-                                            atom.element.symbol()
-                                        ),
+                                        format!("{} · {}", atom_name, atom.element.symbol()),
                                         vec![atom_index],
                                         target,
                                         info.inspection == Some(target),
@@ -1083,6 +1581,9 @@ fn inspector(ui: &mut egui::Ui, info: UiInfo<'_>) {
         return;
     };
     ui.heading("Inspector");
+    if let Some(name) = info.hierarchy_names.get(&target) {
+        ui.strong(name);
+    }
     match target {
         InspectionTarget::Chain(chain_index) => {
             if let Some(chain) = hierarchy.chains.get(chain_index) {
@@ -1182,6 +1683,7 @@ fn hierarchy_tree(
     info: UiInfo<'_>,
     actions: &mut UiActions,
     color_editor: &mut Option<ColorEditor>,
+    rename_editor: &mut Option<RenameEditor>,
 ) {
     ui.heading("Hierarchy");
     ui.small("Shift: select range · Ctrl/Cmd: toggle one object");
@@ -1209,13 +1711,18 @@ fn hierarchy_tree(
             })
     });
     for (chain_index, chain) in hierarchy.chains.iter().enumerate() {
+        let chain_target = InspectionTarget::Chain(chain_index);
+        let chain_default_name = format!("Chain {}", display_chain(&chain.id));
+        let chain_name = info
+            .hierarchy_names
+            .get(&chain_target)
+            .unwrap_or(&chain_default_name);
         let chain_label = format!(
-            "Chain {} · {} residues · {} atoms",
-            display_chain(&chain.id),
+            "{} · {} residues · {} atoms",
+            chain_name,
             chain.residues.len(),
             chain.atom_count
         );
-        let chain_target = InspectionTarget::Chain(chain_index);
         let first_atom = chain
             .residues
             .iter()
@@ -1243,19 +1750,24 @@ fn hierarchy_tree(
                     info.hierarchy_selection,
                     actions,
                     color_editor,
+                    rename_editor,
+                    &chain_default_name,
+                    info.hierarchy_names.get(&chain_target),
                 );
             })
             .body(|ui| {
                 for (residue_index, residue) in chain.residues.iter().enumerate() {
-                    let residue_label = format!(
-                        "{} · {} atoms",
-                        residue.id.label(),
-                        residue.atom_indices.len()
-                    );
                     let residue_target = InspectionTarget::Residue {
                         chain_index,
                         residue_index,
                     };
+                    let residue_default_name = residue.id.label();
+                    let residue_name = info
+                        .hierarchy_names
+                        .get(&residue_target)
+                        .unwrap_or(&residue_default_name);
+                    let residue_label =
+                        format!("{} · {} atoms", residue_name, residue.atom_indices.len());
                     let residue_on_inspected_path = inspected_atom_path.is_some_and(
                         |(inspected_chain, inspected_residue, _)| {
                             inspected_chain == chain_index && inspected_residue == residue_index
@@ -1284,18 +1796,23 @@ fn hierarchy_tree(
                                 info.hierarchy_selection,
                                 actions,
                                 color_editor,
+                                rename_editor,
+                                &residue_default_name,
+                                info.hierarchy_names.get(&residue_target),
                             );
                         })
                         .body(|ui| {
                             for &atom_index in &residue.atom_indices {
                                 if let Some(atom) = molecule.atoms.get(atom_index) {
-                                    let label = format!(
-                                        "#{:<5} {:<4} · {}",
-                                        atom.serial,
-                                        atom.name,
-                                        atom.element.symbol()
-                                    );
                                     let target = InspectionTarget::Atom(atom_index);
+                                    let atom_default_name =
+                                        format!("#{} {}", atom.serial, atom.name);
+                                    let atom_name = info
+                                        .hierarchy_names
+                                        .get(&target)
+                                        .unwrap_or(&atom_default_name);
+                                    let label =
+                                        format!("{} · {}", atom_name, atom.element.symbol());
                                     ui.horizontal(|ui| {
                                         hierarchy_row(
                                             ui,
@@ -1308,6 +1825,9 @@ fn hierarchy_tree(
                                             info.hierarchy_selection,
                                             actions,
                                             color_editor,
+                                            rename_editor,
+                                            &atom_default_name,
+                                            info.hierarchy_names.get(&target),
                                         );
                                     });
                                 }
@@ -1330,6 +1850,9 @@ fn hierarchy_row(
     hierarchy_selection: &BTreeSet<InspectionTarget>,
     actions: &mut UiActions,
     color_editor: &mut Option<ColorEditor>,
+    rename_editor: &mut Option<RenameEditor>,
+    default_name: &str,
+    custom_name: Option<&String>,
 ) {
     let Some(atom_index) = first_atom else {
         ui.weak(label);
@@ -1441,7 +1964,24 @@ fn hierarchy_row(
             state: visibility.next(),
         });
     }
-    if ui.selectable_label(selected, label).clicked() {
+    let label_response = ui.selectable_label(selected, label);
+    label_response.context_menu(|ui| {
+        if ui.button("Rename").clicked() {
+            *rename_editor = Some(RenameEditor {
+                target: RenameTarget::Hierarchy(target),
+                name: custom_name.map_or_else(|| default_name.to_owned(), Clone::clone),
+            });
+            ui.close();
+        }
+        if ui
+            .add_enabled(custom_name.is_some(), egui::Button::new("Reset name"))
+            .clicked()
+        {
+            actions.manager = Some(ManagerAction::RenameHierarchy { target, name: None });
+            ui.close();
+        }
+    });
+    if label_response.clicked() {
         let modifiers = ui.ctx().input(|input| input.modifiers);
         let gesture = if modifiers.shift {
             HierarchySelectionGesture::Range
@@ -1459,13 +1999,11 @@ fn target_has_children(target: InspectionTarget) -> bool {
 }
 
 fn next_mode_override(current: ModeOverride, global: DisplayMode) -> ModeOverride {
-    if current == ModeOverride::Inherit {
-        ModeOverride::from_mode(match global {
-            DisplayMode::Cartoon => DisplayMode::BallAndStick,
-            DisplayMode::BallAndStick => DisplayMode::Cartoon,
-        })
-    } else {
+    let next = current.mode().unwrap_or(global).next();
+    if next == global {
         ModeOverride::Inherit
+    } else {
+        ModeOverride::from_mode(next)
     }
 }
 
@@ -1473,6 +2011,7 @@ fn mode_button(ui: &mut egui::Ui, effective: DisplayMode, direct: ModeOverride) 
     let label = match effective {
         DisplayMode::Cartoon => "C",
         DisplayMode::BallAndStick => "B",
+        DisplayMode::Toon => "T",
     };
     let color = if direct == ModeOverride::Inherit {
         egui::Color32::from_gray(125)
@@ -1484,14 +2023,14 @@ fn mode_button(ui: &mut egui::Ui, effective: DisplayMode, direct: ModeOverride) 
             .min_size(egui::vec2(20.0, 17.0)),
     )
     .on_hover_text(match (effective, direct) {
-        (DisplayMode::Cartoon, ModeOverride::Inherit) => {
-            "Mode: inherited Cartoon (click → Ball & stick override)"
-        }
-        (DisplayMode::BallAndStick, ModeOverride::Inherit) => {
-            "Mode: inherited Ball & stick (click → Cartoon override)"
-        }
-        (DisplayMode::Cartoon, _) => "Mode override: Cartoon (click → inherit)",
-        (DisplayMode::BallAndStick, _) => "Mode override: Ball & stick (click → inherit)",
+        (mode, ModeOverride::Inherit) => match mode {
+            DisplayMode::Cartoon => "Mode: inherited Cartoon (click → Ball & stick override)",
+            DisplayMode::BallAndStick => "Mode: inherited Ball & stick (click → Toon override)",
+            DisplayMode::Toon => "Mode: inherited Toon (click → Cartoon override)",
+        },
+        (DisplayMode::Cartoon, _) => "Mode override: Cartoon (click → Ball & stick)",
+        (DisplayMode::BallAndStick, _) => "Mode override: Ball & stick (click → Toon)",
+        (DisplayMode::Toon, _) => "Mode override: Toon (click → Cartoon/inherit)",
     })
 }
 
@@ -1559,6 +2098,53 @@ fn color32(color: DisplayColor) -> egui::Color32 {
     )
 }
 
+fn is_simple_selection_name(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
+}
+
+fn current_selection_name(input: &str) -> Option<&str> {
+    let input = input.trim();
+    if is_simple_selection_name(input) {
+        return Some(input);
+    }
+    let (keyword, remainder) = input.split_once(char::is_whitespace)?;
+    if !keyword.eq_ignore_ascii_case("select") {
+        return None;
+    }
+    let name = remainder.trim().strip_suffix(':')?.trim();
+    is_simple_selection_name(name).then_some(name)
+}
+
 fn display_chain(chain: &str) -> &str {
     if chain.is_empty() { "(blank)" } else { chain }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn select_button_distinguishes_current_name_from_full_command() {
+        assert_eq!(current_selection_name("active_site"), Some("active_site"));
+        assert_eq!(
+            current_selection_name("select active_site:"),
+            Some("active_site")
+        );
+        assert_eq!(current_selection_name("select all"), None);
+        assert_eq!(current_selection_name("chain A"), None);
+    }
+
+    #[test]
+    fn hierarchy_mode_button_cycles_through_toon_and_back_to_inherit() {
+        let global = DisplayMode::Cartoon;
+        let ball = next_mode_override(ModeOverride::Inherit, global);
+        let toon = next_mode_override(ball, global);
+        let inherited = next_mode_override(toon, global);
+        assert_eq!(ball, ModeOverride::BallAndStick);
+        assert_eq!(toon, ModeOverride::Toon);
+        assert_eq!(inherited, ModeOverride::Inherit);
+    }
 }

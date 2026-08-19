@@ -1,8 +1,10 @@
 pub mod camera;
 pub mod command;
+pub mod measurement;
 pub mod molecule;
 pub mod picking;
 pub mod render;
+pub mod scene;
 pub mod selection;
 
 use std::collections::HashMap;
@@ -12,6 +14,77 @@ use molecule::Molecule;
 pub type DisplayColor = [f32; 4];
 
 const DEFAULT_UNIFORM_COLOR: DisplayColor = [0.55, 0.67, 0.82, 1.0];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AmbientOcclusionQuality {
+    Low,
+    #[default]
+    Medium,
+    High,
+}
+
+impl AmbientOcclusionQuality {
+    pub const ALL: [Self; 3] = [Self::Low, Self::Medium, Self::High];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Low => "Low · 16 samples",
+            Self::Medium => "Medium · 32 samples",
+            Self::High => "High · 48 samples",
+        }
+    }
+
+    pub const fn sample_count(self) -> u32 {
+        match self {
+            Self::Low => 16,
+            Self::Medium => 32,
+            Self::High => 48,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AmbientOcclusionSettings {
+    pub enabled: bool,
+    pub strength: f32,
+    pub radius: f32,
+    pub bias: f32,
+    pub quality: AmbientOcclusionQuality,
+}
+
+impl Default for AmbientOcclusionSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            strength: 1.0,
+            radius: 2.0,
+            bias: 0.05,
+            quality: AmbientOcclusionQuality::Medium,
+        }
+    }
+}
+
+impl AmbientOcclusionSettings {
+    pub const fn ball_and_stick_default() -> Self {
+        Self {
+            enabled: true,
+            strength: 1.4,
+            radius: 2.3,
+            bias: 0.05,
+            quality: AmbientOcclusionQuality::Medium,
+        }
+    }
+
+    pub const fn toon_default() -> Self {
+        Self {
+            enabled: true,
+            strength: 0.15,
+            radius: 2.0,
+            bias: 0.05,
+            quality: AmbientOcclusionQuality::Medium,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct NamedSelectionStyle {
@@ -25,15 +98,25 @@ pub enum DisplayMode {
     #[default]
     Cartoon,
     BallAndStick,
+    Toon,
 }
 
 impl DisplayMode {
-    pub const ALL: [Self; 2] = [Self::Cartoon, Self::BallAndStick];
+    pub const ALL: [Self; 3] = [Self::Cartoon, Self::BallAndStick, Self::Toon];
 
     pub const fn label(self) -> &'static str {
         match self {
             Self::Cartoon => "Cartoon",
             Self::BallAndStick => "Ball & stick",
+            Self::Toon => "Toon",
+        }
+    }
+
+    pub const fn next(self) -> Self {
+        match self {
+            Self::Cartoon => Self::BallAndStick,
+            Self::BallAndStick => Self::Toon,
+            Self::Toon => Self::Cartoon,
         }
     }
 }
@@ -44,6 +127,7 @@ pub enum ModeOverride {
     Inherit,
     Cartoon,
     BallAndStick,
+    Toon,
 }
 
 impl ModeOverride {
@@ -51,6 +135,7 @@ impl ModeOverride {
         match mode {
             DisplayMode::Cartoon => Self::Cartoon,
             DisplayMode::BallAndStick => Self::BallAndStick,
+            DisplayMode::Toon => Self::Toon,
         }
     }
 
@@ -59,6 +144,7 @@ impl ModeOverride {
             Self::Inherit => None,
             Self::Cartoon => Some(DisplayMode::Cartoon),
             Self::BallAndStick => Some(DisplayMode::BallAndStick),
+            Self::Toon => Some(DisplayMode::Toon),
         }
     }
 }
@@ -136,6 +222,8 @@ pub struct DisplayState {
     pub global_mode: DisplayMode,
     pub coloring_mode: ColoringMode,
     pub uniform_color: DisplayColor,
+    pub ambient_occlusion: AmbientOcclusionSettings,
+    ambient_occlusion_customized: bool,
     base_colors: Vec<DisplayColor>,
     named_colors: Vec<Option<DisplayColor>>,
     chain_colors: Vec<Option<DisplayColor>>,
@@ -154,7 +242,7 @@ pub struct DisplayState {
 impl DisplayState {
     pub fn for_molecule(molecule: &Molecule) -> Self {
         let atom_count = molecule.atoms.len();
-        let base_colors = element_colors(molecule);
+        let base_colors = indexed_categorical_colors(molecule, |atom| atom.chain_id.clone());
         Self {
             colors: base_colors.clone(),
             visible: vec![true; atom_count],
@@ -172,8 +260,10 @@ impl DisplayState {
             selection: vec![false; atom_count],
             modes: vec![DisplayMode::Cartoon; atom_count],
             global_mode: DisplayMode::Cartoon,
-            coloring_mode: ColoringMode::Element,
+            coloring_mode: ColoringMode::Chain,
             uniform_color: DEFAULT_UNIFORM_COLOR,
+            ambient_occlusion: AmbientOcclusionSettings::default(),
+            ambient_occlusion_customized: false,
             base_colors,
             named_colors: vec![None; atom_count],
             chain_colors: vec![None; atom_count],
@@ -419,6 +509,13 @@ impl DisplayState {
     }
 
     pub fn set_global_mode(&mut self, mode: DisplayMode) {
+        if !self.ambient_occlusion_customized {
+            self.ambient_occlusion = match mode {
+                DisplayMode::Cartoon => AmbientOcclusionSettings::default(),
+                DisplayMode::BallAndStick => AmbientOcclusionSettings::ball_and_stick_default(),
+                DisplayMode::Toon => AmbientOcclusionSettings::toon_default(),
+            };
+        }
         self.global_mode = mode;
         let redundant = ModeOverride::from_mode(mode);
         for overrides in [
@@ -434,6 +531,11 @@ impl DisplayState {
             }
         }
         self.recompute_modes();
+    }
+
+    pub fn set_ambient_occlusion(&mut self, settings: AmbientOcclusionSettings) {
+        self.ambient_occlusion = settings;
+        self.ambient_occlusion_customized = true;
     }
 
     pub fn set_mode_override(
@@ -521,7 +623,7 @@ impl DisplayState {
         self.residue_colors.fill(None);
         self.atom_colors.fill(None);
         self.uniform_color = DEFAULT_UNIFORM_COLOR;
-        self.set_coloring_mode(molecule, ColoringMode::Element);
+        self.set_coloring_mode(molecule, ColoringMode::Chain);
     }
 
     pub fn selection_count(&self) -> usize {
@@ -701,6 +803,14 @@ impl RepresentationMask {
         self.0 & representation.0 != 0
     }
 
+    pub const fn bits(self) -> u8 {
+        self.0
+    }
+
+    pub const fn from_bits(bits: u8) -> Self {
+        Self(bits & (Self::SPHERES.0 | Self::STICKS.0))
+    }
+
     pub fn insert(&mut self, representation: Self) {
         self.0 |= representation.0;
     }
@@ -760,21 +870,50 @@ mod display_tests {
     }
 
     #[test]
-    fn default_and_reset_colors_use_element_coloring() {
+    fn default_and_reset_colors_use_chain_coloring() {
         let molecule = molecule();
         let mut display = DisplayState::for_molecule(&molecule);
-        let element_colors = element_colors(&molecule);
-        assert_eq!(display.coloring_mode, ColoringMode::Element);
-        assert_eq!(display.colors, element_colors);
+        let chain_colors = indexed_categorical_colors(&molecule, |atom| atom.chain_id.clone());
+        assert_eq!(display.coloring_mode, ColoringMode::Chain);
+        assert_eq!(display.colors, chain_colors);
+        assert!(display.ambient_occlusion.enabled);
+        assert_eq!(display.ambient_occlusion.quality.sample_count(), 32);
 
         display.set_coloring_mode(&molecule, ColoringMode::Uniform);
         display.set_uniform_color(&molecule, [1.0, 0.0, 0.0, 1.0]);
         display.set_color_override(&[0], DisplayLevel::Atom, Some([0.0, 1.0, 0.0, 1.0]));
         display.reset_colors(&molecule);
 
-        assert_eq!(display.coloring_mode, ColoringMode::Element);
+        assert_eq!(display.coloring_mode, ColoringMode::Chain);
         assert_eq!(display.uniform_color, DEFAULT_UNIFORM_COLOR);
-        assert_eq!(display.colors, element_colors);
+        assert_eq!(display.colors, chain_colors);
+    }
+
+    #[test]
+    fn modes_have_distinct_ao_defaults_without_overwriting_manual_settings() {
+        let molecule = molecule();
+        let mut display = DisplayState::for_molecule(&molecule);
+
+        display.set_global_mode(DisplayMode::BallAndStick);
+        assert_eq!(
+            display.ambient_occlusion,
+            AmbientOcclusionSettings::ball_and_stick_default()
+        );
+
+        display.set_global_mode(DisplayMode::Toon);
+        assert_eq!(
+            display.ambient_occlusion,
+            AmbientOcclusionSettings::toon_default()
+        );
+
+        let custom = AmbientOcclusionSettings {
+            strength: 0.73,
+            ..display.ambient_occlusion
+        };
+        display.set_ambient_occlusion(custom);
+        display.set_global_mode(DisplayMode::Cartoon);
+        display.set_global_mode(DisplayMode::Toon);
+        assert_eq!(display.ambient_occlusion, custom);
     }
 
     #[test]

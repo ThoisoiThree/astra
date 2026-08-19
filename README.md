@@ -17,8 +17,9 @@ instancing with a small egui interface.
 - Click-to-pick atoms with atom/residue/chain property inspection
 - Chain → residue → atom hierarchy with independent selection/expansion controls
 - Hierarchical HSV color overrides and inherited tri-state visibility controls
-- Global and hierarchical Cartoon/Ball & stick display modes
+- Global and hierarchical Cartoon/Ball & stick/Toon display modes
 - Named selections with color/visibility attributes and a preserved internal hierarchy
+- Dashed distance measurements with Å labels and editable line styles
 - Camera panel with clipping and thin-lens optical bokeh controls
 - Element/CPK, chain, residue, residue-type, B-factor, and uniform color schemes
 - Native open dialog, command-line path, and structure-file drag-and-drop
@@ -82,18 +83,29 @@ the default and draws a smoothed backbone ribbon through protein `CA` atoms and
 nucleic-acid `P` atoms; disconnected residues and chains are never bridged.
 Ligands and residues without a cartoon backbone remain in Ball & stick. The
 second global mode is **Ball & stick**, matching the viewer's original rendering.
+**Toon** renders space-filling atoms as analytic ray/sphere impostors, writes
+atom/residue/chain IDs, and adds depth-gated illustrative outlines over a warm
+paper background. Smoothly intersecting atoms merge visually instead of receiving
+an unconditional circle around every sphere.
 
-Cartoon uses the active color scheme; Element/CPK is the default. Picking an
+All modes use Chain coloring by default; Element/CPK remains available in the
+Coloring menu. Picking an
 atom in the viewport reveals its hierarchy path and highlights the atom, its
 residue, and its chain without adding the ancestors to the editable
 multi-selection.
 
 Every chain, residue, and atom has a mode badge before its color and visibility
 attributes. A gray badge inherits; an orange badge is a local override. Clicking
-switches between inheritance and the mode opposite to the global mode. Right-click
+cycles through the three modes and back to inheritance. Right-click
 provides **Reset to default** and **Set to children**. Effective priority is atom
 → residue → chain → named selection → global; a value equal to the global mode is
 stored as inheritance rather than as an unnecessary override.
+
+The **Mode** window also contains ambient-occlusion controls: enable/disable,
+strength, world-space radius, surface bias, and Low/Medium/High quality (16/32/48
+samples). The implementation reconstructs positions and normals from molecular
+depth, uses a rotated low-discrepancy screen-space kernel, and applies a depth-aware
+bilateral filter. It applies to Cartoon, Ball & stick, and Toon.
 
 ### Camera and optical depth of field
 
@@ -145,6 +157,29 @@ controls. Expanding one shows only its selected atoms while preserving their
 chain → residue → atom hierarchy. A named-selection style is a parent layer, so
 explicit chain, residue, and atom overrides still take priority.
 
+### Distance lines
+
+Create two named selections with the **Select!** button, then open **Actions** and
+choose them as endpoints A and B. Each endpoint may contain one atom or atoms
+from exactly one residue/nucleic-acid base; residue and base endpoints use their
+atom centroid. **Create distance line** adds a depth-tested dashed line with a
+centered distance label in ångströms.
+
+Dashed segments have closed flat end caps. Lines are rendered in a separate
+depth-tested annotation pass after molecular AO and DOF, so measurements and
+future markup do not alter molecular depth, ambient occlusion, or shading.
+
+Every measurement is an independent object in the **Lines** folder. Its HSV
+color, gray/green/red visibility state, line thickness (0.01–0.30 Å), label size
+(8–48 pt), and lifetime can be edited there. Measurement creation, styling,
+visibility changes, resizing, and deletion participate in the 50-step Undo/Redo
+history.
+
+Right-click a chain, residue/base, atom, named selection, or measurement line and
+choose **Rename** to assign a user-facing name. Molecular aliases never modify
+the original structure identifiers; **Reset name** restores their generated PDB/
+mmCIF label. Renaming a named selection updates stored `selection …` references.
+
 ## Selection language
 
 Keywords are ASCII case-insensitive. Boolean precedence is `not`, `and`, `xor`,
@@ -186,6 +221,11 @@ color <name-or-#RRGGBB>, <expression>
 show spheres|sticks, <expression>
 hide spheres|sticks, <expression>
 ```
+
+To save the atoms currently selected in the viewport or hierarchy, enter only a
+new name such as `active_site` and press **Select!**. The explicit
+`select active_site:` form is also accepted. Full commands such as `select all`
+retain their existing meaning.
 
 Try these with `examples/minimal.pdb`:
 

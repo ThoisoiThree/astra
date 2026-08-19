@@ -17,7 +17,19 @@ pub fn pick_atom(molecule: &Molecule, ray: Ray) -> Option<usize> {
 pub fn pick_atom_filtered(
     molecule: &Molecule,
     ray: Ray,
+    is_visible: impl FnMut(usize) -> bool,
+) -> Option<usize> {
+    pick_atom_filtered_with_radius(molecule, ray, is_visible, |_, atom| {
+        (atom.element.van_der_waals_radius() * 0.32).max(0.32)
+    })
+}
+
+/// Returns the closest atom using the radius supplied by the active display mode.
+pub fn pick_atom_filtered_with_radius(
+    molecule: &Molecule,
+    ray: Ray,
     mut is_visible: impl FnMut(usize) -> bool,
+    mut radius: impl FnMut(usize, &crate::molecule::Atom) -> f32,
 ) -> Option<usize> {
     let direction = ray.direction.normalize_or_zero();
     if direction == Vec3::ZERO {
@@ -29,7 +41,7 @@ pub fn pick_atom_filtered(
         .enumerate()
         .filter(|(index, _)| is_visible(*index))
         .filter_map(|(index, atom)| {
-            let radius = (atom.element.van_der_waals_radius() * 0.32).max(0.32);
+            let radius = radius(index, atom).max(0.001);
             ray_sphere_distance(ray.origin, direction, atom.position, radius)
                 .map(|distance| (index, distance))
         })

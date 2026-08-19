@@ -1,6 +1,9 @@
 struct Camera {
     view_projection: mat4x4<f32>,
+    inverse_view_projection: mat4x4<f32>,
     eye_position: vec4<f32>,
+    camera_right: vec4<f32>,
+    camera_up: vec4<f32>,
 };
 
 @group(0) @binding(0)
@@ -38,8 +41,7 @@ fn vertex_main(input: VertexInput) -> VertexOutput {
     return output;
 }
 
-@fragment
-fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
+fn shaded_color(input: VertexOutput) -> vec4<f32> {
     let normal = normalize(input.normal);
     let light_direction = normalize(vec3<f32>(0.35, 0.65, 0.70));
     let diffuse = max(dot(normal, light_direction), 0.0);
@@ -51,4 +53,22 @@ fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let lit = selected_color * (0.28 + 0.72 * diffuse) + vec3<f32>(specular);
     let highlight_emission = highlight_color * input.highlight * 0.24;
     return vec4<f32>(lit + highlight_emission, input.color.a);
+}
+
+struct SceneFragmentOutput {
+    @location(0) color: vec4<f32>,
+    @location(1) semantic_ids: vec4<u32>,
+};
+
+@fragment
+fn fragment_scene(input: VertexOutput) -> SceneFragmentOutput {
+    var output: SceneFragmentOutput;
+    output.color = shaded_color(input);
+    output.semantic_ids = vec4<u32>(0u);
+    return output;
+}
+
+@fragment
+fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
+    return shaded_color(input);
 }

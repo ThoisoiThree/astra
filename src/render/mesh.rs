@@ -85,6 +85,40 @@ pub fn cylinder(segments: u32) -> Mesh {
             bottom + 3,
         ]);
     }
+    let bottom_center = vertices.len() as u32;
+    vertices.push(Vertex {
+        position: [0.0, -0.5, 0.0],
+        normal: [0.0, -1.0, 0.0],
+    });
+    let top_center = vertices.len() as u32;
+    vertices.push(Vertex {
+        position: [0.0, 0.5, 0.0],
+        normal: [0.0, 1.0, 0.0],
+    });
+    let bottom_ring = vertices.len() as u32;
+    for segment in 0..segments {
+        let angle = segment as f32 / segments as f32 * std::f32::consts::TAU;
+        let point = [angle.cos(), angle.sin()];
+        vertices.push(Vertex {
+            position: [point[0], -0.5, point[1]],
+            normal: [0.0, -1.0, 0.0],
+        });
+        vertices.push(Vertex {
+            position: [point[0], 0.5, point[1]],
+            normal: [0.0, 1.0, 0.0],
+        });
+    }
+    for segment in 0..segments {
+        let next = (segment + 1) % segments;
+        indices.extend_from_slice(&[
+            bottom_center,
+            bottom_ring + next * 2,
+            bottom_ring + segment * 2,
+            top_center,
+            bottom_ring + segment * 2 + 1,
+            bottom_ring + next * 2 + 1,
+        ]);
+    }
     Mesh { vertices, indices }
 }
 
@@ -157,4 +191,21 @@ pub fn cube() -> Mesh {
         indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
     }
     Mesh { vertices, indices }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cylinder_has_flat_top_and_bottom_caps() {
+        let mesh = cylinder(8);
+        assert!(mesh.vertices.iter().any(|vertex| {
+            vertex.position == [0.0, -0.5, 0.0] && vertex.normal == [0.0, -1.0, 0.0]
+        }));
+        assert!(mesh.vertices.iter().any(|vertex| {
+            vertex.position == [0.0, 0.5, 0.0] && vertex.normal == [0.0, 1.0, 0.0]
+        }));
+        assert_eq!(mesh.indices.len(), 8 * 12);
+    }
 }

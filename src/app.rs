@@ -13,8 +13,9 @@ use molview::{
     RepresentationMask, VisibilityOverride,
     camera::{OrbitCamera, Viewport},
     command::{Command, Representation, parse_command},
+    measurement::{MeasurementEndpoint, MeasurementLine},
     molecule::{Molecule, MoleculeHierarchy, parse_structure},
-    picking::pick_atom_filtered,
+    picking::pick_atom_filtered_with_radius,
     render::{RenderError, Renderer, SurfaceIssue},
     selection::{Selection, evaluate_with_named, parse_selection},
 };
@@ -98,6 +99,9 @@ struct Runtime {
     named_selections: BTreeMap<String, Selection>,
     named_selection_expressions: BTreeMap<String, String>,
     named_selection_styles: BTreeMap<String, NamedSelectionStyle>,
+    measurement_lines: Vec<MeasurementLine>,
+    next_measurement_id: u64,
+    hierarchy_names: BTreeMap<InspectionTarget, String>,
     inspection: Option<InspectionTarget>,
     hierarchy_selection: BTreeSet<InspectionTarget>,
     hierarchy_selection_anchor: Option<InspectionTarget>,
@@ -124,6 +128,8 @@ struct EditableSnapshot {
     named_selections: BTreeMap<String, Selection>,
     named_selection_expressions: BTreeMap<String, String>,
     named_selection_styles: BTreeMap<String, NamedSelectionStyle>,
+    measurement_lines: Vec<MeasurementLine>,
+    hierarchy_names: BTreeMap<InspectionTarget, String>,
     inspection: Option<InspectionTarget>,
     hierarchy_selection: BTreeSet<InspectionTarget>,
     hierarchy_selection_anchor: Option<InspectionTarget>,
@@ -164,6 +170,9 @@ impl Runtime {
             named_selections: BTreeMap::new(),
             named_selection_expressions: BTreeMap::new(),
             named_selection_styles: BTreeMap::new(),
+            measurement_lines: Vec::new(),
+            next_measurement_id: 1,
+            hierarchy_names: BTreeMap::new(),
             inspection: None,
             hierarchy_selection: BTreeSet::new(),
             hierarchy_selection_anchor: None,
@@ -343,6 +352,8 @@ impl Runtime {
             named_selections: &self.named_selections,
             named_selection_expressions: &self.named_selection_expressions,
             named_selection_styles: &self.named_selection_styles,
+            measurement_lines: &self.measurement_lines,
+            hierarchy_names: &self.hierarchy_names,
             inspection: self.inspection,
             hierarchy_selection: &self.hierarchy_selection,
             camera: &self.camera,
@@ -367,6 +378,7 @@ impl Runtime {
         let mut textures_delta = full_output.textures_delta;
         let render_result = self.renderer.render(
             &self.camera,
+            self.display.as_ref(),
             self.viewport,
             &paint_jobs,
             &textures_delta,
@@ -424,6 +436,8 @@ impl Runtime {
                 named_selections: self.named_selections.clone(),
                 named_selection_expressions: self.named_selection_expressions.clone(),
                 named_selection_styles: self.named_selection_styles.clone(),
+                measurement_lines: self.measurement_lines.clone(),
+                hierarchy_names: self.hierarchy_names.clone(),
                 inspection: self.inspection,
                 hierarchy_selection: self.hierarchy_selection.clone(),
                 hierarchy_selection_anchor: self.hierarchy_selection_anchor,
@@ -504,6 +518,10 @@ impl Runtime {
         self.named_selections.clear();
         self.named_selection_expressions.clear();
         self.named_selection_styles.clear();
+        self.measurement_lines.clear();
+        self.next_measurement_id = 1;
+        self.hierarchy_names.clear();
+        self.renderer.update_measurements(&self.measurement_lines);
         self.inspection = None;
         self.hierarchy_selection.clear();
         self.hierarchy_selection_anchor = None;
@@ -523,6 +541,8 @@ impl Runtime {
             named_selections: self.named_selections.clone(),
             named_selection_expressions: self.named_selection_expressions.clone(),
             named_selection_styles: self.named_selection_styles.clone(),
+            measurement_lines: self.measurement_lines.clone(),
+            hierarchy_names: self.hierarchy_names.clone(),
             inspection: self.inspection,
             hierarchy_selection: self.hierarchy_selection.clone(),
             hierarchy_selection_anchor: self.hierarchy_selection_anchor,
@@ -562,6 +582,8 @@ impl Runtime {
         self.named_selections = snapshot.named_selections;
         self.named_selection_expressions = snapshot.named_selection_expressions;
         self.named_selection_styles = snapshot.named_selection_styles;
+        self.measurement_lines = snapshot.measurement_lines;
+        self.hierarchy_names = snapshot.hierarchy_names;
         self.inspection = snapshot.inspection;
         self.hierarchy_selection = snapshot.hierarchy_selection;
         self.hierarchy_selection_anchor = snapshot.hierarchy_selection_anchor;
@@ -664,17 +686,33 @@ impl Runtime {
             .screen_ray(point, self.viewport)
             .and_then(|ray| {
                 self.molecule.as_ref().and_then(|molecule| {
-                    pick_atom_filtered(molecule, ray, |index| {
-                        self.display.as_ref().is_none_or(|display| {
-                            let Some(atom) = molecule.atoms.get(index) else {
-                                return false;
-                            };
-                            display.visible.get(index).copied().unwrap_or(false)
-                                && (display.modes.get(index) == Some(&DisplayMode::BallAndStick)
-                                    || atom.hetero
-                                    || matches!(atom.name.as_str(), "CA" | "P"))
-                        })
-                    })
+                    let display = self.display.as_ref();
+                    pick_atom_filtered_with_radius(
+                        molecule,
+                        ray,
+                        |index| {
+                            display.is_none_or(|display| {
+                                let Some(atom) = molecule.atoms.get(index) else {
+                                    return false;
+                                };
+                                display.visible.get(index).copied().unwrap_or(false)
+                                    && (matches!(
+                                        display.modes.get(index),
+                                        Some(DisplayMode::BallAndStick | DisplayMode::Toon)
+                                    ) || atom.hetero
+                                        || matches!(atom.name.as_str(), "CA" | "P"))
+                            })
+                        },
+                        |index, atom| {
+                            if display.and_then(|display| display.modes.get(index))
+                                == Some(&DisplayMode::Toon)
+                            {
+                                atom.element.van_der_waals_radius()
+                            } else {
+                                (atom.element.van_der_waals_radius() * 0.32).max(0.32)
+                            }
+                        },
+                    )
                 })
             });
         match picked {
@@ -813,6 +851,11 @@ impl Runtime {
                 }
                 self.rebuild_named_display_layers();
             }
+            ManagerAction::SetAmbientOcclusion(settings) => {
+                if let Some(display) = &mut self.display {
+                    display.set_ambient_occlusion(settings);
+                }
+            }
             ManagerAction::SetUniformColor(color) => {
                 if let (Some(molecule), Some(display)) = (&self.molecule, &mut self.display) {
                     display.set_uniform_color(molecule, color);
@@ -862,7 +905,141 @@ impl Runtime {
                 self.named_selection_styles.remove(&name);
                 self.rebuild_named_display_layers();
             }
+            ManagerAction::CreateMeasurement {
+                first_selection,
+                second_selection,
+            } => match self.create_measurement(&first_selection, &second_selection) {
+                Ok(()) => self.ui.latest_error = None,
+                Err(error) => self.ui.latest_error = Some(error.to_string()),
+            },
+            ManagerAction::SetMeasurementColor { id, color } => {
+                if let Some(line) = self.measurement_lines.iter_mut().find(|line| line.id == id) {
+                    line.color = color;
+                    self.renderer.update_measurements(&self.measurement_lines);
+                }
+            }
+            ManagerAction::SetMeasurementVisibility { id, state } => {
+                if let Some(line) = self.measurement_lines.iter_mut().find(|line| line.id == id) {
+                    line.visibility = state;
+                    self.renderer.update_measurements(&self.measurement_lines);
+                }
+            }
+            ManagerAction::SetMeasurementLabelSize { id, size } => {
+                if let Some(line) = self.measurement_lines.iter_mut().find(|line| line.id == id) {
+                    line.set_label_size(size);
+                }
+            }
+            ManagerAction::SetMeasurementThickness { id, thickness } => {
+                if let Some(line) = self.measurement_lines.iter_mut().find(|line| line.id == id) {
+                    line.set_thickness(thickness);
+                    self.renderer.update_measurements(&self.measurement_lines);
+                }
+            }
+            ManagerAction::RemoveMeasurement(id) => {
+                self.measurement_lines.retain(|line| line.id != id);
+                self.renderer.update_measurements(&self.measurement_lines);
+            }
+            ManagerAction::SaveCurrentSelection(name) => {
+                let result = (|| -> Result<()> {
+                    if self.named_selections.contains_key(&name) {
+                        anyhow::bail!("named selection '{name}' already exists");
+                    }
+                    let flags = self
+                        .display
+                        .as_ref()
+                        .context("load a structure before saving a selection")?
+                        .selection
+                        .clone();
+                    if !flags.iter().any(|selected| *selected) {
+                        anyhow::bail!("select at least one atom first");
+                    }
+                    self.named_selections
+                        .insert(name.clone(), Selection::from_flags(flags));
+                    self.named_selection_styles.entry(name).or_default();
+                    self.rebuild_named_display_layers();
+                    Ok(())
+                })();
+                match result {
+                    Ok(()) => self.ui.latest_error = None,
+                    Err(error) => self.ui.latest_error = Some(error.to_string()),
+                }
+            }
+            ManagerAction::RenameHierarchy { target, name } => {
+                if let Some(name) = name {
+                    self.hierarchy_names.insert(target, name);
+                } else {
+                    self.hierarchy_names.remove(&target);
+                }
+            }
+            ManagerAction::RenameNamedSelection { old_name, new_name } => {
+                let result = (|| -> Result<()> {
+                    if old_name == new_name {
+                        return Ok(());
+                    }
+                    if self.named_selections.contains_key(&new_name) {
+                        anyhow::bail!("named selection '{new_name}' already exists");
+                    }
+                    let selection = self
+                        .named_selections
+                        .remove(&old_name)
+                        .with_context(|| format!("named selection '{old_name}' does not exist"))?;
+                    self.named_selections.insert(new_name.clone(), selection);
+                    if let Some(expression) = self.named_selection_expressions.remove(&old_name) {
+                        self.named_selection_expressions
+                            .insert(new_name.clone(), expression);
+                    }
+                    if let Some(style) = self.named_selection_styles.remove(&old_name) {
+                        self.named_selection_styles.insert(new_name.clone(), style);
+                    }
+                    for expression in self.named_selection_expressions.values_mut() {
+                        *expression = rename_selection_reference(expression, &old_name, &new_name);
+                    }
+                    self.rebuild_named_display_layers();
+                    Ok(())
+                })();
+                match result {
+                    Ok(()) => self.ui.latest_error = None,
+                    Err(error) => self.ui.latest_error = Some(error.to_string()),
+                }
+            }
+            ManagerAction::RenameMeasurement { id, name } => {
+                if let Some(line) = self.measurement_lines.iter_mut().find(|line| line.id == id) {
+                    line.name = name;
+                }
+            }
         }
+    }
+
+    fn create_measurement(&mut self, first_name: &str, second_name: &str) -> Result<()> {
+        let molecule = self
+            .molecule
+            .as_ref()
+            .context("load a structure before creating a distance line")?;
+        let first = measurement_endpoint(
+            molecule,
+            first_name,
+            self.named_selections
+                .get(first_name)
+                .with_context(|| format!("named selection '{first_name}' does not exist"))?,
+        )?;
+        let second = measurement_endpoint(
+            molecule,
+            second_name,
+            self.named_selections
+                .get(second_name)
+                .with_context(|| format!("named selection '{second_name}' does not exist"))?,
+        )?;
+        if first.position.distance(second.position) <= f32::EPSILON {
+            anyhow::bail!("the two measurement endpoints occupy the same point");
+        }
+        self.measurement_lines.push(MeasurementLine::new(
+            self.next_measurement_id,
+            first,
+            second,
+        ));
+        self.next_measurement_id += 1;
+        self.renderer.update_measurements(&self.measurement_lines);
+        Ok(())
     }
 
     fn select_hierarchy(&mut self, target: InspectionTarget, gesture: HierarchySelectionGesture) {
@@ -1121,6 +1298,7 @@ impl Runtime {
         if let (Some(molecule), Some(display)) = (&self.molecule, &self.display) {
             self.renderer.update_instances(molecule, display);
         }
+        self.renderer.update_measurements(&self.measurement_lines);
     }
 
     fn apply_camera_update(&mut self, update: CameraUpdate) {
@@ -1324,6 +1502,89 @@ fn centroid(molecule: &Molecule, indices: &[usize]) -> Option<Vec3> {
     (count > 0).then(|| sum / count as f32)
 }
 
+fn measurement_endpoint(
+    molecule: &Molecule,
+    selection_name: &str,
+    selection: &Selection,
+) -> Result<MeasurementEndpoint> {
+    let indices: Vec<_> = selection.indices().collect();
+    let first_index = *indices
+        .first()
+        .with_context(|| format!("named selection '{selection_name}' is empty"))?;
+    let first = molecule
+        .atoms
+        .get(first_index)
+        .with_context(|| format!("named selection '{selection_name}' refers to a missing atom"))?;
+    if indices.len() == 1 {
+        return Ok(MeasurementEndpoint {
+            position: first.position,
+            description: format!("{selection_name}: atom #{} {}", first.serial, first.name),
+        });
+    }
+
+    let one_residue = indices.iter().all(|index| {
+        molecule.atoms.get(*index).is_some_and(|atom| {
+            atom.chain_id == first.chain_id
+                && atom.residue_name == first.residue_name
+                && atom.residue_number == first.residue_number
+                && atom.insertion_code == first.insertion_code
+        })
+    });
+    if !one_residue {
+        anyhow::bail!(
+            "named selection '{selection_name}' must contain one atom or atoms from exactly one residue/base"
+        );
+    }
+    Ok(MeasurementEndpoint {
+        position: centroid(molecule, &indices).with_context(|| {
+            format!("named selection '{selection_name}' contains no valid atoms")
+        })?,
+        description: format!(
+            "{selection_name}: {} {} / chain {}",
+            first.residue_name, first.residue_number, first.chain_id
+        ),
+    })
+}
+
+fn rename_selection_reference(source: &str, old_name: &str, new_name: &str) -> String {
+    let mut output = String::with_capacity(source.len() + new_name.len());
+    let mut cursor = 0;
+    let mut expect_name = false;
+    for (start, word) in selection_words(source) {
+        output.push_str(&source[cursor..start]);
+        if expect_name && word.eq_ignore_ascii_case(old_name) {
+            output.push_str(new_name);
+        } else {
+            output.push_str(word);
+        }
+        expect_name = word.eq_ignore_ascii_case("selection");
+        cursor = start + word.len();
+    }
+    output.push_str(&source[cursor..]);
+    output
+}
+
+fn selection_words(source: &str) -> Vec<(usize, &str)> {
+    let mut words = Vec::new();
+    let mut start = None;
+    for (index, character) in source.char_indices() {
+        let is_word =
+            character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '+' | '\'' | '*');
+        match (start, is_word) {
+            (None, true) => start = Some(index),
+            (Some(word_start), false) => {
+                words.push((word_start, &source[word_start..index]));
+                start = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(word_start) = start {
+        words.push((word_start, &source[word_start..]));
+    }
+    words
+}
+
 fn representation_mask(representation: Representation) -> RepresentationMask {
     match representation {
         Representation::Spheres => RepresentationMask::SPHERES,
@@ -1406,6 +1667,34 @@ fn inclusive_target_range(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use molview::{
+        molecule::{Atom, Element},
+        selection::evaluate,
+    };
+
+    fn measurement_molecule() -> Molecule {
+        let atom = |serial, residue_number, position| Atom {
+            serial,
+            name: format!("A{serial}"),
+            element: Element::C,
+            residue_name: "GLY".into(),
+            residue_number,
+            insertion_code: None,
+            chain_id: "A".into(),
+            position,
+            occupancy: 1.0,
+            b_factor: 0.0,
+            hetero: false,
+        };
+        Molecule {
+            atoms: vec![
+                atom(1, 1, Vec3::ZERO),
+                atom(2, 1, Vec3::new(2.0, 0.0, 0.0)),
+                atom(3, 2, Vec3::new(5.0, 0.0, 0.0)),
+            ],
+            bonds: Vec::new(),
+        }
+    }
 
     #[test]
     fn shift_selects_range_and_command_toggles_one_target() {
@@ -1462,6 +1751,33 @@ mod tests {
     }
 
     #[test]
+    fn measurement_endpoint_accepts_one_atom_or_one_residue() {
+        let molecule = measurement_molecule();
+        let residue = evaluate(&parse_selection("resi 1").unwrap(), &molecule);
+        let endpoint = measurement_endpoint(&molecule, "residue", &residue).unwrap();
+        assert_eq!(endpoint.position, Vec3::new(1.0, 0.0, 0.0));
+
+        let atom = evaluate(&parse_selection("serial 3").unwrap(), &molecule);
+        let endpoint = measurement_endpoint(&molecule, "atom", &atom).unwrap();
+        assert_eq!(endpoint.position, Vec3::new(5.0, 0.0, 0.0));
+
+        let multiple = evaluate(&parse_selection("all").unwrap(), &molecule);
+        assert!(measurement_endpoint(&molecule, "multiple", &multiple).is_err());
+    }
+
+    #[test]
+    fn renaming_named_selection_updates_only_named_references() {
+        assert_eq!(
+            rename_selection_reference(
+                "selection old and (selection older or selection OLD)",
+                "old",
+                "new",
+            ),
+            "selection new and (selection older or selection new)"
+        );
+    }
+
+    #[test]
     fn edit_history_keeps_only_the_newest_fifty_events() {
         let mut history = VecDeque::new();
         for index in 0..60 {
@@ -1472,6 +1788,8 @@ mod tests {
                     named_selections: BTreeMap::new(),
                     named_selection_expressions: BTreeMap::new(),
                     named_selection_styles: BTreeMap::new(),
+                    measurement_lines: Vec::new(),
+                    hierarchy_names: BTreeMap::new(),
                     inspection: Some(InspectionTarget::Atom(index)),
                     hierarchy_selection: BTreeSet::new(),
                     hierarchy_selection_anchor: None,

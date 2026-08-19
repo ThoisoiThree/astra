@@ -19,6 +19,10 @@ pub enum SelectionEvaluationError {
 }
 
 impl Selection {
+    pub fn from_flags(flags: Vec<bool>) -> Self {
+        Self { flags }
+    }
+
     pub fn flags(&self) -> &[bool] {
         &self.flags
     }

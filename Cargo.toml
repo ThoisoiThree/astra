@@ -14,11 +14,13 @@ egui-winit = "0.36"
 flate2 = "1"
 glam = "0.33"
 pollster = "1"
+prost = "0.14"
 rfd = "0.17"
 rmpv = "1"
 thiserror = "2"
 wgpu = "30"
 winit = "0.30"
+zstd = "0.13"
 
 [profile.release]
 lto = "thin"
