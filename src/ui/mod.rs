@@ -230,6 +230,7 @@ pub enum ManagerAction {
 #[derive(Debug)]
 pub struct UiActions {
     pub open: bool,
+    pub save_scene: bool,
     pub fit: bool,
     pub reset_colors: bool,
     pub execute: Option<String>,
@@ -244,6 +245,7 @@ impl Default for UiActions {
     fn default() -> Self {
         Self {
             open: false,
+            save_scene: false,
             fit: false,
             reset_colors: false,
             execute: None,
@@ -282,7 +284,10 @@ impl UiState {
         let mut actions = UiActions::default();
         egui::Panel::top("toolbar").show(root, |ui| {
             ui.horizontal(|ui| {
-                actions.open = ui.button("Open structure").clicked();
+                actions.open = ui.button("Open").clicked();
+                actions.save_scene = ui
+                    .add_enabled(info.molecule.is_some(), egui::Button::new("Save scene"))
+                    .clicked();
                 actions.fit = ui.button("Fit").clicked();
                 actions.reset_colors = ui.button("Reset colors").clicked();
                 if ui.selectable_label(self.mode_open, "Mode").clicked() {

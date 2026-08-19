@@ -1,0 +1,208 @@
+syntax = "proto3";
+
+package molecule.v1;
+
+// Molecule 1.0 payload inside the versioned MOLECULE + Zstandard container.
+message Scene {
+  uint32 schema_version = 1;
+  uint32 minimum_reader_version = 2;
+  string source_name = 3;
+  Molecule molecule = 4;
+  Display display = 5;
+  repeated NamedSelection selections = 6;
+  repeated MeasurementLine measurements = 7;
+  Camera camera = 8;
+  repeated HierarchyName hierarchy_names = 9;
+  HierarchyTarget inspection = 10;
+  repeated HierarchyTarget hierarchy_selection = 11;
+  HierarchyTarget hierarchy_selection_anchor = 12;
+  string focus_description = 13;
+  string pivot_description = 14;
+}
+
+message Molecule {
+  uint32 atom_count = 1;
+  repeated string strings = 2;
+  repeated uint32 serials = 3 [packed = true];
+  repeated uint32 name_indices = 4 [packed = true];
+  repeated Element elements = 5 [packed = true];
+  repeated uint32 residue_name_indices = 6 [packed = true];
+  repeated sint32 residue_numbers = 7 [packed = true];
+  // Zero means absent; otherwise Unicode scalar value + 1.
+  repeated uint32 insertion_codes = 8 [packed = true];
+  repeated uint32 chain_indices = 9 [packed = true];
+  // xyzxyz... in Å, binary32.
+  repeated float positions = 10 [packed = true];
+  repeated float occupancies = 11 [packed = true];
+  repeated float b_factors = 12 [packed = true];
+  bytes hetero_flags = 13;
+  // ab ab... contiguous atom indices.
+  repeated uint32 bond_endpoints = 14 [packed = true];
+}
+
+message Display {
+  DisplayMode global_mode = 1;
+  ColoringMode coloring_mode = 2;
+  repeated float uniform_color = 3 [packed = true];
+  AmbientOcclusion ambient_occlusion = 4;
+  bool ambient_occlusion_customized = 5;
+  repeated uint32 representation_masks = 6 [packed = true];
+  bytes selection_flags = 7;
+  reserved 8, 9;
+  repeated ColorRun chain_colors = 10;
+  repeated ColorRun residue_colors = 11;
+  repeated ColorRun atom_colors = 12;
+  reserved 13 to 19;
+  repeated StateRun chain_visibility = 20;
+  repeated StateRun residue_visibility = 21;
+  repeated StateRun atom_visibility = 22;
+  reserved 23 to 29;
+  repeated StateRun chain_modes = 30;
+  repeated StateRun residue_modes = 31;
+  repeated StateRun atom_modes = 32;
+}
+
+message AmbientOcclusion {
+  bool enabled = 1;
+  float strength = 2;
+  float radius = 3;
+  float bias = 4;
+  AmbientOcclusionQuality quality = 5;
+}
+
+message ColorRun {
+  uint32 start = 1;
+  uint32 length = 2;
+  repeated float rgba = 3 [packed = true];
+}
+
+message StateRun {
+  uint32 start = 1;
+  uint32 length = 2;
+  uint32 value = 3;
+}
+
+message NamedSelection {
+  string name = 1;
+  optional string expression = 2;
+  bytes flags = 3;
+  SelectionStyle style = 4;
+}
+
+message SelectionStyle {
+  // Empty means inherited.
+  repeated float color = 1 [packed = true];
+  VisibilityOverride visibility = 2;
+  ModeOverride mode = 3;
+}
+
+message MeasurementLine {
+  uint64 id = 1;
+  string name = 2;
+  MeasurementEndpoint first = 3;
+  MeasurementEndpoint second = 4;
+  // Empty means default.
+  repeated float color = 5 [packed = true];
+  VisibilityOverride visibility = 6;
+  float label_size = 7;
+  float thickness = 8;
+}
+
+message MeasurementEndpoint {
+  Vec3 position = 1;
+  string description = 2;
+}
+
+message Camera {
+  Vec3 target = 1;
+  float distance = 2;
+  float yaw = 3;
+  float pitch = 4;
+  float field_of_view_y = 5;
+  float near = 6;
+  float far = 7;
+  DepthOfField depth_of_field = 8;
+}
+
+message DepthOfField {
+  bool enabled = 1;
+  Vec3 focus_point = 2;
+  float focal_length_mm = 3;
+  float sensor_height_mm = 4;
+  float f_stop = 5;
+  uint32 blade_count = 6;
+  float blade_rotation = 7;
+  float max_coc_pixels = 8;
+}
+
+message HierarchyName {
+  HierarchyTarget target = 1;
+  string name = 2;
+}
+
+message HierarchyTarget {
+  // 0 chain, 1 residue, 2 atom.
+  uint32 kind = 1;
+  uint32 first = 2;
+  uint32 second = 3;
+}
+
+message Vec3 {
+  float x = 1;
+  float y = 2;
+  float z = 3;
+}
+
+enum Element {
+  ELEMENT_UNKNOWN = 0;
+  ELEMENT_H = 1;
+  ELEMENT_C = 2;
+  ELEMENT_N = 3;
+  ELEMENT_O = 4;
+  ELEMENT_P = 5;
+  ELEMENT_S = 6;
+  ELEMENT_F = 7;
+  ELEMENT_CL = 8;
+  ELEMENT_BR = 9;
+  ELEMENT_I = 10;
+  ELEMENT_NA = 11;
+  ELEMENT_MG = 12;
+  ELEMENT_K = 13;
+  ELEMENT_CA = 14;
+  ELEMENT_FE = 15;
+  ELEMENT_ZN = 16;
+}
+
+enum DisplayMode {
+  DISPLAY_MODE_CARTOON = 0;
+  DISPLAY_MODE_BALL_AND_STICK = 1;
+  DISPLAY_MODE_TOON = 2;
+}
+
+enum ColoringMode {
+  COLORING_MODE_ELEMENT = 0;
+  COLORING_MODE_CHAIN = 1;
+  COLORING_MODE_RESIDUE = 2;
+  COLORING_MODE_RESIDUE_TYPE = 3;
+  COLORING_MODE_B_FACTOR = 4;
+  COLORING_MODE_UNIFORM = 5;
+}
+
+enum VisibilityOverride {
+  VISIBILITY_INHERIT = 0;
+  VISIBILITY_SHOW = 1;
+  VISIBILITY_HIDE = 2;
+}
+
+enum ModeOverride {
+  MODE_INHERIT = 0;
+  MODE_CARTOON = 1;
+  MODE_BALL_AND_STICK = 2;
+  MODE_TOON = 3;
+}
+
+enum AmbientOcclusionQuality {
+  AO_QUALITY_LOW = 0;
+  AO_QUALITY_MEDIUM = 1;
+  AO_QUALITY_HIGH = 2;
+}

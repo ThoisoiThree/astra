@@ -19,6 +19,8 @@ instancing with a small egui interface.
 - Hierarchical HSV color overrides and inherited tri-state visibility controls
 - Global and hierarchical Cartoon/Ball & stick/Toon display modes
 - Named selections with color/visibility attributes and a preserved internal hierarchy
+- Portable Molecule 1.0 (`.mol`) project files with embedded geometry, selections, styling, camera state,
+  schema versioning, and Zstandard compression
 - Dashed distance measurements with Å labels and editable line styles
 - Camera panel with clipping and thin-lens optical bokeh controls
 - Element/CPK, chain, residue, residue-type, B-factor, and uniform color schemes

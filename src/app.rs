@@ -17,6 +17,10 @@ use molview::{
     molecule::{Molecule, MoleculeHierarchy, parse_structure},
     picking::pick_atom_filtered_with_radius,
     render::{RenderError, Renderer, SurfaceIssue},
+    scene::{
+        SCENE_EXTENSION, SCENE_FORMAT_NAME, SceneDocument, SceneHierarchyTarget,
+        decode as decode_scene, encode as encode_scene, is_scene_document,
+    },
     selection::{Selection, evaluate_with_named, parse_selection},
 };
 use winit::{
@@ -412,6 +416,7 @@ impl Runtime {
     fn handle_ui_actions(&mut self, actions: UiActions) {
         if actions.open
             && let Some(path) = rfd::FileDialog::new()
+                .add_filter(SCENE_FORMAT_NAME, &[SCENE_EXTENSION])
                 .add_filter(
                     "Molecular structures",
                     &["pdb", "ent", "cif", "mmcif", "bcif", "xml", "gz"],
@@ -424,6 +429,26 @@ impl Runtime {
             && let Err(error) = self.load_path(&path)
         {
             self.ui.latest_error = Some(error.to_string());
+        }
+        if actions.save_scene {
+            let suggested_name = self
+                .loaded_filename
+                .as_deref()
+                .and_then(|name| Path::new(name).file_stem())
+                .map_or_else(
+                    || format!("scene.{SCENE_EXTENSION}"),
+                    |stem| format!("{}.{}", stem.to_string_lossy(), SCENE_EXTENSION),
+                );
+            if let Some(path) = rfd::FileDialog::new()
+                .add_filter(SCENE_FORMAT_NAME, &[SCENE_EXTENSION])
+                .set_file_name(suggested_name)
+                .save_file()
+            {
+                match self.save_scene(&path) {
+                    Ok(()) => self.ui.latest_error = None,
+                    Err(error) => self.ui.latest_error = Some(error.to_string()),
+                }
+            }
         }
         if actions.fit {
             self.fit();
@@ -506,6 +531,11 @@ impl Runtime {
             || path.display().to_string(),
             |name| name.to_string_lossy().into(),
         );
+        if is_scene_document(&contents) {
+            let document = decode_scene(&contents)
+                .with_context(|| format!("could not decode scene {}", path.display()))?;
+            return self.load_scene_document(document, filename);
+        }
         let (molecule, _format) = parse_structure(&contents, &filename)
             .with_context(|| format!("could not parse {}", path.display()))?;
         let hierarchy = MoleculeHierarchy::from_molecule(&molecule);
@@ -531,6 +561,99 @@ impl Runtime {
         self.camera.depth_of_field.focus_point = self.camera.target;
         self.focus_description = "Molecule center".into();
         self.pivot_description = "Molecule center".into();
+        self.ui.latest_error = None;
+        Ok(())
+    }
+
+    fn save_scene(&self, path: &Path) -> Result<()> {
+        let molecule = self
+            .molecule
+            .as_ref()
+            .context("open a structure before saving a scene")?;
+        let display = self
+            .display
+            .as_ref()
+            .context("display state is unavailable")?;
+        let document = SceneDocument {
+            source_name: self.loaded_filename.clone().unwrap_or_default(),
+            molecule: molecule.clone(),
+            display: display.clone(),
+            named_selections: self.named_selections.clone(),
+            named_selection_expressions: self.named_selection_expressions.clone(),
+            named_selection_styles: self.named_selection_styles.clone(),
+            measurement_lines: self.measurement_lines.clone(),
+            hierarchy_names: self
+                .hierarchy_names
+                .iter()
+                .map(|(target, name)| (scene_target(*target), name.clone()))
+                .collect(),
+            inspection: self.inspection.map(scene_target),
+            hierarchy_selection: self
+                .hierarchy_selection
+                .iter()
+                .copied()
+                .map(scene_target)
+                .collect(),
+            hierarchy_selection_anchor: self.hierarchy_selection_anchor.map(scene_target),
+            focus_description: self.focus_description.clone(),
+            pivot_description: self.pivot_description.clone(),
+            camera: self.camera.clone(),
+        };
+        let contents = encode_scene(&document).context("could not encode scene")?;
+        fs::write(path, contents)
+            .with_context(|| format!("could not write scene {}", path.display()))
+    }
+
+    fn load_scene_document(&mut self, document: SceneDocument, filename: String) -> Result<()> {
+        let SceneDocument {
+            molecule,
+            display,
+            named_selections,
+            named_selection_expressions,
+            named_selection_styles,
+            measurement_lines,
+            hierarchy_names,
+            inspection,
+            hierarchy_selection,
+            hierarchy_selection_anchor,
+            focus_description,
+            pivot_description,
+            mut camera,
+            ..
+        } = document;
+        let hierarchy = MoleculeHierarchy::from_molecule(&molecule);
+        camera.set_viewport(self.viewport);
+        self.renderer.update_instances(&molecule, &display);
+        self.renderer.update_measurements(&measurement_lines);
+        self.next_measurement_id = measurement_lines
+            .iter()
+            .map(|line| line.id)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+        self.loaded_filename = Some(filename);
+        self.molecule = Some(molecule);
+        self.hierarchy = Some(hierarchy);
+        self.display = Some(display);
+        self.named_selections = named_selections;
+        self.named_selection_expressions = named_selection_expressions;
+        self.named_selection_styles = named_selection_styles;
+        self.measurement_lines = measurement_lines;
+        self.hierarchy_names = hierarchy_names
+            .into_iter()
+            .map(|(target, name)| (inspection_target(target), name))
+            .collect();
+        self.inspection = inspection.map(inspection_target);
+        self.hierarchy_selection = hierarchy_selection
+            .into_iter()
+            .map(inspection_target)
+            .collect();
+        self.hierarchy_selection_anchor = hierarchy_selection_anchor.map(inspection_target);
+        self.focus_description = focus_description;
+        self.pivot_description = pivot_description;
+        self.camera = camera;
+        self.undo_history.clear();
+        self.redo_history.clear();
         self.ui.latest_error = None;
         Ok(())
     }
@@ -1461,6 +1584,34 @@ impl Runtime {
                 ))
             }
         }
+    }
+}
+
+fn scene_target(target: InspectionTarget) -> SceneHierarchyTarget {
+    match target {
+        InspectionTarget::Chain(index) => SceneHierarchyTarget::Chain(index),
+        InspectionTarget::Residue {
+            chain_index,
+            residue_index,
+        } => SceneHierarchyTarget::Residue {
+            chain_index,
+            residue_index,
+        },
+        InspectionTarget::Atom(index) => SceneHierarchyTarget::Atom(index),
+    }
+}
+
+fn inspection_target(target: SceneHierarchyTarget) -> InspectionTarget {
+    match target {
+        SceneHierarchyTarget::Chain(index) => InspectionTarget::Chain(index),
+        SceneHierarchyTarget::Residue {
+            chain_index,
+            residue_index,
+        } => InspectionTarget::Residue {
+            chain_index,
+            residue_index,
+        },
+        SceneHierarchyTarget::Atom(index) => InspectionTarget::Atom(index),
     }
 }
 
