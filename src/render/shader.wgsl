@@ -46,7 +46,9 @@ fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let view_direction = normalize(camera.eye_position.xyz - input.world_position);
     let half_vector = normalize(light_direction + view_direction);
     let specular = pow(max(dot(normal, half_vector), 0.0), 28.0) * 0.32;
-    let selected_color = mix(input.color.rgb, vec3<f32>(1.0, 0.78, 0.08), input.highlight * 0.72);
+    let highlight_color = vec3<f32>(1.0, 0.84, 0.08);
+    let selected_color = mix(input.color.rgb, highlight_color, input.highlight * 0.90);
     let lit = selected_color * (0.28 + 0.72 * diffuse) + vec3<f32>(specular);
-    return vec4<f32>(lit, input.color.a);
+    let highlight_emission = highlight_color * input.highlight * 0.24;
+    return vec4<f32>(lit + highlight_emission, input.color.a);
 }

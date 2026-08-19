@@ -154,7 +154,7 @@ pub struct DisplayState {
 impl DisplayState {
     pub fn for_molecule(molecule: &Molecule) -> Self {
         let atom_count = molecule.atoms.len();
-        let base_colors = vec![DEFAULT_UNIFORM_COLOR; atom_count];
+        let base_colors = element_colors(molecule);
         Self {
             colors: base_colors.clone(),
             visible: vec![true; atom_count],
@@ -172,7 +172,7 @@ impl DisplayState {
             selection: vec![false; atom_count],
             modes: vec![DisplayMode::Cartoon; atom_count],
             global_mode: DisplayMode::Cartoon,
-            coloring_mode: ColoringMode::Uniform,
+            coloring_mode: ColoringMode::Element,
             uniform_color: DEFAULT_UNIFORM_COLOR,
             base_colors,
             named_colors: vec![None; atom_count],
@@ -521,7 +521,7 @@ impl DisplayState {
         self.residue_colors.fill(None);
         self.atom_colors.fill(None);
         self.uniform_color = DEFAULT_UNIFORM_COLOR;
-        self.set_coloring_mode(molecule, ColoringMode::Uniform);
+        self.set_coloring_mode(molecule, ColoringMode::Element);
     }
 
     pub fn selection_count(&self) -> usize {
@@ -760,20 +760,21 @@ mod display_tests {
     }
 
     #[test]
-    fn default_and_reset_colors_use_the_uniform_cartoon_color() {
+    fn default_and_reset_colors_use_element_coloring() {
         let molecule = molecule();
         let mut display = DisplayState::for_molecule(&molecule);
-        assert_eq!(display.coloring_mode, ColoringMode::Uniform);
-        assert_eq!(display.colors, vec![DEFAULT_UNIFORM_COLOR; 2]);
+        let element_colors = element_colors(&molecule);
+        assert_eq!(display.coloring_mode, ColoringMode::Element);
+        assert_eq!(display.colors, element_colors);
 
-        display.set_coloring_mode(&molecule, ColoringMode::Element);
+        display.set_coloring_mode(&molecule, ColoringMode::Uniform);
         display.set_uniform_color(&molecule, [1.0, 0.0, 0.0, 1.0]);
         display.set_color_override(&[0], DisplayLevel::Atom, Some([0.0, 1.0, 0.0, 1.0]));
         display.reset_colors(&molecule);
 
-        assert_eq!(display.coloring_mode, ColoringMode::Uniform);
+        assert_eq!(display.coloring_mode, ColoringMode::Element);
         assert_eq!(display.uniform_color, DEFAULT_UNIFORM_COLOR);
-        assert_eq!(display.colors, vec![DEFAULT_UNIFORM_COLOR; 2]);
+        assert_eq!(display.colors, element_colors);
     }
 
     #[test]

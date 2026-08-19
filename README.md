@@ -83,10 +83,10 @@ nucleic-acid `P` atoms; disconnected residues and chains are never bridged.
 Ligands and residues without a cartoon backbone remain in Ball & stick. The
 second global mode is **Ball & stick**, matching the viewer's original rendering.
 
-The default Cartoon color is the same blue-gray Uniform color shown in the
-Coloring window. Picking an atom in the viewport reveals its hierarchy path and
-highlights the atom, its residue, and its chain without adding the ancestors to
-the editable multi-selection.
+Cartoon uses the active color scheme; Element/CPK is the default. Picking an
+atom in the viewport reveals its hierarchy path and highlights the atom, its
+residue, and its chain without adding the ancestors to the editable
+multi-selection.
 
 Every chain, residue, and atom has a mode badge before its color and visibility
 attributes. A gray badge inherits; an orange badge is a local override. Clicking

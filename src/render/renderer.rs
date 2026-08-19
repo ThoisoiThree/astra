@@ -710,10 +710,10 @@ impl Renderer {
                     depth_slice: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
-                            // sRGB #21272C converted to linear RGB for Rgba16Float.
-                            r: 0.015_209,
-                            g: 0.020_289,
-                            b: 0.025_187,
+                            // sRGB #1D2123 converted to linear RGB for Rgba16Float.
+                            r: 0.012_286,
+                            g: 0.015_209,
+                            b: 0.016_807,
                             a: 1.0,
                         }),
                         store: wgpu::StoreOp::Store,
