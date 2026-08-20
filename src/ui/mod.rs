@@ -15,6 +15,9 @@ pub struct UiState {
     pub latest_error: Option<String>,
     history: Vec<String>,
     history_cursor: Option<usize>,
+    file_open: bool,
+    fetch_open: bool,
+    fetch_id: String,
     camera_open: bool,
     coloring_open: bool,
     mode_open: bool,
@@ -230,7 +233,12 @@ pub enum ManagerAction {
 #[derive(Debug)]
 pub struct UiActions {
     pub open: bool,
-    pub save_scene: bool,
+    pub fetch: Option<String>,
+    pub cancel_fetch: bool,
+    pub activate_session: Option<u64>,
+    pub close_session: Option<u64>,
+    pub save: bool,
+    pub save_as: bool,
     pub fit: bool,
     pub reset_colors: bool,
     pub execute: Option<String>,
@@ -245,7 +253,12 @@ impl Default for UiActions {
     fn default() -> Self {
         Self {
             open: false,
-            save_scene: false,
+            fetch: None,
+            cancel_fetch: false,
+            activate_session: None,
+            close_session: None,
+            save: false,
+            save_as: false,
             fit: false,
             reset_colors: false,
             execute: None,
@@ -258,9 +271,18 @@ impl Default for UiActions {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct SessionTab {
+    pub id: u64,
+    pub label: String,
+}
+
 #[derive(Clone, Copy)]
 pub struct UiInfo<'a> {
     pub filename: Option<&'a str>,
+    pub molecule_id: Option<&'a str>,
+    pub session_tabs: &'a [SessionTab],
+    pub active_session_id: Option<u64>,
     pub atom_count: usize,
     pub bond_count: usize,
     pub selection_count: usize,
@@ -277,17 +299,23 @@ pub struct UiInfo<'a> {
     pub camera: &'a OrbitCamera,
     pub focus_description: &'a str,
     pub pivot_description: &'a str,
+    pub fetching_pdb_id: Option<&'a str>,
+    pub fetch_downloaded_bytes: u64,
+    pub fetch_total_bytes: Option<u64>,
+    pub fetch_bytes_per_second: f64,
 }
 
 impl UiState {
     pub fn show(&mut self, root: &mut egui::Ui, info: UiInfo<'_>) -> UiActions {
         let mut actions = UiActions::default();
+        let mut file_button = None;
         egui::Panel::top("toolbar").show(root, |ui| {
             ui.horizontal(|ui| {
-                actions.open = ui.button("Open").clicked();
-                actions.save_scene = ui
-                    .add_enabled(info.molecule.is_some(), egui::Button::new("Save scene"))
-                    .clicked();
+                let response = ui.selectable_label(self.file_open, "File");
+                if response.clicked() {
+                    self.file_open = !self.file_open;
+                }
+                file_button = Some(response);
                 actions.fit = ui.button("Fit").clicked();
                 actions.reset_colors = ui.button("Reset colors").clicked();
                 if ui.selectable_label(self.mode_open, "Mode").clicked() {
@@ -309,6 +337,9 @@ impl UiState {
                 ui.strong(info.filename.unwrap_or("No molecule loaded"));
             });
         });
+        if let Some(response) = &file_button {
+            self.file_panel(response, info, &mut actions);
+        }
 
         egui::Panel::left("molecule manager")
             .default_size(350.0)
@@ -357,8 +388,40 @@ impl UiState {
                             &mut self.color_editor,
                             &mut self.rename_editor,
                         );
-                    });
+                });
             });
+        if !info.session_tabs.is_empty() {
+            egui::Panel::top("document tabs")
+                .exact_size(32.0)
+                .show(root, |ui| {
+                    egui::ScrollArea::horizontal()
+                        .id_salt("document tabs scroll")
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                for tab in info.session_tabs {
+                                    ui.group(|ui| {
+                                        ui.horizontal(|ui| {
+                                            let selected = info.active_session_id == Some(tab.id);
+                                            if ui
+                                                .selectable_label(
+                                                    selected,
+                                                    format!("◉ {}", tab.label),
+                                                )
+                                                .clicked()
+                                            {
+                                                actions.activate_session = Some(tab.id);
+                                            }
+                                            if ui.small_button("×").clicked() {
+                                                actions.close_session = Some(tab.id);
+                                            }
+                                        });
+                                    });
+                                }
+                            });
+                        });
+                });
+        }
         let viewport = root.available_rect_before_wrap();
         measurement_labels(root.painter(), viewport, info);
         self.mode_window(root.ctx(), info, &mut actions);
@@ -370,8 +433,122 @@ impl UiState {
         self.measurement_color_editor_window(root.ctx(), &mut actions);
         self.named_expression_editor_window(root.ctx(), &mut actions);
         self.rename_window(root.ctx(), &mut actions);
+        self.fetch_window(root.ctx(), info, &mut actions);
         actions.viewport = viewport;
         actions
+    }
+
+    fn file_panel(&mut self, button: &egui::Response, info: UiInfo<'_>, actions: &mut UiActions) {
+        let mut open = self.file_open;
+        let mut close = false;
+        egui::Popup::from_response(button)
+            .open_bool(&mut open)
+            .width(180.0)
+            .show(|ui| {
+                if ui.button("Open").clicked() {
+                    actions.open = true;
+                    close = true;
+                }
+                if ui.button("Fetch").clicked() {
+                    self.fetch_open = true;
+                    close = true;
+                }
+                let has_structure = info.molecule.is_some();
+                if ui
+                    .add_enabled(has_structure, egui::Button::new("Save as…"))
+                    .clicked()
+                {
+                    actions.save_as = true;
+                    close = true;
+                }
+                if ui
+                    .add_enabled(has_structure, egui::Button::new("Save"))
+                    .clicked()
+                {
+                    actions.save = true;
+                    close = true;
+                }
+            });
+        self.file_open = open && !close;
+    }
+
+    fn fetch_window(&mut self, context: &egui::Context, info: UiInfo<'_>, actions: &mut UiActions) {
+        if !self.fetch_open {
+            return;
+        }
+        let response =
+            egui::Modal::new(egui::Id::new("fetch PDB structure modal")).show(context, |ui| {
+                ui.set_min_width(360.0);
+                ui.heading("Fetch");
+                ui.label("Download a structure from RCSB PDB");
+                ui.add_space(6.0);
+
+                if let Some(id) = info.fetching_pdb_id {
+                    ui.label(format!("Downloading {id}"));
+                    let progress = info.fetch_total_bytes.map_or(0.0, |total| {
+                        if total == 0 {
+                            0.0
+                        } else {
+                            info.fetch_downloaded_bytes as f32 / total as f32
+                        }
+                    });
+                    let progress_text = info.fetch_total_bytes.map_or_else(
+                        || format_bytes(info.fetch_downloaded_bytes),
+                        |total| {
+                            format!(
+                                "{} / {}",
+                                format_bytes(info.fetch_downloaded_bytes),
+                                format_bytes(total)
+                            )
+                        },
+                    );
+                    ui.add(
+                        egui::ProgressBar::new(progress)
+                            .desired_width(340.0)
+                            .text(progress_text)
+                            .animate(info.fetch_total_bytes.is_none()),
+                    );
+                    ui.label(format!(
+                        "{} · saved to ~/downloads/pdb/",
+                        format_speed(info.fetch_bytes_per_second)
+                    ));
+                    ui.add_space(6.0);
+                    if ui.button("Cancel").clicked() {
+                        actions.cancel_fetch = true;
+                        self.fetch_open = false;
+                    }
+                } else {
+                    let edit = ui.add(
+                        egui::TextEdit::singleline(&mut self.fetch_id)
+                            .hint_text("PDB ID, e.g. 4R8P")
+                            .desired_width(340.0),
+                    );
+                    let enter = edit.lost_focus()
+                        && context.input(|input| input.key_pressed(egui::Key::Enter));
+                    ui.small("The downloaded file will be saved to ~/downloads/pdb/");
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        let can_fetch = !self.fetch_id.trim().is_empty();
+                        if ui
+                            .add_enabled(can_fetch, egui::Button::new("Fetch"))
+                            .clicked()
+                            || (enter && can_fetch)
+                        {
+                            actions.fetch = Some(self.fetch_id.trim().to_owned());
+                        }
+                        if ui.button("Cancel").clicked() {
+                            self.fetch_open = false;
+                        }
+                    });
+                }
+            });
+        if response.should_close() && info.fetching_pdb_id.is_none() {
+            self.fetch_open = false;
+        }
+    }
+
+    pub fn close_fetch(&mut self) {
+        self.fetch_open = false;
     }
 
     fn mode_window(&mut self, context: &egui::Context, info: UiInfo<'_>, actions: &mut UiActions) {
@@ -1033,7 +1210,12 @@ impl UiState {
 }
 
 fn molecule_summary(ui: &mut egui::Ui, info: UiInfo<'_>) {
-    ui.heading("Molecule");
+    ui.horizontal(|ui| {
+        ui.heading("Molecule");
+        if let Some(id) = info.molecule_id {
+            ui.monospace(id);
+        }
+    });
     egui::Grid::new("molecule stats")
         .num_columns(2)
         .spacing([12.0, 4.0])
@@ -2125,6 +2307,29 @@ fn current_selection_name(input: &str) -> Option<&str> {
 
 fn display_chain(chain: &str) -> &str {
     if chain.is_empty() { "(blank)" } else { chain }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} {}", UNITS[unit])
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+fn format_speed(bytes_per_second: f64) -> String {
+    if bytes_per_second <= 0.0 {
+        "Waiting for data…".into()
+    } else {
+        format!("{}/s", format_bytes(bytes_per_second.round() as u64))
+    }
 }
 
 #[cfg(test)]

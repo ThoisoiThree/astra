@@ -24,7 +24,7 @@ instancing with a small egui interface.
 - Dashed distance measurements with Å labels and editable line styles
 - Camera panel with clipping and thin-lens optical bokeh controls
 - Element/CPK, chain, residue, residue-type, B-factor, and uniform color schemes
-- Native open dialog, command-line path, and structure-file drag-and-drop
+- Open/Fetch/Save file menu, RCSB PDB download by ID, command-line path, and drag-and-drop
 - Boolean selection AST with useful position-bearing syntax errors
 - Per-atom color, sphere/stick visibility, and non-destructive selection highlight
 - Command history with Up/Down while the command field is focused
@@ -47,7 +47,7 @@ cargo run -- examples/minimal.pdb
 cargo run -- examples/4R8P.pdb
 ```
 
-Or start without a file and use **Open structure**:
+Or start without a file and use **File → Open**:
 
 ```bash
 cargo run
@@ -64,7 +64,7 @@ Shift+left-drag pans, and the mouse wheel/trackpad zooms. Ctrl/Cmd with either
 right-drag or macOS three-finger drag translates the camera and pivot in screen
 space, so the gesture always follows visible left/right/up/down. The
 hierarchy manager can select whole chains, residues, or individual atoms. **Fit**
-reframes the molecule and **Reset colors** restores element/CPK coloring.
+reframes the molecule and **Reset colors** restores chain coloring.
 
 Supported coordinate inputs are `.pdb`/`.ent`, `.cif`/`.mmcif`, `.bcif`, and
 PDBML `.xml`; each can be gzip-compressed. Biological assembly files use these
@@ -72,6 +72,13 @@ same readers. Structure-factor and validation CIF/XML files are recognized, but
 if they contain no `atom_site` coordinates the viewer reports that they are
 non-displayable data rather than treating them as a broken structure. Validation
 PDF reports likewise have no molecular coordinates.
+
+The **File** menu contains **Open**, **Fetch**, **Save as**, and **Save**. **Fetch** opens a
+modal PDB ID dialog with cancellable download progress and transfer speed. Large files use
+four HTTP byte-range workers when RCSB advertises range support; small files use one stream
+to avoid connection overhead. Downloads are stored under `~/downloads/pdb/` and opened
+without blocking the UI. Save as
+creates a Molecule 1.0 `.mol` project; subsequent Save operations update that file.
 
 Ctrl/Cmd+Z undoes edits to selections, named selections, colors, visibility,
 representations, and other display state. Ctrl/Cmd+R reapplies them. The newest
@@ -172,7 +179,7 @@ depth-tested annotation pass after molecular AO and DOF, so measurements and
 future markup do not alter molecular depth, ambient occlusion, or shading.
 
 Every measurement is an independent object in the **Lines** folder. Its HSV
-color, gray/green/red visibility state, line thickness (0.01–0.30 Å), label size
+color, gray/green/red visibility state, line thickness (0.01–10 Å), label size
 (8–48 pt), and lifetime can be edited there. Measurement creation, styling,
 visibility changes, resizing, and deletion participate in the 50-step Undo/Redo
 history.

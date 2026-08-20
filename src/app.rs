@@ -1,9 +1,14 @@
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
-    fs,
+    env, fs,
+    io::Read,
     path::Path,
     path::PathBuf,
     sync::Arc,
+    sync::atomic::{AtomicBool, Ordering},
+    sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError},
+    thread,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
@@ -33,10 +38,15 @@ use winit::{
 };
 
 const EDIT_HISTORY_LIMIT: usize = 50;
+const MAX_FETCH_SIZE: u64 = 512 * 1024 * 1024;
+const FETCH_BUFFER_SIZE: usize = 64 * 1024;
+const PARALLEL_FETCH_MIN_SIZE: u64 = 4 * 1024 * 1024;
+const PARALLEL_FETCH_WORKERS: usize = 4;
+const FETCH_CANCELLED: &str = "PDB download canceled";
 
 use crate::ui::{
     CameraUpdate, FocusRequest, HierarchySelectionGesture, InspectionTarget, ManagerAction,
-    PivotRequest, UiActions, UiInfo, UiState,
+    PivotRequest, SessionTab, UiActions, UiInfo, UiState,
 };
 
 pub fn run(initial_path: Option<PathBuf>) -> Result<()> {
@@ -112,6 +122,16 @@ struct Runtime {
     focus_description: String,
     pivot_description: String,
     loaded_filename: Option<String>,
+    molecule_id: Option<String>,
+    scene_path: Option<PathBuf>,
+    inactive_sessions: Vec<DocumentSession>,
+    session_order: Vec<u64>,
+    active_session_id: u64,
+    next_session_id: u64,
+    fetch_receiver: Option<Receiver<FetchEvent>>,
+    fetching_pdb_id: Option<String>,
+    fetch_progress: FetchProgress,
+    fetch_cancel: Option<Arc<AtomicBool>>,
     camera: OrbitCamera,
     ui: UiState,
     cursor: Option<PhysicalPosition<f64>>,
@@ -124,6 +144,79 @@ struct Runtime {
     occluded: bool,
     undo_history: VecDeque<EditableSnapshot>,
     redo_history: VecDeque<EditableSnapshot>,
+}
+
+struct DocumentSession {
+    id: u64,
+    molecule: Option<Molecule>,
+    hierarchy: Option<MoleculeHierarchy>,
+    display: Option<DisplayState>,
+    named_selections: BTreeMap<String, Selection>,
+    named_selection_expressions: BTreeMap<String, String>,
+    named_selection_styles: BTreeMap<String, NamedSelectionStyle>,
+    measurement_lines: Vec<MeasurementLine>,
+    next_measurement_id: u64,
+    hierarchy_names: BTreeMap<InspectionTarget, String>,
+    inspection: Option<InspectionTarget>,
+    hierarchy_selection: BTreeSet<InspectionTarget>,
+    hierarchy_selection_anchor: Option<InspectionTarget>,
+    focus_description: String,
+    pivot_description: String,
+    loaded_filename: Option<String>,
+    molecule_id: Option<String>,
+    scene_path: Option<PathBuf>,
+    camera: OrbitCamera,
+    undo_history: VecDeque<EditableSnapshot>,
+    redo_history: VecDeque<EditableSnapshot>,
+}
+
+impl DocumentSession {
+    fn empty(id: u64, viewport: Viewport) -> Self {
+        let aspect = viewport.width / viewport.height.max(1.0);
+        Self {
+            id,
+            molecule: None,
+            hierarchy: None,
+            display: None,
+            named_selections: BTreeMap::new(),
+            named_selection_expressions: BTreeMap::new(),
+            named_selection_styles: BTreeMap::new(),
+            measurement_lines: Vec::new(),
+            next_measurement_id: 1,
+            hierarchy_names: BTreeMap::new(),
+            inspection: None,
+            hierarchy_selection: BTreeSet::new(),
+            hierarchy_selection_anchor: None,
+            focus_description: "World origin".into(),
+            pivot_description: "World origin".into(),
+            loaded_filename: None,
+            molecule_id: None,
+            scene_path: None,
+            camera: OrbitCamera::new(aspect),
+            undo_history: VecDeque::new(),
+            redo_history: VecDeque::new(),
+        }
+    }
+
+    fn tab(&self) -> SessionTab {
+        SessionTab {
+            id: self.id,
+            label: session_label(self.molecule_id.as_deref(), self.loaded_filename.as_deref()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct FetchProgress {
+    downloaded_bytes: u64,
+    total_bytes: Option<u64>,
+    bytes_per_second: f64,
+}
+
+#[derive(Debug)]
+enum FetchEvent {
+    Progress(FetchProgress),
+    Finished(Result<PathBuf, String>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -153,6 +246,7 @@ impl Runtime {
         let renderer = pollster::block_on(Renderer::new(window.clone()))
             .context("could not initialize wgpu")?;
         let size = renderer.size();
+        let viewport = Viewport::full(size.width, size.height);
         let camera = OrbitCamera::new(size.width as f32 / size.height.max(1) as f32);
         let egui_context = egui::Context::default();
         let egui_state = egui_winit::State::new(
@@ -183,10 +277,20 @@ impl Runtime {
             focus_description: "World origin".into(),
             pivot_description: "World origin".into(),
             loaded_filename: None,
+            molecule_id: None,
+            scene_path: None,
+            inactive_sessions: Vec::new(),
+            session_order: Vec::new(),
+            active_session_id: 1,
+            next_session_id: 2,
+            fetch_receiver: None,
+            fetching_pdb_id: None,
+            fetch_progress: FetchProgress::default(),
+            fetch_cancel: None,
             camera,
             ui: UiState::default(),
             cursor: None,
-            viewport: Viewport::full(size.width, size.height),
+            viewport,
             left_drag: false,
             left_drag_distance: 0.0,
             right_drag: false,
@@ -206,6 +310,7 @@ impl Runtime {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, event: WindowEvent) {
+        self.poll_fetch_result();
         let egui_response = self.egui_state.on_window_event(&self.window, &event);
         if egui_response.repaint {
             self.window.request_redraw();
@@ -336,8 +441,12 @@ impl Runtime {
 
     fn redraw(&mut self, event_loop: &ActiveEventLoop) {
         let raw_input = self.egui_state.take_egui_input(&self.window);
+        let session_tabs = self.session_tabs();
         let info = UiInfo {
             filename: self.loaded_filename.as_deref(),
+            molecule_id: self.molecule_id.as_deref(),
+            session_tabs: &session_tabs,
+            active_session_id: self.molecule.as_ref().map(|_| self.active_session_id),
             atom_count: self
                 .molecule
                 .as_ref()
@@ -363,6 +472,10 @@ impl Runtime {
             camera: &self.camera,
             focus_description: &self.focus_description,
             pivot_description: &self.pivot_description,
+            fetching_pdb_id: self.fetching_pdb_id.as_deref(),
+            fetch_downloaded_bytes: self.fetch_progress.downloaded_bytes,
+            fetch_total_bytes: self.fetch_progress.total_bytes,
+            fetch_bytes_per_second: self.fetch_progress.bytes_per_second,
         };
         let context = self.egui_context.clone();
         let mut actions = UiActions::default();
@@ -414,8 +527,16 @@ impl Runtime {
     }
 
     fn handle_ui_actions(&mut self, actions: UiActions) {
+        if let Some(id) = actions.close_session {
+            self.close_session(id);
+            return;
+        }
+        if let Some(id) = actions.activate_session {
+            self.activate_session(id);
+            return;
+        }
         if actions.open
-            && let Some(path) = rfd::FileDialog::new()
+            && let Some(paths) = rfd::FileDialog::new()
                 .add_filter(SCENE_FORMAT_NAME, &[SCENE_EXTENSION])
                 .add_filter(
                     "Molecular structures",
@@ -425,29 +546,35 @@ impl Runtime {
                 .add_filter("BinaryCIF", &["bcif", "gz"])
                 .add_filter("Legacy PDB", &["pdb", "ent", "gz"])
                 .add_filter("PDBML/XML", &["xml", "gz"])
-                .pick_file()
-            && let Err(error) = self.load_path(&path)
+                .pick_files()
+        {
+            for path in paths {
+                if let Err(error) = self.load_path(&path) {
+                    self.ui.latest_error = Some(error.to_string());
+                    break;
+                }
+            }
+        }
+        if let Some(id) = actions.fetch
+            && let Err(error) = self.start_fetch(&id)
         {
             self.ui.latest_error = Some(error.to_string());
         }
-        if actions.save_scene {
-            let suggested_name = self
-                .loaded_filename
-                .as_deref()
-                .and_then(|name| Path::new(name).file_stem())
-                .map_or_else(
-                    || format!("scene.{SCENE_EXTENSION}"),
-                    |stem| format!("{}.{}", stem.to_string_lossy(), SCENE_EXTENSION),
-                );
-            if let Some(path) = rfd::FileDialog::new()
-                .add_filter(SCENE_FORMAT_NAME, &[SCENE_EXTENSION])
-                .set_file_name(suggested_name)
-                .save_file()
-            {
-                match self.save_scene(&path) {
-                    Ok(()) => self.ui.latest_error = None,
-                    Err(error) => self.ui.latest_error = Some(error.to_string()),
-                }
+        if actions.cancel_fetch {
+            self.cancel_fetch();
+        }
+        if actions.save_as {
+            if let Err(error) = self.save_scene_as() {
+                self.ui.latest_error = Some(error.to_string());
+            }
+        } else if actions.save {
+            let result = if let Some(path) = self.scene_path.clone() {
+                self.save_scene_to(path)
+            } else {
+                self.save_scene_as()
+            };
+            if let Err(error) = result {
+                self.ui.latest_error = Some(error.to_string());
             }
         }
         if actions.fit {
@@ -524,6 +651,154 @@ impl Runtime {
         }
     }
 
+    fn session_tabs(&self) -> Vec<SessionTab> {
+        self.session_order
+            .iter()
+            .filter_map(|id| {
+                if *id == self.active_session_id && self.molecule.is_some() {
+                    Some(SessionTab {
+                        id: *id,
+                        label: session_label(
+                            self.molecule_id.as_deref(),
+                            self.loaded_filename.as_deref(),
+                        ),
+                    })
+                } else {
+                    self.inactive_sessions
+                        .iter()
+                        .find(|session| session.id == *id)
+                        .map(DocumentSession::tab)
+                }
+            })
+            .collect()
+    }
+
+    fn begin_new_session(&mut self) {
+        if self.molecule.is_some() {
+            let mut previous = DocumentSession::empty(self.active_session_id, self.viewport);
+            self.swap_active_document(&mut previous);
+            self.inactive_sessions.push(previous);
+            self.active_session_id = self.next_session_id;
+            self.next_session_id = self.next_session_id.saturating_add(1);
+        }
+        if !self.session_order.contains(&self.active_session_id) {
+            self.session_order.push(self.active_session_id);
+        }
+    }
+
+    fn activate_session(&mut self, id: u64) {
+        if id == self.active_session_id || !self.session_order.contains(&id) {
+            return;
+        }
+        let Some(position) = self
+            .inactive_sessions
+            .iter()
+            .position(|session| session.id == id)
+        else {
+            return;
+        };
+        let mut target = self.inactive_sessions.remove(position);
+        let mut previous = DocumentSession::empty(self.active_session_id, self.viewport);
+        self.swap_active_document(&mut previous);
+        if previous.molecule.is_some() {
+            self.inactive_sessions.push(previous);
+        }
+        self.active_session_id = id;
+        self.swap_active_document(&mut target);
+        self.sync_active_document();
+    }
+
+    fn close_session(&mut self, id: u64) {
+        let Some(order_position) = self.session_order.iter().position(|candidate| *candidate == id)
+        else {
+            return;
+        };
+        self.session_order.remove(order_position);
+        if id != self.active_session_id {
+            if let Some(position) = self
+                .inactive_sessions
+                .iter()
+                .position(|session| session.id == id)
+            {
+                self.inactive_sessions.remove(position);
+            }
+            return;
+        }
+
+        let next_id = if self.session_order.is_empty() {
+            None
+        } else {
+            Some(self.session_order[order_position.min(self.session_order.len() - 1)])
+        };
+        let mut discarded = DocumentSession::empty(self.active_session_id, self.viewport);
+        self.swap_active_document(&mut discarded);
+        if let Some(next_id) = next_id
+            && let Some(position) = self
+                .inactive_sessions
+                .iter()
+                .position(|session| session.id == next_id)
+        {
+            let mut next = self.inactive_sessions.remove(position);
+            self.active_session_id = next_id;
+            self.swap_active_document(&mut next);
+        } else {
+            self.active_session_id = self.next_session_id;
+            self.next_session_id = self.next_session_id.saturating_add(1);
+        }
+        self.sync_active_document();
+    }
+
+    fn swap_active_document(&mut self, session: &mut DocumentSession) {
+        std::mem::swap(&mut self.molecule, &mut session.molecule);
+        std::mem::swap(&mut self.hierarchy, &mut session.hierarchy);
+        std::mem::swap(&mut self.display, &mut session.display);
+        std::mem::swap(&mut self.named_selections, &mut session.named_selections);
+        std::mem::swap(
+            &mut self.named_selection_expressions,
+            &mut session.named_selection_expressions,
+        );
+        std::mem::swap(
+            &mut self.named_selection_styles,
+            &mut session.named_selection_styles,
+        );
+        std::mem::swap(&mut self.measurement_lines, &mut session.measurement_lines);
+        std::mem::swap(
+            &mut self.next_measurement_id,
+            &mut session.next_measurement_id,
+        );
+        std::mem::swap(&mut self.hierarchy_names, &mut session.hierarchy_names);
+        std::mem::swap(&mut self.inspection, &mut session.inspection);
+        std::mem::swap(
+            &mut self.hierarchy_selection,
+            &mut session.hierarchy_selection,
+        );
+        std::mem::swap(
+            &mut self.hierarchy_selection_anchor,
+            &mut session.hierarchy_selection_anchor,
+        );
+        std::mem::swap(&mut self.focus_description, &mut session.focus_description);
+        std::mem::swap(&mut self.pivot_description, &mut session.pivot_description);
+        std::mem::swap(&mut self.loaded_filename, &mut session.loaded_filename);
+        std::mem::swap(&mut self.molecule_id, &mut session.molecule_id);
+        std::mem::swap(&mut self.scene_path, &mut session.scene_path);
+        std::mem::swap(&mut self.camera, &mut session.camera);
+        std::mem::swap(&mut self.undo_history, &mut session.undo_history);
+        std::mem::swap(&mut self.redo_history, &mut session.redo_history);
+    }
+
+    fn sync_active_document(&mut self) {
+        self.camera.set_viewport(self.viewport);
+        if let (Some(molecule), Some(display)) = (&self.molecule, &self.display) {
+            self.renderer.update_instances(molecule, display);
+        } else {
+            let molecule = Molecule::default();
+            let display = DisplayState::for_molecule(&molecule);
+            self.renderer.update_instances(&molecule, &display);
+        }
+        self.renderer.update_measurements(&self.measurement_lines);
+        self.ui.latest_error = None;
+    }
+
     fn load_path(&mut self, path: &Path) -> Result<()> {
         let contents =
             fs::read(path).with_context(|| format!("could not read {}", path.display()))?;
@@ -534,14 +809,18 @@ impl Runtime {
         if is_scene_document(&contents) {
             let document = decode_scene(&contents)
                 .with_context(|| format!("could not decode scene {}", path.display()))?;
-            return self.load_scene_document(document, filename);
+            return self.load_scene_document(document, filename, path.to_owned());
         }
         let (molecule, _format) = parse_structure(&contents, &filename)
             .with_context(|| format!("could not parse {}", path.display()))?;
         let hierarchy = MoleculeHierarchy::from_molecule(&molecule);
         let display = DisplayState::for_molecule(&molecule);
+        let molecule_id = molecule_id_from_structure(&contents, &filename);
+        self.begin_new_session();
         self.renderer.update_instances(&molecule, &display);
         self.loaded_filename = Some(filename);
+        self.molecule_id = Some(molecule_id);
+        self.scene_path = None;
         self.molecule = Some(molecule);
         self.hierarchy = Some(hierarchy);
         self.display = Some(display);
@@ -565,7 +844,7 @@ impl Runtime {
         Ok(())
     }
 
-    fn save_scene(&self, path: &Path) -> Result<()> {
+    fn write_scene(&self, path: &Path) -> Result<()> {
         let molecule = self
             .molecule
             .as_ref()
@@ -575,7 +854,11 @@ impl Runtime {
             .as_ref()
             .context("display state is unavailable")?;
         let document = SceneDocument {
-            source_name: self.loaded_filename.clone().unwrap_or_default(),
+            source_name: self
+                .molecule_id
+                .clone()
+                .or_else(|| self.loaded_filename.clone())
+                .unwrap_or_default(),
             molecule: molecule.clone(),
             display: display.clone(),
             named_selections: self.named_selections.clone(),
@@ -604,8 +887,46 @@ impl Runtime {
             .with_context(|| format!("could not write scene {}", path.display()))
     }
 
-    fn load_scene_document(&mut self, document: SceneDocument, filename: String) -> Result<()> {
+    fn save_scene_as(&mut self) -> Result<()> {
+        let suggested_name = self
+            .loaded_filename
+            .as_deref()
+            .and_then(|name| Path::new(name).file_stem())
+            .map_or_else(
+                || format!("scene.{SCENE_EXTENSION}"),
+                |stem| format!("{}.{}", stem.to_string_lossy(), SCENE_EXTENSION),
+            );
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter(SCENE_FORMAT_NAME, &[SCENE_EXTENSION])
+            .set_file_name(suggested_name)
+            .save_file()
+        {
+            self.save_scene_to(path)?;
+        }
+        Ok(())
+    }
+
+    fn save_scene_to(&mut self, path: PathBuf) -> Result<()> {
+        let path = molecule_path(path);
+        self.write_scene(&path)?;
+        self.loaded_filename = Some(path.file_name().map_or_else(
+            || path.display().to_string(),
+            |name| name.to_string_lossy().into_owned(),
+        ));
+        self.scene_path = Some(path);
+        self.ui.latest_error = None;
+        Ok(())
+    }
+
+    fn load_scene_document(
+        &mut self,
+        document: SceneDocument,
+        filename: String,
+        scene_path: PathBuf,
+    ) -> Result<()> {
+        self.begin_new_session();
         let SceneDocument {
+            source_name,
             molecule,
             display,
             named_selections,
@@ -621,6 +942,11 @@ impl Runtime {
             mut camera,
             ..
         } = document;
+        let molecule_id = if source_name.trim().is_empty() {
+            molecule_id_from_filename(&filename)
+        } else {
+            molecule_id_from_filename(&source_name)
+        };
         let hierarchy = MoleculeHierarchy::from_molecule(&molecule);
         camera.set_viewport(self.viewport);
         self.renderer.update_instances(&molecule, &display);
@@ -632,6 +958,8 @@ impl Runtime {
             .unwrap_or(0)
             .saturating_add(1);
         self.loaded_filename = Some(filename);
+        self.molecule_id = Some(molecule_id);
+        self.scene_path = Some(scene_path);
         self.molecule = Some(molecule);
         self.hierarchy = Some(hierarchy);
         self.display = Some(display);
@@ -656,6 +984,84 @@ impl Runtime {
         self.redo_history.clear();
         self.ui.latest_error = None;
         Ok(())
+    }
+
+    fn start_fetch(&mut self, requested_id: &str) -> Result<()> {
+        if self.fetch_receiver.is_some() {
+            anyhow::bail!("a PDB download is already in progress");
+        }
+        let id = normalize_pdb_id(requested_id)?;
+        let directory = pdb_download_directory()?;
+        let (sender, receiver) = mpsc::channel();
+        let window = self.window.clone();
+        let worker_id = id.clone();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = cancel.clone();
+        thread::spawn(move || {
+            let progress_sender = sender.clone();
+            let progress_window = window.clone();
+            let result = download_pdb_with_progress(
+                &worker_id,
+                &directory,
+                &worker_cancel,
+                move |progress| {
+                    let _ = progress_sender.send(FetchEvent::Progress(progress));
+                    progress_window.request_redraw();
+                },
+            )
+            .map_err(|error| error.to_string());
+            let _ = sender.send(FetchEvent::Finished(result));
+            window.request_redraw();
+        });
+        self.fetch_receiver = Some(receiver);
+        self.fetching_pdb_id = Some(id);
+        self.fetch_progress = FetchProgress::default();
+        self.fetch_cancel = Some(cancel);
+        self.ui.latest_error = None;
+        Ok(())
+    }
+
+    fn cancel_fetch(&mut self) {
+        if let Some(cancel) = &self.fetch_cancel {
+            cancel.store(true, Ordering::Relaxed);
+        }
+    }
+
+    fn poll_fetch_result(&mut self) {
+        let mut finished = None;
+        loop {
+            let event = match self.fetch_receiver.as_ref().map(Receiver::try_recv) {
+                Some(Ok(event)) => Some(event),
+                Some(Err(TryRecvError::Disconnected)) => Some(FetchEvent::Finished(Err(
+                    "PDB download worker stopped unexpectedly".into(),
+                ))),
+                Some(Err(TryRecvError::Empty)) | None => None,
+            };
+            match event {
+                Some(FetchEvent::Progress(progress)) => self.fetch_progress = progress,
+                Some(FetchEvent::Finished(result)) => {
+                    finished = Some(result);
+                    break;
+                }
+                None => break,
+            }
+        }
+        let Some(result) = finished else {
+            return;
+        };
+        self.fetch_receiver = None;
+        self.fetching_pdb_id = None;
+        self.fetch_cancel = None;
+        self.ui.close_fetch();
+        match result {
+            Ok(path) => {
+                if let Err(error) = self.load_path(&path) {
+                    self.ui.latest_error = Some(error.to_string());
+                }
+            }
+            Err(error) if error == FETCH_CANCELLED => self.ui.latest_error = None,
+            Err(error) => self.ui.latest_error = Some(error),
+        }
     }
 
     fn editable_snapshot(&self) -> EditableSnapshot {
@@ -1587,6 +1993,366 @@ impl Runtime {
     }
 }
 
+fn normalize_pdb_id(value: &str) -> Result<String> {
+    let id = value.trim().to_ascii_uppercase();
+    let legacy = id.len() == 4 && id.bytes().all(|byte| byte.is_ascii_alphanumeric());
+    let extended = id.len() == 12
+        && id.starts_with("PDB_")
+        && id[4..].bytes().all(|byte| byte.is_ascii_alphanumeric());
+    if legacy || extended {
+        Ok(id)
+    } else {
+        anyhow::bail!(
+            "'{value}' is not a valid PDB ID; use four letters/digits such as 4R8P or an extended pdb_00004hhb ID"
+        )
+    }
+}
+
+fn pdb_download_directory() -> Result<PathBuf> {
+    let home = env::var_os("HOME")
+        .or_else(|| env::var_os("USERPROFILE"))
+        .context("could not determine the home directory")?;
+    Ok(PathBuf::from(home).join("downloads").join("pdb"))
+}
+
+#[cfg(test)]
+fn download_pdb(id: &str, directory: &Path) -> Result<PathBuf> {
+    download_pdb_with_progress(id, directory, &AtomicBool::new(false), |_| {})
+}
+
+fn download_pdb_with_progress(
+    id: &str,
+    directory: &Path,
+    cancel: &AtomicBool,
+    mut report_progress: impl FnMut(FetchProgress),
+) -> Result<PathBuf> {
+    let filename = format!("{id}.cif");
+    let url = pdb_download_url(id);
+    let agent = pdb_agent();
+    let (supports_ranges, advertised_size) = download_metadata(&agent, &url);
+    if advertised_size.is_some_and(|length| length > MAX_FETCH_SIZE) {
+        anyhow::bail!("PDB entry {id} exceeds the 512 MiB download limit");
+    }
+    let started = Instant::now();
+    report_progress(FetchProgress {
+        downloaded_bytes: 0,
+        total_bytes: advertised_size,
+        bytes_per_second: 0.0,
+    });
+    let contents = if supports_ranges
+        && advertised_size.is_some_and(|length| length >= PARALLEL_FETCH_MIN_SIZE)
+    {
+        match download_pdb_ranges(
+            id,
+            &url,
+            advertised_size.unwrap_or_default(),
+            cancel,
+            started,
+            &mut report_progress,
+        ) {
+            Ok(contents) => contents,
+            Err(error) if cancel.load(Ordering::Relaxed) => return Err(error),
+            Err(_) => {
+                report_progress(FetchProgress {
+                    downloaded_bytes: 0,
+                    total_bytes: advertised_size,
+                    bytes_per_second: 0.0,
+                });
+                download_pdb_stream(
+                    id,
+                    &url,
+                    &agent,
+                    advertised_size,
+                    cancel,
+                    started,
+                    &mut report_progress,
+                )?
+            }
+        }
+    } else {
+        download_pdb_stream(
+            id,
+            &url,
+            &agent,
+            advertised_size,
+            cancel,
+            started,
+            &mut report_progress,
+        )?
+    };
+    let elapsed = started.elapsed().as_secs_f64().max(0.001);
+    report_progress(FetchProgress {
+        downloaded_bytes: contents.len() as u64,
+        total_bytes: Some(contents.len() as u64),
+        bytes_per_second: contents.len() as f64 / elapsed,
+    });
+    parse_structure(&contents, &filename)
+        .with_context(|| format!("RCSB returned invalid structure data for {id}"))?;
+    if cancel.load(Ordering::Relaxed) {
+        anyhow::bail!(FETCH_CANCELLED);
+    }
+    fs::create_dir_all(directory)
+        .with_context(|| format!("could not create {}", directory.display()))?;
+    let path = directory.join(filename);
+    fs::write(&path, contents)
+        .with_context(|| format!("could not save downloaded structure to {}", path.display()))?;
+    Ok(path)
+}
+
+fn pdb_agent() -> ureq::Agent {
+    let config = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(60)))
+        .https_only(true)
+        .build();
+    ureq::Agent::new_with_config(config)
+}
+
+fn download_metadata(agent: &ureq::Agent, url: &str) -> (bool, Option<u64>) {
+    let Ok(response) = agent
+        .head(url)
+        .header("User-Agent", concat!("molview/", env!("CARGO_PKG_VERSION")))
+        .call()
+    else {
+        return (false, None);
+    };
+    let supports_ranges = response
+        .headers()
+        .get("accept-ranges")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.eq_ignore_ascii_case("bytes"));
+    let size = response
+        .headers()
+        .get("content-length")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse().ok());
+    (supports_ranges, size)
+}
+
+fn download_pdb_stream(
+    id: &str,
+    url: &str,
+    agent: &ureq::Agent,
+    advertised_size: Option<u64>,
+    cancel: &AtomicBool,
+    started: Instant,
+    report_progress: &mut impl FnMut(FetchProgress),
+) -> Result<Vec<u8>> {
+    let mut response = agent
+        .get(url)
+        .header("User-Agent", concat!("molview/", env!("CARGO_PKG_VERSION")))
+        .call()
+        .with_context(|| format!("could not fetch PDB entry {id} from RCSB"))?;
+    let total_bytes = response.body().content_length().or(advertised_size);
+    if total_bytes.is_some_and(|length| length > MAX_FETCH_SIZE) {
+        anyhow::bail!("PDB entry {id} exceeds the 512 MiB download limit");
+    }
+    let capacity = total_bytes
+        .unwrap_or_default()
+        .min(MAX_FETCH_SIZE)
+        .try_into()
+        .unwrap_or(0);
+    let mut contents = Vec::with_capacity(capacity);
+    let mut reader = response.body_mut().as_reader();
+    let mut buffer = [0_u8; FETCH_BUFFER_SIZE];
+    let mut last_report = started;
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            anyhow::bail!(FETCH_CANCELLED);
+        }
+        let read = reader
+            .read(&mut buffer)
+            .with_context(|| format!("could not download PDB entry {id}"))?;
+        if read == 0 {
+            break;
+        }
+        if contents.len().saturating_add(read) as u64 > MAX_FETCH_SIZE {
+            anyhow::bail!("PDB entry {id} exceeds the 512 MiB download limit");
+        }
+        contents.extend_from_slice(&buffer[..read]);
+        let now = Instant::now();
+        if now.duration_since(last_report) >= Duration::from_millis(100) {
+            let elapsed = now.duration_since(started).as_secs_f64().max(0.001);
+            report_progress(FetchProgress {
+                downloaded_bytes: contents.len() as u64,
+                total_bytes,
+                bytes_per_second: contents.len() as f64 / elapsed,
+            });
+            last_report = now;
+        }
+    }
+    Ok(contents)
+}
+
+enum RangeDownloadEvent {
+    Downloaded(usize),
+    Finished {
+        index: usize,
+        contents: std::result::Result<Vec<u8>, String>,
+    },
+}
+
+fn download_pdb_ranges(
+    id: &str,
+    url: &str,
+    total_bytes: u64,
+    cancel: &AtomicBool,
+    started: Instant,
+    report_progress: &mut impl FnMut(FetchProgress),
+) -> Result<Vec<u8>> {
+    let worker_count = PARALLEL_FETCH_WORKERS.min(total_bytes.max(1) as usize);
+    let range_size = total_bytes.div_ceil(worker_count as u64);
+    let (sender, receiver) = mpsc::channel();
+    let stop = AtomicBool::new(false);
+
+    thread::scope(|scope| -> Result<Vec<u8>> {
+        for index in 0..worker_count {
+            let start = index as u64 * range_size;
+            let end = (start + range_size - 1).min(total_bytes - 1);
+            let sender = sender.clone();
+            let stop = &stop;
+            scope.spawn(move || {
+                let result = download_pdb_range(id, url, start, end, cancel, stop, &sender)
+                    .map_err(|error| error.to_string());
+                if result.is_err() {
+                    stop.store(true, Ordering::Relaxed);
+                }
+                let _ = sender.send(RangeDownloadEvent::Finished {
+                    index,
+                    contents: result,
+                });
+            });
+        }
+        drop(sender);
+
+        let mut parts = vec![None; worker_count];
+        let mut completed = 0;
+        let mut downloaded_bytes = 0_u64;
+        let mut last_report = started;
+        let mut first_error = None;
+        while completed < worker_count {
+            if cancel.load(Ordering::Relaxed) {
+                stop.store(true, Ordering::Relaxed);
+                anyhow::bail!(FETCH_CANCELLED);
+            }
+            match receiver.recv_timeout(Duration::from_millis(100)) {
+                Ok(RangeDownloadEvent::Downloaded(bytes)) => {
+                    downloaded_bytes = downloaded_bytes.saturating_add(bytes as u64);
+                }
+                Ok(RangeDownloadEvent::Finished { index, contents }) => {
+                    completed += 1;
+                    match contents {
+                        Ok(contents) => parts[index] = Some(contents),
+                        Err(_) if cancel.load(Ordering::Relaxed) => {
+                            anyhow::bail!(FETCH_CANCELLED);
+                        }
+                        Err(error) if error == FETCH_CANCELLED => {}
+                        Err(error) if first_error.is_none() => first_error = Some(error),
+                        Err(_) => {}
+                    }
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => {
+                    anyhow::bail!("parallel PDB download stopped unexpectedly");
+                }
+            }
+            let now = Instant::now();
+            if now.duration_since(last_report) >= Duration::from_millis(100)
+                || completed == worker_count
+            {
+                let elapsed = now.duration_since(started).as_secs_f64().max(0.001);
+                report_progress(FetchProgress {
+                    downloaded_bytes,
+                    total_bytes: Some(total_bytes),
+                    bytes_per_second: downloaded_bytes as f64 / elapsed,
+                });
+                last_report = now;
+            }
+        }
+
+        if let Some(error) = first_error {
+            anyhow::bail!("could not download byte range for PDB entry {id}: {error}");
+        }
+        let capacity = usize::try_from(total_bytes).unwrap_or_default();
+        let mut contents = Vec::with_capacity(capacity);
+        for part in parts {
+            let part = part.context("parallel PDB download returned an incomplete file")?;
+            contents.extend_from_slice(&part);
+        }
+        if contents.len() as u64 != total_bytes {
+            anyhow::bail!(
+                "parallel PDB download returned {} bytes instead of {total_bytes}",
+                contents.len()
+            );
+        }
+        Ok(contents)
+    })
+}
+
+fn download_pdb_range(
+    id: &str,
+    url: &str,
+    start: u64,
+    end: u64,
+    cancel: &AtomicBool,
+    stop: &AtomicBool,
+    sender: &Sender<RangeDownloadEvent>,
+) -> Result<Vec<u8>> {
+    let mut response = pdb_agent()
+        .get(url)
+        .header("User-Agent", concat!("molview/", env!("CARGO_PKG_VERSION")))
+        .header("Range", format!("bytes={start}-{end}"))
+        .call()
+        .with_context(|| format!("could not fetch PDB entry {id} from RCSB"))?;
+    if response.status().as_u16() != 206 {
+        anyhow::bail!(
+            "RCSB did not honor the requested byte range ({})",
+            response.status()
+        );
+    }
+    let expected = end - start + 1;
+    let capacity = usize::try_from(expected).unwrap_or_default();
+    let mut contents = Vec::with_capacity(capacity);
+    let mut reader = response.body_mut().as_reader();
+    let mut buffer = [0_u8; FETCH_BUFFER_SIZE];
+    loop {
+        if cancel.load(Ordering::Relaxed) || stop.load(Ordering::Relaxed) {
+            anyhow::bail!(FETCH_CANCELLED);
+        }
+        let read = reader
+            .read(&mut buffer)
+            .with_context(|| format!("could not download PDB entry {id}"))?;
+        if read == 0 {
+            break;
+        }
+        if contents.len().saturating_add(read) as u64 > expected {
+            anyhow::bail!("RCSB returned too many bytes for a requested range");
+        }
+        contents.extend_from_slice(&buffer[..read]);
+        let _ = sender.send(RangeDownloadEvent::Downloaded(read));
+    }
+    if contents.len() as u64 != expected {
+        anyhow::bail!(
+            "RCSB returned {} bytes for a {expected}-byte range",
+            contents.len()
+        );
+    }
+    Ok(contents)
+}
+
+fn pdb_download_url(id: &str) -> String {
+    format!("https://files.rcsb.org/download/{id}.cif")
+}
+
+fn molecule_path(mut path: PathBuf) -> PathBuf {
+    let has_extension = path
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case(SCENE_EXTENSION));
+    if !has_extension {
+        path.set_extension(SCENE_EXTENSION);
+    }
+    path
+}
+
 fn scene_target(target: InspectionTarget) -> SceneHierarchyTarget {
     match target {
         InspectionTarget::Chain(index) => SceneHierarchyTarget::Chain(index),
@@ -1956,5 +2722,41 @@ mod tests {
             history.back().and_then(|state| state.inspection),
             Some(InspectionTarget::Atom(59))
         );
+    }
+
+    #[test]
+    fn pdb_ids_are_normalized_without_allowing_path_components() {
+        assert_eq!(normalize_pdb_id(" 4r8p ").unwrap(), "4R8P");
+        assert_eq!(normalize_pdb_id("pdb_00004hhb").unwrap(), "PDB_00004HHB");
+        assert!(normalize_pdb_id("../../4r8p").is_err());
+        assert!(normalize_pdb_id("abc").is_err());
+        assert_eq!(
+            pdb_download_url("4R8P"),
+            "https://files.rcsb.org/download/4R8P.cif"
+        );
+    }
+
+    #[test]
+    fn save_as_enforces_the_molecule_extension() {
+        assert_eq!(
+            molecule_path(PathBuf::from("scene.pdb")),
+            PathBuf::from("scene.mol")
+        );
+        assert_eq!(
+            molecule_path(PathBuf::from("scene.MOL")),
+            PathBuf::from("scene.MOL")
+        );
+    }
+
+    #[test]
+    #[ignore = "requires access to files.rcsb.org"]
+    fn fetches_and_validates_a_real_rcsb_entry() {
+        let directory = env::temp_dir().join(format!("molview-fetch-test-{}", std::process::id()));
+        let path = download_pdb("4R8P", &directory).unwrap();
+        let contents = fs::read(&path).unwrap();
+        let (molecule, _) = parse_structure(&contents, "4R8P.cif").unwrap();
+        assert!(!molecule.atoms.is_empty());
+        fs::remove_file(path).unwrap();
+        fs::remove_dir(directory).unwrap();
     }
 }
