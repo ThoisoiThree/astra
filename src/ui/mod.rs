@@ -930,6 +930,11 @@ impl UiState {
                     ColoringMode::ResidueType => {
                         ui.label("Equal residue names share the same color.");
                     }
+                    ColoringMode::SecondaryStructure => {
+                        ui.label("Helix red · Sheet yellow · Turn blue");
+                        ui.label("Coil gray · Nucleic acid violet");
+                        ui.small("Ligands, solvent, and ions retain element colors.");
+                    }
                     ColoringMode::BFactor => {
                         ui.label("Blue → cyan → yellow → red B-factor gradient.");
                     }

@@ -23,7 +23,7 @@ instancing with a small egui interface.
   schema versioning, and Zstandard compression
 - Dashed distance measurements with Å labels and editable line styles
 - Camera panel with clipping and thin-lens optical bokeh controls
-- Element/CPK, chain, residue, residue-type, B-factor, and uniform color schemes
+- Element/CPK, chain, residue, residue-type, secondary-structure, B-factor, and uniform color schemes
 - Open/Fetch/Save file menu, RCSB PDB download by ID, command-line path, and drag-and-drop
 - Boolean selection AST with useful position-bearing syntax errors
 - Per-atom color, sphere/stick visibility, and non-destructive selection highlight
@@ -153,11 +153,14 @@ returns it to the molecule center.
 ### Coloring and hierarchy overrides
 
 Open **Coloring** in the top toolbar to choose Element/CPK, Chain, Residue
-identity, Residue type, B-factor, or Uniform coloring. Every chain, residue, and
-atom row has a color square. Clicking it opens an HSV editor; **Default** removes
-the local override. Effective priority is atom → residue → chain → active base
-scheme, and a local color participates in that priority only while it is a real
-override (an inherited/default match is discarded).
+identity, Residue type, Secondary structure, B-factor, or Uniform coloring.
+Secondary-structure coloring uses red helices, yellow sheets, blue turns, gray
+coils, and violet nucleic acids; non-polymer atoms retain their element colors.
+Every chain, residue, and atom row has a color square. Clicking it opens an HSV
+editor; **Default** removes the local override. Effective priority is atom →
+residue → chain → active base scheme, and a local color participates in that
+priority only while it is a real override (an inherited/default match is
+discarded).
 
 The eye beside each hierarchy row cycles gray → green → red → gray: inherit,
 force visible, hide, inherit. A lower-level state wins, so a green residue or atom

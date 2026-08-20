@@ -156,16 +156,18 @@ pub enum ColoringMode {
     Chain,
     Residue,
     ResidueType,
+    SecondaryStructure,
     BFactor,
     Uniform,
 }
 
 impl ColoringMode {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Element,
         Self::Chain,
         Self::Residue,
         Self::ResidueType,
+        Self::SecondaryStructure,
         Self::BFactor,
         Self::Uniform,
     ];
@@ -176,6 +178,7 @@ impl ColoringMode {
             Self::Chain => "Chain based",
             Self::Residue => "Residue identity",
             Self::ResidueType => "Residue type",
+            Self::SecondaryStructure => "Secondary structure",
             Self::BFactor => "B-factor",
             Self::Uniform => "Uniform",
         }
@@ -298,6 +301,7 @@ impl DisplayState {
                 .iter()
                 .map(|atom| categorical_color(&atom.residue_name))
                 .collect(),
+            ColoringMode::SecondaryStructure => secondary_structure_colors(molecule),
             ColoringMode::BFactor => b_factor_colors(molecule),
             ColoringMode::Uniform => vec![self.uniform_color; molecule.atoms.len()],
         };
@@ -721,6 +725,43 @@ fn element_colors(molecule: &Molecule) -> Vec<DisplayColor> {
         .collect()
 }
 
+fn secondary_structure_colors(molecule: &Molecule) -> Vec<DisplayColor> {
+    use molecule::{MoleculeHierarchy, SecondaryStructure, assign_secondary_structure};
+
+    let hierarchy = MoleculeHierarchy::from_molecule(molecule);
+    let assignments = assign_secondary_structure(molecule, &hierarchy);
+    // Ligands, solvent, and ions have no secondary structure; retaining CPK colors makes
+    // that distinction explicit instead of incorrectly presenting them as protein coils.
+    let mut colors = element_colors(molecule);
+    for (chain_index, chain) in hierarchy.chains.iter().enumerate() {
+        for (residue_index, residue) in chain.residues.iter().enumerate() {
+            let structure = assignments
+                .get(chain_index)
+                .and_then(|chain| chain.get(residue_index))
+                .copied()
+                .unwrap_or(SecondaryStructure::Coil);
+            let color = match structure {
+                SecondaryStructure::Helix => [0.92, 0.25, 0.36, 1.0],
+                SecondaryStructure::Strand => [0.98, 0.78, 0.20, 1.0],
+                SecondaryStructure::Turn => [0.25, 0.72, 0.92, 1.0],
+                SecondaryStructure::Coil => [0.72, 0.76, 0.82, 1.0],
+                SecondaryStructure::Nucleic => [0.68, 0.43, 0.90, 1.0],
+            };
+            for &atom_index in &residue.atom_indices {
+                if molecule
+                    .atoms
+                    .get(atom_index)
+                    .is_some_and(|atom| !atom.hetero)
+                    && let Some(atom_color) = colors.get_mut(atom_index)
+                {
+                    *atom_color = color;
+                }
+            }
+        }
+    }
+    colors
+}
+
 const CATEGORICAL_PALETTE: [DisplayColor; 12] = [
     [0.30, 0.62, 0.98, 1.0],
     [0.96, 0.48, 0.25, 1.0],
@@ -887,6 +928,54 @@ mod display_tests {
         assert_eq!(display.coloring_mode, ColoringMode::Chain);
         assert_eq!(display.uniform_color, DEFAULT_UNIFORM_COLOR);
         assert_eq!(display.colors, chain_colors);
+    }
+
+    #[test]
+    fn secondary_structure_coloring_marks_polymers_and_keeps_ligands_element_colored() {
+        let mut atoms = (0..7)
+            .map(|index| {
+                let angle = index as f32 * 100.0_f32.to_radians();
+                Atom {
+                    serial: index + 1,
+                    name: "CA".into(),
+                    element: Element::C,
+                    residue_name: "ALA".into(),
+                    residue_number: index as i32 + 1,
+                    insertion_code: None,
+                    chain_id: "A".into(),
+                    position: Vec3::new(2.3 * angle.cos(), 2.3 * angle.sin(), index as f32 * 1.5),
+                    occupancy: 1.0,
+                    b_factor: 0.0,
+                    hetero: false,
+                }
+            })
+            .collect::<Vec<_>>();
+        atoms.push(Atom {
+            serial: 8,
+            name: "O".into(),
+            element: Element::O,
+            residue_name: "HOH".into(),
+            residue_number: 1,
+            insertion_code: None,
+            chain_id: "B".into(),
+            position: Vec3::new(10.0, 0.0, 0.0),
+            occupancy: 1.0,
+            b_factor: 0.0,
+            hetero: true,
+        });
+        let molecule = Molecule {
+            atoms,
+            bonds: Vec::new(),
+        };
+        let mut display = DisplayState::for_molecule(&molecule);
+        display.set_coloring_mode(&molecule, ColoringMode::SecondaryStructure);
+
+        assert!(
+            display.colors[..7]
+                .iter()
+                .all(|color| *color == [0.92, 0.25, 0.36, 1.0])
+        );
+        assert_eq!(display.colors[7], Element::O.cpk_color());
     }
 
     #[test]

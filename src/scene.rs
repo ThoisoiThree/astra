@@ -1335,6 +1335,7 @@ fn coloring_mode_code(mode: ColoringMode) -> u32 {
         ColoringMode::ResidueType => 3,
         ColoringMode::BFactor => 4,
         ColoringMode::Uniform => 5,
+        ColoringMode::SecondaryStructure => 6,
     }
 }
 
@@ -1346,6 +1347,7 @@ fn coloring_mode_from_code(code: u32) -> Result<ColoringMode, SceneError> {
         3 => Ok(ColoringMode::ResidueType),
         4 => Ok(ColoringMode::BFactor),
         5 => Ok(ColoringMode::Uniform),
+        6 => Ok(ColoringMode::SecondaryStructure),
         value => Err(invalid(format!("unknown coloring mode {value}"))),
     }
 }
@@ -1441,6 +1443,7 @@ mod tests {
             bonds: vec![Bond::new(0, 1).unwrap()],
         };
         let mut display = DisplayState::for_molecule(&molecule);
+        display.set_coloring_mode(&molecule, ColoringMode::SecondaryStructure);
         display.set_global_mode(DisplayMode::BallAndStick);
         display.set_color_override(&[0, 1], DisplayLevel::Chain, Some([0.2, 0.4, 0.8, 1.0]));
         display.set_color_override(&[1], DisplayLevel::Atom, Some([0.9, 0.2, 0.1, 1.0]));
