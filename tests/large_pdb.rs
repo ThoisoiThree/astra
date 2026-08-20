@@ -1,6 +1,8 @@
 use std::{error::Error, fs, path::PathBuf};
 
-use molview::molecule::{MoleculeHierarchy, parse_pdb};
+use molview::molecule::{
+    MoleculeHierarchy, SecondaryStructure, assign_secondary_structure, parse_pdb,
+};
 use molview::selection::{evaluate, parse_selection};
 
 #[test]
@@ -25,6 +27,25 @@ fn supplied_4r8p_builds_expected_hierarchy() -> Result<(), Box<dyn Error>> {
             .chains
             .iter()
             .all(|chain| !chain.residues.is_empty())
+    );
+    let secondary = assign_secondary_structure(&molecule, &hierarchy);
+    let helix_count = secondary
+        .iter()
+        .flatten()
+        .filter(|state| **state == SecondaryStructure::Helix)
+        .count();
+    let strand_count = secondary
+        .iter()
+        .flatten()
+        .filter(|state| **state == SecondaryStructure::Strand)
+        .count();
+    assert!(
+        helix_count > 300,
+        "expected protein helices, got {helix_count}; strands {strand_count}"
+    );
+    assert!(
+        strand_count > 50,
+        "expected beta strands, got {strand_count}"
     );
 
     let leucines = evaluate(&parse_selection("Chain A/LEU*")?, &molecule);

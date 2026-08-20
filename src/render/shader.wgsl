@@ -28,6 +28,13 @@ struct VertexOutput {
     @location(3) highlight: f32,
 };
 
+struct CartoonVertexInput {
+    @location(0) position: vec3<f32>,
+    @location(1) normal: vec3<f32>,
+    @location(2) color: vec4<f32>,
+    @location(3) highlight: vec4<f32>,
+};
+
 @vertex
 fn vertex_main(input: VertexInput) -> VertexOutput {
     let model = mat4x4<f32>(input.model_0, input.model_1, input.model_2, input.model_3);
@@ -36,6 +43,17 @@ fn vertex_main(input: VertexInput) -> VertexOutput {
     output.clip_position = camera.view_projection * world;
     output.world_position = world.xyz;
     output.normal = normalize((model * vec4<f32>(input.normal, 0.0)).xyz);
+    output.color = input.color;
+    output.highlight = input.highlight.x;
+    return output;
+}
+
+@vertex
+fn cartoon_vertex_main(input: CartoonVertexInput) -> VertexOutput {
+    var output: VertexOutput;
+    output.clip_position = camera.view_projection * vec4<f32>(input.position, 1.0);
+    output.world_position = input.position;
+    output.normal = normalize(input.normal);
     output.color = input.color;
     output.highlight = input.highlight.x;
     return output;

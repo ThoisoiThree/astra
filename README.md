@@ -94,10 +94,14 @@ part of this history.
 ### Display mode
 
 The top toolbar menus are ordered **Mode**, **Coloring**, **Camera**. Cartoon is
-the default and draws a smoothed backbone ribbon through protein `CA` atoms and
-nucleic-acid `P` atoms; disconnected residues and chains are never bridged.
-Ligands and residues without a cartoon backbone remain in Ball & stick. The
-second global mode is **Ball & stick**, matching the viewer's original rendering.
+the default and derives helix, beta-strand, turn, and coil assignments from protein
+backbone geometry in every supported coordinate format. Helices use broad ribbons,
+beta strands terminate in directional arrows, turns/coils use round tubes, and
+nucleic acids retain a wide ribbon through `P` atoms. Centripetal splines, ten
+samples per residue, and parallel-transported frames keep bends and transitions
+continuous; disconnected residues and chains are never bridged. Ligands and
+residues without a cartoon backbone remain in Ball & stick. The second global
+mode is **Ball & stick**, matching the viewer's original rendering.
 **Toon** renders space-filling atoms as analytic ray/sphere impostors, writes
 atom/residue/chain IDs, and adds depth-gated illustrative outlines over a warm
 paper background. Smoothly intersecting atoms merge visually instead of receiving
@@ -287,22 +291,19 @@ See `AGENTS.md` for the contributor contract.
 
 - Only the first model and altloc blank/A are loaded
 - Connectivity has no bond order and uses approximate distance perception
-- One molecular object at a time
-- No labels, measurements, or saved sessions
-- Spheres and sticks only; rendering favors responsiveness over publication quality
+- No molecular surfaces, crystal symmetry, or electron-density maps
+- No trajectory playback
 - No browser build yet
 
 ## Roadmap
 
-1. Multiple molecular objects
-2. Improved bond perception
-3. Sequence viewer
-4. Cartoon/ribbon representation
-5. Molecular surfaces
-6. Labels and measurements
-7. Trajectory support
-8. Scripting/API
-9. WASM/browser target
+1. Improved bond perception
+2. Sequence viewer
+3. Molecular surfaces and electron-density maps
+4. Trajectory support
+5. Assemblies and crystal symmetry
+6. Scripting/API
+7. WASM/browser target
 
 ## Development checks
 

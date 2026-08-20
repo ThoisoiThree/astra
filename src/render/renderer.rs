@@ -12,7 +12,9 @@ use crate::{
     DisplayMode, DisplayState, RepresentationMask,
     camera::{OrbitCamera, Viewport},
     measurement::MeasurementLine,
-    molecule::{Molecule, MoleculeHierarchy, ResidueGroup},
+    molecule::{
+        Molecule, MoleculeHierarchy, ResidueGroup, SecondaryStructure, assign_secondary_structure,
+    },
 };
 
 use super::mesh::{self, Vertex};
@@ -101,6 +103,41 @@ impl InstanceRaw {
         wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<Self>() as wgpu::BufferAddress,
             step_mode: wgpu::VertexStepMode::Instance,
+            attributes: &Self::ATTRIBUTES,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct CartoonVertex {
+    position: [f32; 3],
+    normal: [f32; 3],
+    color: [f32; 4],
+    highlight: [f32; 4],
+}
+
+impl CartoonVertex {
+    const ATTRIBUTES: [wgpu::VertexAttribute; 4] = wgpu::vertex_attr_array![
+        0 => Float32x3,
+        1 => Float32x3,
+        2 => Float32x4,
+        3 => Float32x4
+    ];
+
+    fn new(position: Vec3, normal: Vec3, color: [f32; 4], highlighted: bool) -> Self {
+        Self {
+            position: position.to_array(),
+            normal: normal.to_array(),
+            color,
+            highlight: [f32::from(highlighted), 0.0, 0.0, 0.0],
+        }
+    }
+
+    fn layout() -> wgpu::VertexBufferLayout<'static> {
+        wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<Self>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Vertex,
             attributes: &Self::ATTRIBUTES,
         }
     }
@@ -746,6 +783,57 @@ fn create_scene_geometry_pipeline(
     })
 }
 
+fn create_cartoon_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+) -> wgpu::RenderPipeline {
+    let vertex_layouts = [Some(CartoonVertex::layout())];
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("continuous cartoon pipeline"),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("cartoon_vertex_main"),
+            compilation_options: Default::default(),
+            buffers: &vertex_layouts,
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            cull_mode: None,
+            front_face: wgpu::FrontFace::Ccw,
+            ..Default::default()
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: DEPTH_FORMAT,
+            depth_write_enabled: Some(true),
+            depth_compare: Some(wgpu::CompareFunction::LessEqual),
+            stencil: Default::default(),
+            bias: Default::default(),
+        }),
+        multisample: Default::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some("fragment_scene"),
+            compilation_options: Default::default(),
+            targets: &[
+                Some(wgpu::ColorTargetState {
+                    format: SCENE_FORMAT,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                }),
+                Some(wgpu::ColorTargetState {
+                    format: SEMANTIC_FORMAT,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                }),
+            ],
+        }),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
 fn create_toon_pipeline(
     device: &wgpu::Device,
     layout: &wgpu::PipelineLayout,
@@ -804,21 +892,22 @@ pub struct Renderer {
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     pipeline: wgpu::RenderPipeline,
+    cartoon_pipeline: wgpu::RenderPipeline,
     toon_pipeline: wgpu::RenderPipeline,
     annotation_pipeline: wgpu::RenderPipeline,
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
     sphere: GpuMesh,
     cylinder: GpuMesh,
-    ribbon: GpuMesh,
     atom_instances: wgpu::Buffer,
     bond_instances: wgpu::Buffer,
-    cartoon_instances: wgpu::Buffer,
+    cartoon_vertices: wgpu::Buffer,
+    cartoon_indices: wgpu::Buffer,
     toon_instances: wgpu::Buffer,
     measurement_instances: wgpu::Buffer,
     atom_instance_count: u32,
     bond_instance_count: u32,
-    cartoon_instance_count: u32,
+    cartoon_index_count: u32,
     toon_instance_count: u32,
     measurement_instance_count: u32,
     depth: DepthTarget,
@@ -891,6 +980,7 @@ impl Renderer {
             immediate_size: 0,
         });
         let pipeline = create_scene_geometry_pipeline(&device, &pipeline_layout, &shader);
+        let cartoon_pipeline = create_cartoon_pipeline(&device, &pipeline_layout, &shader);
         let toon_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("analytic toon sphere shader"),
             source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("toon_sphere.wgsl"))),
@@ -907,10 +997,10 @@ impl Renderer {
 
         let sphere = GpuMesh::new(&device, "sphere", mesh::uv_sphere(14, 22));
         let cylinder = GpuMesh::new(&device, "cylinder", mesh::cylinder(16));
-        let ribbon = GpuMesh::new(&device, "cartoon ribbon segment", mesh::cube());
         let atom_instances = empty_instance_buffer(&device, "atom instances");
         let bond_instances = empty_instance_buffer(&device, "bond instances");
-        let cartoon_instances = empty_instance_buffer(&device, "cartoon instances");
+        let cartoon_vertices = empty_cartoon_vertex_buffer(&device);
+        let cartoon_indices = empty_cartoon_index_buffer(&device);
         let toon_instances = empty_toon_instance_buffer(&device);
         let measurement_instances = empty_instance_buffer(&device, "measurement instances");
         let depth = DepthTarget::new(&device, config.width, config.height);
@@ -932,21 +1022,22 @@ impl Renderer {
             queue,
             config,
             pipeline,
+            cartoon_pipeline,
             toon_pipeline,
             annotation_pipeline,
             camera_buffer,
             camera_bind_group,
             sphere,
             cylinder,
-            ribbon,
             atom_instances,
             bond_instances,
-            cartoon_instances,
+            cartoon_vertices,
+            cartoon_indices,
             toon_instances,
             measurement_instances,
             atom_instance_count: 0,
             bond_instance_count: 0,
-            cartoon_instance_count: 0,
+            cartoon_index_count: 0,
             toon_instance_count: 0,
             measurement_instance_count: 0,
             depth,
@@ -978,14 +1069,14 @@ impl Renderer {
     }
 
     pub fn update_instances(&mut self, molecule: &Molecule, display: &DisplayState) {
-        let (cartoons, standard_atomic) = cartoon_render_data(molecule, display);
+        let cartoon = cartoon_render_data(molecule, display);
         let atoms: Vec<_> = molecule
             .atoms
             .iter()
             .enumerate()
             .filter(|(index, _)| {
                 display.visible[*index]
-                    && standard_atomic[*index]
+                    && cartoon.standard_atomic[*index]
                     && display.representations[*index].contains(RepresentationMask::SPHERES)
             })
             .map(|(index, atom)| {
@@ -1010,8 +1101,8 @@ impl Renderer {
             .filter(|bond| {
                 display.visible[bond.a]
                     && display.visible[bond.b]
-                    && standard_atomic[bond.a]
-                    && standard_atomic[bond.b]
+                    && cartoon.standard_atomic[bond.a]
+                    && cartoon.standard_atomic[bond.b]
                     && display.representations[bond.a].contains(RepresentationMask::STICKS)
                     && display.representations[bond.b].contains(RepresentationMask::STICKS)
             })
@@ -1072,11 +1163,12 @@ impl Renderer {
 
         self.atom_instances = instance_buffer(&self.device, "atom instances", &atoms);
         self.bond_instances = instance_buffer(&self.device, "bond instances", &bonds);
-        self.cartoon_instances = instance_buffer(&self.device, "cartoon instances", &cartoons);
+        self.cartoon_vertices = cartoon_vertex_buffer(&self.device, &cartoon.vertices);
+        self.cartoon_indices = cartoon_index_buffer(&self.device, &cartoon.indices);
         self.toon_instances = toon_instance_buffer(&self.device, &toon_atoms);
         self.atom_instance_count = atoms.len() as u32;
         self.bond_instance_count = bonds.len() as u32;
-        self.cartoon_instance_count = cartoons.len() as u32;
+        self.cartoon_index_count = cartoon.indices.len() as u32;
         self.toon_instance_count = toon_atoms.len() as u32;
     }
 
@@ -1263,14 +1355,12 @@ impl Renderer {
                 as u32;
             pass.set_scissor_rect(scissor_x, scissor_y, scissor_width, scissor_height);
 
-            pass.set_vertex_buffer(0, self.ribbon.vertices.slice(..));
-            pass.set_vertex_buffer(1, self.cartoon_instances.slice(..));
-            pass.set_index_buffer(self.ribbon.indices.slice(..), wgpu::IndexFormat::Uint32);
-            pass.draw_indexed(
-                0..self.ribbon.index_count,
-                0,
-                0..self.cartoon_instance_count,
-            );
+            pass.set_pipeline(&self.cartoon_pipeline);
+            pass.set_vertex_buffer(0, self.cartoon_vertices.slice(..));
+            pass.set_index_buffer(self.cartoon_indices.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..self.cartoon_index_count, 0, 0..1);
+
+            pass.set_pipeline(&self.pipeline);
 
             pass.set_vertex_buffer(0, self.cylinder.vertices.slice(..));
             pass.set_vertex_buffer(1, self.bond_instances.slice(..));
@@ -1513,16 +1603,22 @@ struct BackboneAnchor {
     position: Vec3,
     guide: Vec3,
     nucleic: bool,
+    structure: SecondaryStructure,
 }
 
-fn cartoon_render_data(
-    molecule: &Molecule,
-    display: &DisplayState,
-) -> (Vec<InstanceRaw>, Vec<bool>) {
+struct CartoonRenderData {
+    vertices: Vec<CartoonVertex>,
+    indices: Vec<u32>,
+    standard_atomic: Vec<bool>,
+}
+
+fn cartoon_render_data(molecule: &Molecule, display: &DisplayState) -> CartoonRenderData {
     let hierarchy = MoleculeHierarchy::from_molecule(molecule);
-    let mut cartoons = Vec::new();
+    let assignments = assign_secondary_structure(molecule, &hierarchy);
+    let mut vertices = Vec::new();
+    let mut indices = Vec::new();
     let mut cartoon_residue_atoms = vec![false; molecule.atoms.len()];
-    for chain in &hierarchy.chains {
+    for (chain_index, chain) in hierarchy.chains.iter().enumerate() {
         let mut anchors = Vec::new();
         for (residue_index, residue) in chain.residues.iter().enumerate() {
             let Some((atom_index, nucleic)) = backbone_atom(molecule, residue) else {
@@ -1552,6 +1648,15 @@ fn cartoon_render_data(
                 position,
                 guide,
                 nucleic,
+                structure: assignments
+                    .get(chain_index)
+                    .and_then(|chain| chain.get(residue_index))
+                    .copied()
+                    .unwrap_or(if nucleic {
+                        SecondaryStructure::Nucleic
+                    } else {
+                        SecondaryStructure::Coil
+                    }),
             });
         }
 
@@ -1570,14 +1675,14 @@ fn cartoon_render_data(
                         <= if anchor.nucleic { 8.5 } else { 5.0 }
             });
             if !drawable || !continuous {
-                append_ribbon_run(&run, display, &mut cartoons);
+                append_ribbon_run(&run, display, &mut vertices, &mut indices);
                 run.clear();
             }
             if drawable {
                 run.push(anchor);
             }
         }
-        append_ribbon_run(&run, display, &mut cartoons);
+        append_ribbon_run(&run, display, &mut vertices, &mut indices);
     }
 
     let standard_atomic = display
@@ -1590,7 +1695,11 @@ fn cartoon_render_data(
             DisplayMode::Toon => false,
         })
         .collect();
-    (cartoons, standard_atomic)
+    CartoonRenderData {
+        vertices,
+        indices,
+        standard_atomic,
+    }
 }
 
 fn backbone_atom(molecule: &Molecule, residue: &ResidueGroup) -> Option<(usize, bool)> {
@@ -1623,7 +1732,8 @@ fn backbone_atom(molecule: &Molecule, residue: &ResidueGroup) -> Option<(usize, 
 fn append_ribbon_run(
     run: &[BackboneAnchor],
     display: &DisplayState,
-    instances: &mut Vec<InstanceRaw>,
+    vertices: &mut Vec<CartoonVertex>,
+    indices: &mut Vec<u32>,
 ) {
     if run.len() < 2 {
         return;
@@ -1645,68 +1755,400 @@ fn append_ribbon_run(
         }
     }
 
-    const SAMPLES_PER_RESIDUE: usize = 6;
-    for segment in 0..run.len() - 1 {
-        for sample in 0..SAMPLES_PER_RESIDUE {
-            let t0 = sample as f32 / SAMPLES_PER_RESIDUE as f32;
-            let t1 = (sample + 1) as f32 / SAMPLES_PER_RESIDUE as f32;
-            let start = catmull_rom(run, segment, t0);
-            let end = catmull_rom(run, segment, t1);
-            let tangent = (end - start).normalize_or_zero();
-            if tangent == Vec3::ZERO {
-                continue;
-            }
-            let midpoint_t = (t0 + t1) * 0.5;
-            let guide = guides[segment]
-                .lerp(guides[segment + 1], midpoint_t)
-                .normalize_or_zero();
-            let mut side = (guide - tangent * guide.dot(tangent)).normalize_or_zero();
-            if side == Vec3::ZERO {
-                let fallback = if tangent.x.abs() < 0.8 {
-                    Vec3::X
+    const SAMPLES_PER_RESIDUE: usize = 10;
+    let sample_count = (run.len() - 1) * SAMPLES_PER_RESIDUE + 1;
+    let mut positions = Vec::with_capacity(sample_count);
+    for index in 0..sample_count {
+        let segment = (index / SAMPLES_PER_RESIDUE).min(run.len() - 2);
+        let t = if index + 1 == sample_count {
+            1.0
+        } else {
+            (index % SAMPLES_PER_RESIDUE) as f32 / SAMPLES_PER_RESIDUE as f32
+        };
+        positions.push(centripetal_catmull_rom(run, segment, t));
+    }
+
+    let mut sides = Vec::with_capacity(sample_count);
+    for index in 0..sample_count {
+        let before = positions[index.saturating_sub(1)];
+        let after = positions[(index + 1).min(sample_count - 1)];
+        let tangent = (after - before).normalize_or_zero();
+        let segment = (index / SAMPLES_PER_RESIDUE).min(run.len() - 2);
+        let t = if index + 1 == sample_count {
+            1.0
+        } else {
+            (index % SAMPLES_PER_RESIDUE) as f32 / SAMPLES_PER_RESIDUE as f32
+        };
+        let guide = guides[segment].lerp(guides[segment + 1], t);
+        let target = project_side(guide, tangent);
+        let side = if let Some(previous) = sides.last().copied() {
+            let transported = project_side(previous, tangent);
+            if target == Vec3::ZERO {
+                transported
+            } else if transported == Vec3::ZERO {
+                target
+            } else {
+                let target = if target.dot(transported) < 0.0 {
+                    -target
                 } else {
-                    Vec3::Z
+                    target
                 };
-                side = (fallback - tangent * fallback.dot(tangent)).normalize_or_zero();
+                transported.lerp(target, 0.18).normalize_or_zero()
             }
-            let normal = side.cross(tangent).normalize_or_zero();
-            side = tangent.cross(normal).normalize_or_zero();
-            let length = start.distance(end);
-            let width = if run[segment].nucleic { 1.05 } else { 0.82 };
-            let thickness = if run[segment].nucleic { 0.22 } else { 0.16 };
-            let model = Mat4::from_cols(
-                (side * width).extend(0.0),
-                (tangent * length).extend(0.0),
-                (normal * thickness).extend(0.0),
-                ((start + end) * 0.5).extend(1.0),
-            );
-            let left = display.colors[run[segment].atom_index];
-            let right = display.colors[run[segment + 1].atom_index];
-            let color = [
-                left[0] + (right[0] - left[0]) * midpoint_t,
-                left[1] + (right[1] - left[1]) * midpoint_t,
-                left[2] + (right[2] - left[2]) * midpoint_t,
-                1.0,
-            ];
-            let selected = display.selection[run[segment].atom_index]
-                || display.selection[run[segment + 1].atom_index];
-            instances.push(InstanceRaw::new(model, color, selected));
+        } else if target != Vec3::ZERO {
+            target
+        } else {
+            fallback_side(tangent)
+        };
+        sides.push(if side == Vec3::ZERO {
+            fallback_side(tangent)
+        } else {
+            side
+        });
+    }
+
+    let mut samples = Vec::with_capacity(sample_count);
+    for index in 0..sample_count {
+        let before = positions[index.saturating_sub(1)];
+        let after = positions[(index + 1).min(sample_count - 1)];
+        let tangent = (after - before).normalize_or_zero();
+        let mut side = project_side(sides[index], tangent);
+        if side == Vec3::ZERO {
+            side = fallback_side(tangent);
+        }
+        let normal = side.cross(tangent).normalize_or_zero();
+        side = tangent.cross(normal).normalize_or_zero();
+        let segment = (index / SAMPLES_PER_RESIDUE).min(run.len() - 2);
+        let t = if index + 1 == sample_count {
+            1.0
+        } else {
+            (index % SAMPLES_PER_RESIDUE) as f32 / SAMPLES_PER_RESIDUE as f32
+        };
+        let structure = if t < 0.5 {
+            run[segment].structure
+        } else {
+            run[segment + 1].structure
+        };
+        let (mut width, thickness) = cartoon_profile(run[segment].structure)
+            .lerp(cartoon_profile(run[segment + 1].structure), smoothstep(t));
+        if structure == SecondaryStructure::Strand {
+            width *= strand_arrow_scale(run, segment, t);
+        }
+        let left = display.colors[run[segment].atom_index];
+        let right = display.colors[run[segment + 1].atom_index];
+        let color = [
+            left[0] + (right[0] - left[0]) * t,
+            left[1] + (right[1] - left[1]) * t,
+            left[2] + (right[2] - left[2]) * t,
+            1.0,
+        ];
+        let selected = display.selection[run[segment].atom_index]
+            || display.selection[run[segment + 1].atom_index];
+        samples.push(CartoonSample {
+            position: positions[index],
+            tangent,
+            side,
+            normal,
+            width,
+            thickness,
+            color,
+            selected,
+            tube: matches!(
+                structure,
+                SecondaryStructure::Coil | SecondaryStructure::Turn
+            ),
+        });
+    }
+
+    let mut first_edge = 0;
+    while first_edge + 1 < samples.len() {
+        let tube = samples[first_edge].tube && samples[first_edge + 1].tube;
+        let mut last_edge = first_edge;
+        while last_edge + 2 < samples.len()
+            && (samples[last_edge + 1].tube && samples[last_edge + 2].tube) == tube
+        {
+            last_edge += 1;
+        }
+        let strip = &samples[first_edge..=last_edge + 1];
+        if tube {
+            append_tube_strip(strip, vertices, indices);
+        } else {
+            append_rectangular_strip(strip, vertices, indices);
+        }
+        first_edge = last_edge + 1;
+    }
+}
+
+#[derive(Clone, Copy)]
+struct CartoonSample {
+    position: Vec3,
+    tangent: Vec3,
+    side: Vec3,
+    normal: Vec3,
+    width: f32,
+    thickness: f32,
+    color: [f32; 4],
+    selected: bool,
+    tube: bool,
+}
+
+fn append_rectangular_strip(
+    samples: &[CartoonSample],
+    vertices: &mut Vec<CartoonVertex>,
+    indices: &mut Vec<u32>,
+) {
+    // A single quad across the full ribbon width becomes strongly non-planar on tight
+    // bends. Its implicit diagonal then leaks into both diffuse and specular lighting.
+    // A small transverse grid follows the ruled surface closely without changing its
+    // silhouette, while analytical surface normals keep the bend visually continuous.
+    const WIDTH_SEGMENTS: u32 = 8;
+    const FACE_ROW: u32 = WIDTH_SEGMENTS + 1;
+    const VERTICES_PER_RING: u32 = FACE_ROW * 2 + 4;
+    let base = vertices.len() as u32;
+    for (ring, sample) in samples.iter().copied().enumerate() {
+        for top in [true, false] {
+            for width_index in 0..=WIDTH_SEGMENTS {
+                let across = width_index as f32 / WIDTH_SEGMENTS as f32 - 0.5;
+                let position = ribbon_surface_position(sample, across, top);
+                let before = ribbon_surface_position(samples[ring.saturating_sub(1)], across, top);
+                let after = ribbon_surface_position(
+                    samples[(ring + 1).min(samples.len() - 1)],
+                    across,
+                    top,
+                );
+                let longitudinal = (after - before).normalize_or_zero();
+                let expected = if top { sample.normal } else { -sample.normal };
+                let candidate = sample.side.cross(longitudinal).normalize_or_zero();
+                let mut surface_normal = if top { candidate } else { -candidate };
+                if surface_normal == Vec3::ZERO {
+                    surface_normal = expected;
+                } else if surface_normal.dot(expected) < 0.0 {
+                    surface_normal = -surface_normal;
+                }
+                vertices.push(CartoonVertex::new(
+                    position,
+                    surface_normal,
+                    sample.color,
+                    sample.selected,
+                ));
+            }
+        }
+
+        let left_bottom = ribbon_surface_position(sample, -0.5, false);
+        let left_top = ribbon_surface_position(sample, -0.5, true);
+        let right_top = ribbon_surface_position(sample, 0.5, true);
+        let right_bottom = ribbon_surface_position(sample, 0.5, false);
+        vertices.extend_from_slice(&[
+            CartoonVertex::new(left_bottom, -sample.side, sample.color, sample.selected),
+            CartoonVertex::new(left_top, -sample.side, sample.color, sample.selected),
+            CartoonVertex::new(right_top, sample.side, sample.color, sample.selected),
+            CartoonVertex::new(right_bottom, sample.side, sample.color, sample.selected),
+        ]);
+    }
+    for ring in 0..samples.len().saturating_sub(1) as u32 {
+        let current = base + ring * VERTICES_PER_RING;
+        let next = current + VERTICES_PER_RING;
+        for width_index in 0..WIDTH_SEGMENTS {
+            let a = current + width_index;
+            let b = a + 1;
+            let next_a = next + width_index;
+            let next_b = next_a + 1;
+            indices.extend_from_slice(&[a, b, next_a, next_a, b, next_b]);
+
+            let a = current + FACE_ROW + width_index;
+            let b = a + 1;
+            let next_a = next + FACE_ROW + width_index;
+            let next_b = next_a + 1;
+            indices.extend_from_slice(&[a, next_a, b, next_a, next_b, b]);
+        }
+
+        let left = current + FACE_ROW * 2;
+        let next_left = next + FACE_ROW * 2;
+        indices.extend_from_slice(&[
+            left,
+            left + 1,
+            next_left,
+            next_left,
+            left + 1,
+            next_left + 1,
+        ]);
+        let right = left + 2;
+        let next_right = next_left + 2;
+        indices.extend_from_slice(&[
+            right,
+            right + 1,
+            next_right,
+            next_right,
+            right + 1,
+            next_right + 1,
+        ]);
+    }
+    append_rectangular_cap(samples[0], -samples[0].tangent, vertices, indices);
+    let last = samples[samples.len() - 1];
+    append_rectangular_cap(last, last.tangent, vertices, indices);
+}
+
+fn ribbon_surface_position(sample: CartoonSample, across: f32, top: bool) -> Vec3 {
+    let height = if top { 0.5 } else { -0.5 };
+    sample.position
+        + sample.side * (sample.width * across)
+        + sample.normal * (sample.thickness * height)
+}
+
+fn append_rectangular_cap(
+    sample: CartoonSample,
+    cap_normal: Vec3,
+    vertices: &mut Vec<CartoonVertex>,
+    indices: &mut Vec<u32>,
+) {
+    let base = vertices.len() as u32;
+    let half_side = sample.side * sample.width * 0.5;
+    let half_normal = sample.normal * sample.thickness * 0.5;
+    for position in [
+        sample.position - half_side - half_normal,
+        sample.position + half_side - half_normal,
+        sample.position + half_side + half_normal,
+        sample.position - half_side + half_normal,
+    ] {
+        vertices.push(CartoonVertex::new(
+            position,
+            cap_normal,
+            sample.color,
+            sample.selected,
+        ));
+    }
+    indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+}
+
+fn append_tube_strip(
+    samples: &[CartoonSample],
+    vertices: &mut Vec<CartoonVertex>,
+    indices: &mut Vec<u32>,
+) {
+    const RING_SEGMENTS: u32 = 16;
+    let base = vertices.len() as u32;
+    for sample in samples {
+        let radius = sample.width * 0.5;
+        for segment in 0..RING_SEGMENTS {
+            let angle = segment as f32 / RING_SEGMENTS as f32 * std::f32::consts::TAU;
+            let radial = (sample.side * angle.cos() + sample.normal * angle.sin()).normalize();
+            vertices.push(CartoonVertex::new(
+                sample.position + radial * radius,
+                radial,
+                sample.color,
+                sample.selected,
+            ));
+        }
+    }
+    for ring in 0..samples.len().saturating_sub(1) as u32 {
+        let current = base + ring * RING_SEGMENTS;
+        let next = current + RING_SEGMENTS;
+        for segment in 0..RING_SEGMENTS {
+            let following = (segment + 1) % RING_SEGMENTS;
+            indices.extend_from_slice(&[
+                current + segment,
+                current + following,
+                next + segment,
+                next + segment,
+                current + following,
+                next + following,
+            ]);
         }
     }
 }
 
-fn catmull_rom(run: &[BackboneAnchor], segment: usize, t: f32) -> Vec3 {
+#[derive(Clone, Copy)]
+struct CartoonProfile {
+    width: f32,
+    thickness: f32,
+}
+
+impl CartoonProfile {
+    fn lerp(self, other: Self, t: f32) -> (f32, f32) {
+        (
+            self.width + (other.width - self.width) * t,
+            self.thickness + (other.thickness - self.thickness) * t,
+        )
+    }
+}
+
+fn cartoon_profile(structure: SecondaryStructure) -> CartoonProfile {
+    match structure {
+        SecondaryStructure::Helix => CartoonProfile {
+            width: 1.42,
+            thickness: 0.30,
+        },
+        SecondaryStructure::Strand => CartoonProfile {
+            width: 1.18,
+            thickness: 0.13,
+        },
+        SecondaryStructure::Nucleic => CartoonProfile {
+            width: 1.18,
+            thickness: 0.24,
+        },
+        SecondaryStructure::Turn => CartoonProfile {
+            width: 0.19,
+            thickness: 0.19,
+        },
+        SecondaryStructure::Coil => CartoonProfile {
+            width: 0.16,
+            thickness: 0.16,
+        },
+    }
+}
+
+fn strand_arrow_scale(run: &[BackboneAnchor], segment: usize, t: f32) -> f32 {
+    let mut end = segment;
+    while end + 1 < run.len() && run[end + 1].structure == SecondaryStructure::Strand {
+        end += 1;
+    }
+    let arrow_start = end.saturating_sub(1) as f32;
+    let position = segment as f32 + t;
+    if position < arrow_start {
+        return 1.0;
+    }
+    let u = (position - arrow_start).clamp(0.0, 1.0);
+    if u < 0.35 {
+        1.0 + u / 0.35 * 0.55
+    } else {
+        1.55 + (0.08 - 1.55) * ((u - 0.35) / 0.65)
+    }
+}
+
+fn project_side(vector: Vec3, tangent: Vec3) -> Vec3 {
+    (vector - tangent * vector.dot(tangent)).normalize_or_zero()
+}
+
+fn fallback_side(tangent: Vec3) -> Vec3 {
+    let fallback = if tangent.x.abs() < 0.8 {
+        Vec3::X
+    } else {
+        Vec3::Z
+    };
+    project_side(fallback, tangent)
+}
+
+fn smoothstep(value: f32) -> f32 {
+    let value = value.clamp(0.0, 1.0);
+    value * value * (3.0 - 2.0 * value)
+}
+
+fn centripetal_catmull_rom(run: &[BackboneAnchor], segment: usize, t: f32) -> Vec3 {
     let p0 = run[segment.saturating_sub(1)].position;
     let p1 = run[segment].position;
     let p2 = run[segment + 1].position;
     let p3 = run[(segment + 2).min(run.len() - 1)].position;
+    let d01 = p0.distance(p1).sqrt().max(0.001);
+    let d12 = p1.distance(p2).sqrt().max(0.001);
+    let d23 = p2.distance(p3).sqrt().max(0.001);
+    let tangent1 = (p2 - p0) * (d12 / (d01 + d12));
+    let tangent2 = (p3 - p1) * (d12 / (d12 + d23));
     let t2 = t * t;
     let t3 = t2 * t;
-    (p1 * 2.0
-        + (p2 - p0) * t
-        + (p0 * 2.0 - p1 * 5.0 + p2 * 4.0 - p3) * t2
-        + (-p0 + p1 * 3.0 - p2 * 3.0 + p3) * t3)
-        * 0.5
+    p1 * (2.0 * t3 - 3.0 * t2 + 1.0)
+        + tangent1 * (t3 - 2.0 * t2 + t)
+        + p2 * (-2.0 * t3 + 3.0 * t2)
+        + tangent2 * (t3 - t2)
 }
 
 fn toon_semantic_ids(molecule: &Molecule) -> Vec<[u32; 4]> {
@@ -1748,6 +2190,46 @@ fn empty_instance_buffer(device: &wgpu::Device, label: &str) -> wgpu::Buffer {
         label: Some(label),
         size: std::mem::size_of::<InstanceRaw>() as u64,
         usage: wgpu::BufferUsages::VERTEX,
+        mapped_at_creation: false,
+    })
+}
+
+fn cartoon_vertex_buffer(device: &wgpu::Device, vertices: &[CartoonVertex]) -> wgpu::Buffer {
+    if vertices.is_empty() {
+        return empty_cartoon_vertex_buffer(device);
+    }
+    device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("continuous cartoon vertices"),
+        contents: bytemuck::cast_slice(vertices),
+        usage: wgpu::BufferUsages::VERTEX,
+    })
+}
+
+fn empty_cartoon_vertex_buffer(device: &wgpu::Device) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("continuous cartoon vertices"),
+        size: std::mem::size_of::<CartoonVertex>() as u64,
+        usage: wgpu::BufferUsages::VERTEX,
+        mapped_at_creation: false,
+    })
+}
+
+fn cartoon_index_buffer(device: &wgpu::Device, indices: &[u32]) -> wgpu::Buffer {
+    if indices.is_empty() {
+        return empty_cartoon_index_buffer(device);
+    }
+    device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("continuous cartoon indices"),
+        contents: bytemuck::cast_slice(indices),
+        usage: wgpu::BufferUsages::INDEX,
+    })
+}
+
+fn empty_cartoon_index_buffer(device: &wgpu::Device) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("continuous cartoon indices"),
+        size: std::mem::size_of::<u32>() as u64,
+        usage: wgpu::BufferUsages::INDEX,
         mapped_at_creation: false,
     })
 }
@@ -1826,10 +2308,11 @@ mod tests {
     fn cartoon_builds_smooth_ribbon_and_keeps_ligands_atomic() {
         let molecule = backbone_molecule();
         let display = DisplayState::for_molecule(&molecule);
-        let (cartoons, atomic) = cartoon_render_data(&molecule, &display);
-        assert_eq!(cartoons.len(), 12);
-        assert_eq!(&atomic[..6], &[false; 6]);
-        assert!(atomic[6]);
+        let cartoon = cartoon_render_data(&molecule, &display);
+        assert_eq!(cartoon.vertices.len(), 21 * 16);
+        assert_eq!(cartoon.indices.len(), 20 * 16 * 6);
+        assert_eq!(&cartoon.standard_atomic[..6], &[false; 6]);
+        assert!(cartoon.standard_atomic[6]);
     }
 
     #[test]
@@ -1837,10 +2320,10 @@ mod tests {
         let molecule = backbone_molecule();
         let mut display = DisplayState::for_molecule(&molecule);
         display.set_mode_override(&[2, 3], DisplayLevel::Residue, ModeOverride::BallAndStick);
-        let (cartoons, atomic) = cartoon_render_data(&molecule, &display);
-        assert!(cartoons.is_empty());
-        assert!(atomic[2] && atomic[3]);
-        assert!(!atomic[0] && !atomic[4]);
+        let cartoon = cartoon_render_data(&molecule, &display);
+        assert!(cartoon.vertices.is_empty() && cartoon.indices.is_empty());
+        assert!(cartoon.standard_atomic[2] && cartoon.standard_atomic[3]);
+        assert!(!cartoon.standard_atomic[0] && !cartoon.standard_atomic[4]);
     }
 
     #[test]
@@ -1848,10 +2331,10 @@ mod tests {
         let molecule = backbone_molecule();
         let mut display = DisplayState::for_molecule(&molecule);
         display.set_global_mode(DisplayMode::Toon);
-        let (cartoons, standard_atomic) = cartoon_render_data(&molecule, &display);
+        let cartoon = cartoon_render_data(&molecule, &display);
         let ids = toon_semantic_ids(&molecule);
-        assert!(cartoons.is_empty());
-        assert!(standard_atomic.iter().all(|standard| !standard));
+        assert!(cartoon.vertices.is_empty() && cartoon.indices.is_empty());
+        assert!(cartoon.standard_atomic.iter().all(|standard| !standard));
         assert_eq!(ids.len(), molecule.atoms.len());
         assert!(ids.iter().all(|id| id[0] != 0 && id[1] != 0 && id[2] != 0));
         assert_ne!(ids[0][1], ids[2][1]);
