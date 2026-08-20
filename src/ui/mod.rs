@@ -388,7 +388,7 @@ impl UiState {
                             &mut self.color_editor,
                             &mut self.rename_editor,
                         );
-                });
+                    });
             });
         if !info.session_tabs.is_empty() {
             egui::Panel::top("document tabs")
@@ -549,6 +549,14 @@ impl UiState {
 
     pub fn close_fetch(&mut self) {
         self.fetch_open = false;
+    }
+
+    pub fn document_changed(&mut self) {
+        self.color_editor = None;
+        self.named_color_editor = None;
+        self.measurement_color_editor = None;
+        self.named_expression_editor = None;
+        self.rename_editor = None;
     }
 
     fn mode_window(&mut self, context: &egui::Context, info: UiInfo<'_>, actions: &mut UiActions) {

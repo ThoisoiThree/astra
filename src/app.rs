@@ -709,7 +709,10 @@ impl Runtime {
     }
 
     fn close_session(&mut self, id: u64) {
-        let Some(order_position) = self.session_order.iter().position(|candidate| *candidate == id)
+        let Some(order_position) = self
+            .session_order
+            .iter()
+            .position(|candidate| *candidate == id)
         else {
             return;
         };
@@ -796,6 +799,7 @@ impl Runtime {
             self.renderer.update_instances(&molecule, &display);
         }
         self.renderer.update_measurements(&self.measurement_lines);
+        self.ui.document_changed();
         self.ui.latest_error = None;
     }
 
@@ -817,6 +821,7 @@ impl Runtime {
         let display = DisplayState::for_molecule(&molecule);
         let molecule_id = molecule_id_from_structure(&contents, &filename);
         self.begin_new_session();
+        self.ui.document_changed();
         self.renderer.update_instances(&molecule, &display);
         self.loaded_filename = Some(filename);
         self.molecule_id = Some(molecule_id);
@@ -925,6 +930,7 @@ impl Runtime {
         scene_path: PathBuf,
     ) -> Result<()> {
         self.begin_new_session();
+        self.ui.document_changed();
         let SceneDocument {
             source_name,
             molecule,
@@ -1993,6 +1999,64 @@ impl Runtime {
     }
 }
 
+fn molecule_id_from_structure(contents: &[u8], filename: &str) -> String {
+    if let Ok(text) = std::str::from_utf8(contents) {
+        for line in text.lines().take(200) {
+            if line.starts_with("HEADER")
+                && let Some(id) = line.get(62..66)
+                && is_structure_id(id.trim())
+            {
+                return id.trim().to_ascii_uppercase();
+            }
+            if let Some(value) = line.trim().strip_prefix("_entry.id")
+                && let Some(id) = value.split_whitespace().next()
+            {
+                let id = id.trim_matches(['\'', '"']);
+                if is_structure_id(id) {
+                    return id.to_ascii_uppercase();
+                }
+            }
+        }
+    }
+    molecule_id_from_filename(filename)
+}
+
+fn molecule_id_from_filename(filename: &str) -> String {
+    let mut name = Path::new(filename)
+        .file_name()
+        .map_or(filename, |name| name.to_str().unwrap_or(filename));
+    if name
+        .rsplit_once('.')
+        .is_some_and(|(_, extension)| extension.eq_ignore_ascii_case("gz"))
+    {
+        name = name.rsplit_once('.').map_or(name, |(stem, _)| stem);
+    }
+    let stem = name.rsplit_once('.').map_or(name, |(stem, _)| stem).trim();
+    if stem.is_empty() {
+        "Untitled".into()
+    } else if is_structure_id(stem) {
+        stem.to_ascii_uppercase()
+    } else {
+        stem.to_owned()
+    }
+}
+
+fn is_structure_id(value: &str) -> bool {
+    let value = value.trim();
+    (value.len() == 4 && value.bytes().all(|byte| byte.is_ascii_alphanumeric()))
+        || (value.len() == 12
+            && value.to_ascii_uppercase().starts_with("PDB_")
+            && value[4..].bytes().all(|byte| byte.is_ascii_alphanumeric()))
+}
+
+fn session_label(molecule_id: Option<&str>, filename: Option<&str>) -> String {
+    molecule_id
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned)
+        .or_else(|| filename.map(molecule_id_from_filename))
+        .unwrap_or_else(|| "Untitled".into())
+}
+
 fn normalize_pdb_id(value: &str) -> Result<String> {
     let id = value.trim().to_ascii_uppercase();
     let legacy = id.len() == 4 && id.bytes().all(|byte| byte.is_ascii_alphanumeric());
@@ -2733,6 +2797,19 @@ mod tests {
         assert_eq!(
             pdb_download_url("4R8P"),
             "https://files.rcsb.org/download/4R8P.cif"
+        );
+    }
+
+    #[test]
+    fn molecule_ids_prefer_structure_metadata_and_fall_back_to_filename() {
+        let pdb = b"HEADER    TEST                                    01-JAN-00   1ABC\n";
+        assert_eq!(molecule_id_from_structure(pdb, "renamed.pdb"), "1ABC");
+        let cif = b"data_2xyz\n_entry.id 2xyz\n";
+        assert_eq!(molecule_id_from_structure(cif, "renamed.cif"), "2XYZ");
+        assert_eq!(molecule_id_from_structure(b"ATOM", "4r8p.pdb.gz"), "4R8P");
+        assert_eq!(
+            molecule_id_from_filename("custom-model.mol"),
+            "custom-model"
         );
     }
 

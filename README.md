@@ -80,6 +80,12 @@ to avoid connection overhead. Downloads are stored under `~/downloads/pdb/` and 
 without blocking the UI. Save as
 creates a Molecule 1.0 `.mol` project; subsequent Save operations update that file.
 
+Open can select one or several files. Every structure or `.mol` scene opens in its own tab
+above the viewport; tabs can be switched or closed with `×`. Molecule display state,
+selections, measurements, camera, and undo/redo history remain independent per tab. The
+structure ID is read from PDB `HEADER` or mmCIF `_entry.id`, with the filename used as a
+fallback, and is shown beside **Molecule** in the hierarchy manager.
+
 Ctrl/Cmd+Z undoes edits to selections, named selections, colors, visibility,
 representations, and other display state. Ctrl/Cmd+R reapplies them. The newest
 50 edits are retained; camera changes and loading a different structure are not
