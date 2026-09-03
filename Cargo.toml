@@ -27,5 +27,9 @@ zstd = "0.13"
 prost-build = "0.14"
 protoc-bin-vendored = "3"
 
+[[bench]]
+name = "display_memory"
+harness = false
+
 [profile.release]
 lto = "thin"

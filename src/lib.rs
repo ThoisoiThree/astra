@@ -922,7 +922,7 @@ fn default_representations(molecule: &Molecule) -> Vec<RepresentationMask> {
 
 fn hierarchy_membership(molecule: &Molecule) -> Vec<HierarchyMembership> {
     let mut chain_ids = HashMap::<String, u32>::new();
-    let mut residue_ids = HashMap::<(String, i32, Option<char>), u32>::new();
+    let mut residue_ids = HashMap::<(String, String, i32, Option<char>), u32>::new();
     let mut next_chain = 0_u32;
     let mut next_residue = 0_u32;
     molecule
@@ -936,6 +936,7 @@ fn hierarchy_membership(molecule: &Molecule) -> Vec<HierarchyMembership> {
             });
             let residue_key = (
                 atom.chain_id.clone(),
+                atom.residue_name.clone(),
                 atom.residue_number,
                 atom.insertion_code,
             );
@@ -1291,7 +1292,10 @@ mod display_tests {
         let mut display = DisplayState::for_molecule(&molecule);
         display.set_visibility_override(&[0, 1], DisplayLevel::Chain, VisibilityOverride::Hide);
         display.set_visibility_override(&[0], DisplayLevel::Atom, VisibilityOverride::Show);
-        assert_eq!(display.visible, vec![true, false]);
+        assert_eq!(
+            display.visible.iter().collect::<Vec<_>>(),
+            vec![true, false]
+        );
     }
 
     #[test]
@@ -1327,7 +1331,10 @@ mod display_tests {
             },
         )]);
         assert_eq!(display.colors, vec![named_color; 2]);
-        assert_eq!(display.visible, vec![false, false]);
+        assert_eq!(
+            display.visible.iter().collect::<Vec<_>>(),
+            vec![false, false]
+        );
         assert_eq!(display.modes, vec![DisplayMode::BallAndStick; 2]);
 
         let child_color = [0.1, 0.9, 0.2, 1.0];
@@ -1357,5 +1364,32 @@ mod display_tests {
             display.mode_override(0, DisplayLevel::Chain),
             ModeOverride::Inherit
         );
+    }
+
+    #[test]
+    fn edit_state_restores_sparse_authoritative_data_and_dense_cache() {
+        let molecule = molecule();
+        let mut display = DisplayState::for_molecule(&molecule);
+        let before = display.edit_state();
+
+        display.set_selection_from_bools(vec![true, false]);
+        display.set_color_override(&[0, 1], DisplayLevel::Chain, Some([0.2, 0.4, 0.8, 1.0]));
+        display.set_visibility_override(&[0], DisplayLevel::Atom, VisibilityOverride::Hide);
+        display.set_mode_override(&[1], DisplayLevel::Atom, ModeOverride::Toon);
+        display.set_representation([0], RepresentationMask::SPHERES, false);
+        let after = display.edit_state();
+
+        display.restore_edit_state(&molecule, before);
+        assert_eq!(display.selection_count(), 0);
+        assert!(display.visible[0]);
+        assert_eq!(display.global_mode, DisplayMode::Cartoon);
+        assert!(display.representations[0].contains(RepresentationMask::SPHERES));
+
+        display.restore_edit_state(&molecule, after);
+        assert_eq!(display.selection_count(), 1);
+        assert_eq!(display.colors, vec![[0.2, 0.4, 0.8, 1.0]; 2]);
+        assert!(!display.visible[0]);
+        assert_eq!(display.modes[1], DisplayMode::Toon);
+        assert!(!display.representations[0].contains(RepresentationMask::SPHERES));
     }
 }
