@@ -13,8 +13,9 @@ use prost::Message;
 use thiserror::Error;
 
 use crate::{
-    AmbientOcclusionQuality, AmbientOcclusionSettings, ColoringMode, DisplayColor, DisplayMode,
-    DisplayState, ModeOverride, NamedSelectionStyle, RepresentationMask, VisibilityOverride,
+    AmbientOcclusionQuality, AmbientOcclusionSettings, ColoringMode, DisplayColor, DisplayLevel,
+    DisplayMode, DisplayState, ModeOverride, NamedSelectionStyle, RepresentationMask,
+    VisibilityOverride,
     camera::{DepthOfField, OrbitCamera},
     measurement::{MeasurementEndpoint, MeasurementLine},
     molecule::{Atom, Bond, Element, Molecule, MoleculeHierarchy},
@@ -23,13 +24,15 @@ use crate::{
 
 pub const SCENE_EXTENSION: &str = "mol";
 pub const SCENE_FORMAT_NAME: &str = "Molecule 1.0";
+pub const SCENE_MIME_TYPE: &str = "application/vnd.molview.molecule";
 pub const SCENE_SCHEMA_VERSION: u32 = 1;
+pub const SCENE_READER_VERSION: u32 = 2;
 
 const MAGIC: &[u8; 8] = b"MOLECULE";
 const CONTAINER_VERSION: u16 = 1;
 const COMPRESSION_ZSTD: u16 = 1;
 const HEADER_LEN: usize = 24;
-const MAX_DECOMPRESSED_SIZE: u64 = 2 * 1024 * 1024 * 1024;
+const MAX_DECOMPRESSED_SIZE: u64 = 512 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum SceneHierarchyTarget {
@@ -71,6 +74,10 @@ pub enum SceneError {
     UnsupportedCompression(u16),
     #[error("scene schema {found} requires a reader newer than {supported}")]
     UnsupportedSchema { found: u32, supported: u32 },
+    #[error(
+        "scene requires Molecule reader {required}, but this application supports reader {supported}"
+    )]
+    UnsupportedReader { required: u32, supported: u32 },
     #[error("scene payload exceeds the {0} byte safety limit")]
     TooLarge(u64),
     #[error("scene payload length mismatch: expected {expected}, decoded {actual}")]
@@ -149,7 +156,9 @@ pub fn decode(bytes: &[u8]) -> Result<SceneDocument, SceneError> {
 
     let decoder = zstd::stream::read::Decoder::new(Cursor::new(&bytes[HEADER_LEN..]))?;
     let mut limited = decoder.take(expected_len.saturating_add(1));
-    let mut payload = Vec::with_capacity(usize::try_from(expected_len).unwrap_or(0));
+    // Do not trust the header enough to reserve the complete advertised size up front.
+    let initial_capacity = usize::try_from(expected_len.min(8 * 1024 * 1024)).unwrap_or(0);
+    let mut payload = Vec::with_capacity(initial_capacity);
     limited.read_to_end(&mut payload)?;
     let actual_len = payload.len() as u64;
     if actual_len != expected_len {
@@ -172,12 +181,28 @@ fn invalid(message: impl Into<String>) -> SceneError {
     SceneError::InvalidData(message.into())
 }
 
+fn minimum_reader_version(document: &SceneDocument) -> u32 {
+    if document.display.coloring_mode == ColoringMode::SecondaryStructure {
+        2
+    } else {
+        1
+    }
+}
+
 fn pack_flags(flags: &[bool]) -> Vec<u8> {
     let mut bytes = vec![0; flags.len().div_ceil(8)];
     for (index, flag) in flags.iter().copied().enumerate() {
         if flag {
             bytes[index / 8] |= 1 << (index % 8);
         }
+    }
+    bytes
+}
+
+fn pack_atom_mask(flags: &crate::bitset::AtomMask) -> Vec<u8> {
+    let mut bytes = vec![0_u8; flags.len().div_ceil(8)];
+    for index in flags.indices() {
+        bytes[index / 8] |= 1 << (index % 8);
     }
     bytes
 }
@@ -228,7 +253,11 @@ fn checked_finite(value: f32, label: &str) -> Result<f32, SceneError> {
         .ok_or_else(|| invalid(format!("{label} is not finite")))
 }
 
-mod wire {
+// Frozen reader-1 wire declarations are retained only for compatibility tests. Production
+// serialization is generated from schemas/molecule_1_0.proto below, preventing schema drift.
+#[cfg(test)]
+mod legacy_wire_v1 {
+    #![allow(dead_code)]
     use super::*;
 
     #[derive(Clone, PartialEq, Message)]
@@ -484,6 +513,27 @@ mod wire {
     }
 }
 
+#[allow(clippy::enum_variant_names)]
+mod wire {
+    include!(concat!(env!("OUT_DIR"), "/molecule.v1.rs"));
+
+    pub type SceneV1 = Scene;
+    pub type MoleculeV1 = Molecule;
+    pub type DisplayV1 = Display;
+    pub type AmbientOcclusionV1 = AmbientOcclusion;
+    pub type ColorRunV1 = ColorRun;
+    pub type StateRunV1 = StateRun;
+    pub type NamedSelectionV1 = NamedSelection;
+    pub type SelectionStyleV1 = SelectionStyle;
+    pub type MeasurementLineV1 = MeasurementLine;
+    pub type MeasurementEndpointV1 = MeasurementEndpoint;
+    pub type CameraV1 = Camera;
+    pub type DepthOfFieldV1 = DepthOfField;
+    pub type HierarchyNameV1 = HierarchyName;
+    pub type HierarchyTargetV1 = HierarchyTarget;
+    pub type Vec3V1 = Vec3;
+}
+
 impl wire::SceneV1 {
     fn from_document(document: &SceneDocument) -> Result<Self, SceneError> {
         let atom_count = document.molecule.atoms.len();
@@ -507,7 +557,7 @@ impl wire::SceneV1 {
                 Ok(wire::NamedSelectionV1 {
                     name: name.clone(),
                     expression: document.named_selection_expressions.get(name).cloned(),
-                    flags: pack_flags(selection.flags()),
+                    flags: pack_atom_mask(selection.flags()),
                     style: Some(selection_style_to_wire(style)),
                 })
             })
@@ -515,7 +565,7 @@ impl wire::SceneV1 {
 
         Ok(Self {
             schema_version: SCENE_SCHEMA_VERSION,
-            minimum_reader_version: 1,
+            minimum_reader_version: minimum_reader_version(document),
             source_name: document.source_name.clone(),
             molecule: Some(molecule_to_wire(&document.molecule)?),
             display: Some(display_to_wire(&document.display)?),
@@ -556,10 +606,10 @@ impl wire::SceneV1 {
                 supported: SCENE_SCHEMA_VERSION,
             });
         }
-        if self.minimum_reader_version > SCENE_SCHEMA_VERSION {
-            return Err(SceneError::UnsupportedSchema {
-                found: self.minimum_reader_version,
-                supported: SCENE_SCHEMA_VERSION,
+        if self.minimum_reader_version > SCENE_READER_VERSION {
+            return Err(SceneError::UnsupportedReader {
+                required: self.minimum_reader_version,
+                supported: SCENE_READER_VERSION,
             });
         }
         let molecule = molecule_from_wire(
@@ -832,16 +882,34 @@ fn display_to_wire(display: &DisplayState) -> Result<wire::DisplayV1, SceneError
             .iter()
             .map(|mask| u32::from(mask.bits()))
             .collect(),
-        selection_flags: pack_flags(&display.selection),
-        chain_colors: color_runs(&display.chain_colors)?,
-        residue_colors: color_runs(&display.residue_colors)?,
-        atom_colors: color_runs(&display.atom_colors)?,
-        chain_visibility: state_runs(&display.chain_visibility, visibility_code)?,
-        residue_visibility: state_runs(&display.residue_visibility, visibility_code)?,
-        atom_visibility: state_runs(&display.atom_visibility, visibility_code)?,
-        chain_modes: state_runs(&display.chain_modes, mode_override_code)?,
-        residue_modes: state_runs(&display.residue_modes, mode_override_code)?,
-        atom_modes: state_runs(&display.atom_modes, mode_override_code)?,
+        selection_flags: pack_atom_mask(&display.selection),
+        chain_colors: color_runs(&display.color_override_values(DisplayLevel::Chain))?,
+        residue_colors: color_runs(&display.color_override_values(DisplayLevel::Residue))?,
+        atom_colors: color_runs(&display.color_override_values(DisplayLevel::Atom))?,
+        chain_visibility: state_runs(
+            &display.visibility_override_values(DisplayLevel::Chain),
+            visibility_code,
+        )?,
+        residue_visibility: state_runs(
+            &display.visibility_override_values(DisplayLevel::Residue),
+            visibility_code,
+        )?,
+        atom_visibility: state_runs(
+            &display.visibility_override_values(DisplayLevel::Atom),
+            visibility_code,
+        )?,
+        chain_modes: state_runs(
+            &display.mode_override_values(DisplayLevel::Chain),
+            mode_override_code,
+        )?,
+        residue_modes: state_runs(
+            &display.mode_override_values(DisplayLevel::Residue),
+            mode_override_code,
+        )?,
+        atom_modes: state_runs(
+            &display.mode_override_values(DisplayLevel::Atom),
+            mode_override_code,
+        )?,
     })
 }
 
@@ -864,7 +932,7 @@ fn display_from_wire(
             .ok_or_else(|| invalid("ambient occlusion settings are missing"))?,
     )?;
     display.ambient_occlusion_customized = wire.ambient_occlusion_customized;
-    display.representations = wire
+    let representations = wire
         .representation_masks
         .into_iter()
         .map(|bits| {
@@ -877,52 +945,84 @@ fn display_from_wire(
             }
         })
         .collect::<Result<Vec<_>, SceneError>>()?;
-    display.selection = unpack_flags(&wire.selection_flags, atom_count, "current selection")?;
-    display.chain_colors = colors_from_runs(&wire.chain_colors, atom_count, "chain colors")?;
-    display.residue_colors = colors_from_runs(&wire.residue_colors, atom_count, "residue colors")?;
-    display.atom_colors = colors_from_runs(&wire.atom_colors, atom_count, "atom colors")?;
-    display.chain_visibility = states_from_runs(
-        &wire.chain_visibility,
+    display.load_representations(representations);
+    display.set_selection_from_bools(unpack_flags(
+        &wire.selection_flags,
         atom_count,
-        VisibilityOverride::Inherit,
-        visibility_from_code,
-        "chain visibility",
-    )?;
-    display.residue_visibility = states_from_runs(
-        &wire.residue_visibility,
-        atom_count,
-        VisibilityOverride::Inherit,
-        visibility_from_code,
-        "residue visibility",
-    )?;
-    display.atom_visibility = states_from_runs(
-        &wire.atom_visibility,
-        atom_count,
-        VisibilityOverride::Inherit,
-        visibility_from_code,
-        "atom visibility",
-    )?;
-    display.chain_modes = states_from_runs(
-        &wire.chain_modes,
-        atom_count,
-        ModeOverride::Inherit,
-        mode_override_from_code,
-        "chain modes",
-    )?;
-    display.residue_modes = states_from_runs(
-        &wire.residue_modes,
-        atom_count,
-        ModeOverride::Inherit,
-        mode_override_from_code,
-        "residue modes",
-    )?;
-    display.atom_modes = states_from_runs(
-        &wire.atom_modes,
-        atom_count,
-        ModeOverride::Inherit,
-        mode_override_from_code,
-        "atom modes",
-    )?;
+        "current selection",
+    )?);
+    display.load_color_override_values(
+        DisplayLevel::Chain,
+        colors_from_runs(&wire.chain_colors, atom_count, "chain colors")?,
+    );
+    display.load_color_override_values(
+        DisplayLevel::Residue,
+        colors_from_runs(&wire.residue_colors, atom_count, "residue colors")?,
+    );
+    display.load_color_override_values(
+        DisplayLevel::Atom,
+        colors_from_runs(&wire.atom_colors, atom_count, "atom colors")?,
+    );
+    display.load_visibility_override_values(
+        DisplayLevel::Chain,
+        states_from_runs(
+            &wire.chain_visibility,
+            atom_count,
+            VisibilityOverride::Inherit,
+            visibility_from_code,
+            "chain visibility",
+        )?,
+    );
+    display.load_visibility_override_values(
+        DisplayLevel::Residue,
+        states_from_runs(
+            &wire.residue_visibility,
+            atom_count,
+            VisibilityOverride::Inherit,
+            visibility_from_code,
+            "residue visibility",
+        )?,
+    );
+    display.load_visibility_override_values(
+        DisplayLevel::Atom,
+        states_from_runs(
+            &wire.atom_visibility,
+            atom_count,
+            VisibilityOverride::Inherit,
+            visibility_from_code,
+            "atom visibility",
+        )?,
+    );
+    display.load_mode_override_values(
+        DisplayLevel::Chain,
+        states_from_runs(
+            &wire.chain_modes,
+            atom_count,
+            ModeOverride::Inherit,
+            mode_override_from_code,
+            "chain modes",
+        )?,
+    );
+    display.load_mode_override_values(
+        DisplayLevel::Residue,
+        states_from_runs(
+            &wire.residue_modes,
+            atom_count,
+            ModeOverride::Inherit,
+            mode_override_from_code,
+            "residue modes",
+        )?,
+    );
+    display.load_mode_override_values(
+        DisplayLevel::Atom,
+        states_from_runs(
+            &wire.atom_modes,
+            atom_count,
+            ModeOverride::Inherit,
+            mode_override_from_code,
+            "atom modes",
+        )?,
+    );
     display.recompute_colors();
     display.recompute_visibility();
     display.recompute_modes();
@@ -932,8 +1032,8 @@ fn display_from_wire(
 fn selection_style_to_wire(style: NamedSelectionStyle) -> wire::SelectionStyleV1 {
     wire::SelectionStyleV1 {
         color: style.color.map_or_else(Vec::new, |color| color.to_vec()),
-        visibility: visibility_code(style.visibility),
-        mode: mode_override_code(style.mode),
+        visibility: visibility_code(style.visibility) as i32,
+        mode: mode_override_code(style.mode) as i32,
     }
 }
 
@@ -944,8 +1044,8 @@ fn selection_style_from_wire(
         color: (!style.color.is_empty())
             .then(|| checked_color(&style.color, "selection color"))
             .transpose()?,
-        visibility: visibility_from_code(style.visibility)?,
-        mode: mode_override_from_code(style.mode)?,
+        visibility: visibility_from_code(enum_code(style.visibility, "visibility override")?)?,
+        mode: mode_override_from_code(enum_code(style.mode, "mode override")?)?,
     })
 }
 
@@ -956,7 +1056,7 @@ fn measurement_to_wire(line: &MeasurementLine) -> wire::MeasurementLineV1 {
         first: Some(measurement_endpoint_to_wire(&line.first)),
         second: Some(measurement_endpoint_to_wire(&line.second)),
         color: line.color.map_or_else(Vec::new, |color| color.to_vec()),
-        visibility: visibility_code(line.visibility),
+        visibility: visibility_code(line.visibility) as i32,
         label_size: line.label_size,
         thickness: line.thickness,
     }
@@ -985,7 +1085,7 @@ fn measurement_from_wire(line: wire::MeasurementLineV1) -> Result<MeasurementLin
     result.color = (!line.color.is_empty())
         .then(|| checked_color(&line.color, "measurement color"))
         .transpose()?;
-    result.visibility = visibility_from_code(line.visibility)?;
+    result.visibility = visibility_from_code(enum_code(line.visibility, "visibility override")?)?;
     result.set_label_size(checked_finite(line.label_size, "measurement label size")?);
     result.set_thickness(checked_finite(line.thickness, "measurement thickness")?);
     Ok(result)
@@ -1265,7 +1365,7 @@ fn table_string(strings: &[String], index: u32, label: &str) -> Result<String, S
         .ok_or_else(|| invalid(format!("{label} string table index {index} is invalid")))
 }
 
-fn element_code(element: Element) -> u32 {
+fn element_code(element: Element) -> i32 {
     match element {
         Element::Unknown => 0,
         Element::H => 1,
@@ -1287,7 +1387,7 @@ fn element_code(element: Element) -> u32 {
     }
 }
 
-fn element_from_code(code: u32) -> Result<Element, SceneError> {
+fn element_from_code(code: i32) -> Result<Element, SceneError> {
     match code {
         0 => Ok(Element::Unknown),
         1 => Ok(Element::H),
@@ -1310,7 +1410,7 @@ fn element_from_code(code: u32) -> Result<Element, SceneError> {
     }
 }
 
-fn display_mode_code(mode: DisplayMode) -> u32 {
+fn display_mode_code(mode: DisplayMode) -> i32 {
     match mode {
         DisplayMode::Cartoon => 0,
         DisplayMode::BallAndStick => 1,
@@ -1318,7 +1418,7 @@ fn display_mode_code(mode: DisplayMode) -> u32 {
     }
 }
 
-fn display_mode_from_code(code: u32) -> Result<DisplayMode, SceneError> {
+fn display_mode_from_code(code: i32) -> Result<DisplayMode, SceneError> {
     match code {
         0 => Ok(DisplayMode::Cartoon),
         1 => Ok(DisplayMode::BallAndStick),
@@ -1327,7 +1427,7 @@ fn display_mode_from_code(code: u32) -> Result<DisplayMode, SceneError> {
     }
 }
 
-fn coloring_mode_code(mode: ColoringMode) -> u32 {
+fn coloring_mode_code(mode: ColoringMode) -> i32 {
     match mode {
         ColoringMode::Element => 0,
         ColoringMode::Chain => 1,
@@ -1339,7 +1439,7 @@ fn coloring_mode_code(mode: ColoringMode) -> u32 {
     }
 }
 
-fn coloring_mode_from_code(code: u32) -> Result<ColoringMode, SceneError> {
+fn coloring_mode_from_code(code: i32) -> Result<ColoringMode, SceneError> {
     match code {
         0 => Ok(ColoringMode::Element),
         1 => Ok(ColoringMode::Chain),
@@ -1388,7 +1488,7 @@ fn mode_override_from_code(code: u32) -> Result<ModeOverride, SceneError> {
     }
 }
 
-fn ao_quality_code(quality: AmbientOcclusionQuality) -> u32 {
+fn ao_quality_code(quality: AmbientOcclusionQuality) -> i32 {
     match quality {
         AmbientOcclusionQuality::Low => 0,
         AmbientOcclusionQuality::Medium => 1,
@@ -1396,13 +1496,17 @@ fn ao_quality_code(quality: AmbientOcclusionQuality) -> u32 {
     }
 }
 
-fn ao_quality_from_code(code: u32) -> Result<AmbientOcclusionQuality, SceneError> {
+fn ao_quality_from_code(code: i32) -> Result<AmbientOcclusionQuality, SceneError> {
     match code {
         0 => Ok(AmbientOcclusionQuality::Low),
         1 => Ok(AmbientOcclusionQuality::Medium),
         2 => Ok(AmbientOcclusionQuality::High),
         value => Err(invalid(format!("unknown AO quality {value}"))),
     }
+}
+
+fn enum_code(code: i32, label: &str) -> Result<u32, SceneError> {
+    u32::try_from(code).map_err(|_| invalid(format!("{label} has negative value {code}")))
 }
 
 #[cfg(test)]
@@ -1560,10 +1664,128 @@ mod tests {
     }
 
     #[test]
+    fn newer_required_reader_has_a_clear_error() {
+        let mut message = wire::SceneV1::from_document(&document()).unwrap();
+        message.minimum_reader_version = SCENE_READER_VERSION + 1;
+        let bytes = test_container(message.encode_to_vec());
+        assert!(matches!(
+            decode(&bytes),
+            Err(SceneError::UnsupportedReader {
+                required,
+                supported: SCENE_READER_VERSION
+            }) if required == SCENE_READER_VERSION + 1
+        ));
+    }
+
+    #[test]
     fn corrupted_compressed_payload_is_rejected() {
         let mut bytes = encode(&document()).unwrap();
         let last = bytes.last_mut().unwrap();
         *last ^= 0x80;
         assert!(decode(&bytes).is_err());
+    }
+
+    #[test]
+    fn reader_1_golden_opens_in_current_reader() {
+        let restored =
+            decode(include_bytes!("../tests/fixtures/molecule_1_0_reader1.mol")).unwrap();
+        assert_eq!(restored.source_name, "example.cif");
+        assert_eq!(restored.display.coloring_mode, ColoringMode::Chain);
+    }
+
+    #[test]
+    fn compatible_current_file_opens_in_frozen_reader_1() {
+        let mut compatible = document();
+        compatible
+            .display
+            .set_coloring_mode(&compatible.molecule, ColoringMode::Chain);
+        let message = legacy_reader_message(&encode(&compatible).unwrap()).unwrap();
+        assert_eq!(message.schema_version, 1);
+        assert_eq!(message.minimum_reader_version, 1);
+        assert_eq!(message.display.unwrap().coloring_mode, 1);
+    }
+
+    #[test]
+    fn incompatible_current_file_is_rejected_by_frozen_reader_1() {
+        let bytes = encode(&document()).unwrap();
+        let error = legacy_reader_message(&bytes).unwrap_err();
+        assert!(error.contains("requires reader 2"));
+    }
+
+    #[test]
+    fn every_display_and_coloring_mode_round_trips() {
+        let display_modes = [
+            DisplayMode::Cartoon,
+            DisplayMode::BallAndStick,
+            DisplayMode::Toon,
+        ];
+        let coloring_modes = [
+            ColoringMode::Element,
+            ColoringMode::Chain,
+            ColoringMode::Residue,
+            ColoringMode::ResidueType,
+            ColoringMode::BFactor,
+            ColoringMode::Uniform,
+            ColoringMode::SecondaryStructure,
+        ];
+        for display_mode in display_modes {
+            for coloring_mode in coloring_modes {
+                let mut original = document();
+                original.display.set_global_mode(display_mode);
+                original
+                    .display
+                    .set_coloring_mode(&original.molecule, coloring_mode);
+                let restored = decode(&encode(&original).unwrap()).unwrap();
+                assert_eq!(restored.display.global_mode, display_mode);
+                assert_eq!(restored.display.coloring_mode, coloring_mode);
+            }
+        }
+    }
+
+    #[test]
+    fn oversized_payload_is_rejected_from_header() {
+        let mut bytes = encode(&document()).unwrap();
+        bytes[16..24].copy_from_slice(&(MAX_DECOMPRESSED_SIZE + 1).to_le_bytes());
+        assert!(matches!(decode(&bytes), Err(SceneError::TooLarge(_))));
+    }
+
+    fn legacy_reader_message(bytes: &[u8]) -> Result<legacy_wire_v1::SceneV1, String> {
+        if !bytes.starts_with(MAGIC) || bytes.len() < HEADER_LEN {
+            return Err("invalid Molecule container".into());
+        }
+        let expected = u64::from_le_bytes(bytes[16..24].try_into().unwrap()) as usize;
+        let decoder = zstd::stream::read::Decoder::new(Cursor::new(&bytes[HEADER_LEN..]))
+            .map_err(|error| error.to_string())?;
+        let mut payload = Vec::new();
+        decoder
+            .take(expected as u64 + 1)
+            .read_to_end(&mut payload)
+            .map_err(|error| error.to_string())?;
+        if payload.len() != expected {
+            return Err("invalid payload length".into());
+        }
+        let message = legacy_wire_v1::SceneV1::decode(payload.as_slice())
+            .map_err(|error| error.to_string())?;
+        if message.minimum_reader_version > 1 {
+            return Err(format!(
+                "file requires reader {} but frozen reader supports 1",
+                message.minimum_reader_version
+            ));
+        }
+        Ok(message)
+    }
+
+    fn test_container(payload: Vec<u8>) -> Vec<u8> {
+        let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), 1).unwrap();
+        encoder.write_all(&payload).unwrap();
+        let compressed = encoder.finish().unwrap();
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(MAGIC);
+        bytes.extend_from_slice(&CONTAINER_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&COMPRESSION_ZSTD.to_le_bytes());
+        bytes.extend_from_slice(&SCENE_SCHEMA_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(&compressed);
+        bytes
     }
 }

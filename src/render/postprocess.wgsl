@@ -240,6 +240,9 @@ fn compose_toon(
     pixel: vec2<i32>,
     dimensions: vec2<u32>,
 ) -> vec4<f32> {
+    if post.aperture.w < 0.5 {
+        return vec4<f32>(color.rgb * ao, color.a);
+    }
     let outline = toon_outline(pixel, dimensions);
     let ink = vec3<f32>(0.0086, 0.0103, 0.0123);
     return vec4<f32>(mix(color.rgb * ao, ink, outline), color.a);

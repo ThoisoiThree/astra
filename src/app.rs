@@ -1,12 +1,15 @@
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     env, fs,
-    io::Read,
+    fs::OpenOptions,
+    io::{Read, Write},
     path::Path,
     path::PathBuf,
     sync::Arc,
-    sync::atomic::{AtomicBool, Ordering},
-    sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError},
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+    sync::mpsc::{
+        self, Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError, TrySendError,
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -14,25 +17,28 @@ use std::{
 use anyhow::{Context, Result};
 use glam::{Vec2, Vec3};
 use molview::{
-    DisplayColor, DisplayLevel, DisplayMode, DisplayState, ModeOverride, NamedSelectionStyle,
-    RepresentationMask, VisibilityOverride,
+    DisplayColor, DisplayLevel, DisplayMode, DisplayState, DisplayStateData, ModeOverride,
+    NamedSelectionStyle, RepresentationMask, VisibilityOverride,
     camera::{OrbitCamera, Viewport},
     command::{Command, Representation, parse_command},
     measurement::{MeasurementEndpoint, MeasurementLine},
-    molecule::{Molecule, MoleculeHierarchy, parse_structure},
-    picking::pick_atom_filtered_with_radius,
-    render::{RenderError, Renderer, SurfaceIssue},
+    molecule::{MAX_DECOMPRESSED_STRUCTURE_SIZE, Molecule, MoleculeHierarchy, parse_structure},
+    picking::AtomBvh,
+    render::{PreparedCartoon, RenderError, Renderer, SurfaceIssue, prepare_cartoon},
     scene::{
         SCENE_EXTENSION, SCENE_FORMAT_NAME, SceneDocument, SceneHierarchyTarget,
         decode as decode_scene, encode as encode_scene, is_scene_document,
     },
-    selection::{Selection, evaluate_with_named, parse_selection},
+    selection::{
+        Selection, SelectionStatus, evaluate_with_named, rename_named_reference,
+        resolve_named_expressions, validate_unique_name,
+    },
 };
 use winit::{
     application::ApplicationHandler,
     dpi::{LogicalSize, PhysicalPosition},
     event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent},
-    event_loop::{ActiveEventLoop, EventLoop},
+    event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
     keyboard::{Key, ModifiersState},
     window::{Window, WindowAttributes, WindowId},
 };
@@ -43,6 +49,9 @@ const FETCH_BUFFER_SIZE: usize = 64 * 1024;
 const PARALLEL_FETCH_MIN_SIZE: u64 = 4 * 1024 * 1024;
 const PARALLEL_FETCH_WORKERS: usize = 4;
 const FETCH_CANCELLED: &str = "PDB download canceled";
+const MAX_LOCAL_FILE_SIZE: u64 = MAX_DECOMPRESSED_STRUCTURE_SIZE;
+const AUTOSAVE_DELAY: Duration = Duration::from_secs(10);
+static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 use crate::ui::{
     CameraUpdate, FocusRequest, HierarchySelectionGesture, InspectionTarget, ManagerAction,
@@ -99,7 +108,17 @@ impl ApplicationHandler for MolviewApplication {
         }
     }
 
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {}
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if let Some(runtime) = &mut self.runtime {
+            runtime.poll_background_jobs();
+            runtime.autosave_due_documents();
+            if let Some(deadline) = runtime.next_autosave_deadline() {
+                event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
+            } else {
+                event_loop.set_control_flow(ControlFlow::Wait);
+            }
+        }
+    }
 }
 
 struct Runtime {
@@ -109,10 +128,12 @@ struct Runtime {
     egui_state: egui_winit::State,
     molecule: Option<Molecule>,
     hierarchy: Option<MoleculeHierarchy>,
+    atom_bvh: Option<AtomBvh>,
     display: Option<DisplayState>,
     named_selections: BTreeMap<String, Selection>,
     named_selection_expressions: BTreeMap<String, String>,
     named_selection_styles: BTreeMap<String, NamedSelectionStyle>,
+    named_selection_statuses: BTreeMap<String, SelectionStatus>,
     measurement_lines: Vec<MeasurementLine>,
     next_measurement_id: u64,
     hierarchy_names: BTreeMap<InspectionTarget, String>,
@@ -124,6 +145,13 @@ struct Runtime {
     loaded_filename: Option<String>,
     molecule_id: Option<String>,
     scene_path: Option<PathBuf>,
+    dirty: bool,
+    recovery_path: Option<PathBuf>,
+    autosave_due: Option<Instant>,
+    document_version: u64,
+    needs_cartoon_refresh: bool,
+    next_pick_request_id: u64,
+    pending_pick: Option<PendingPick>,
     inactive_sessions: Vec<DocumentSession>,
     session_order: Vec<u64>,
     active_session_id: u64,
@@ -132,6 +160,10 @@ struct Runtime {
     fetching_pdb_id: Option<String>,
     fetch_progress: FetchProgress,
     fetch_cancel: Option<Arc<AtomicBool>>,
+    job_sender: SyncSender<JobRequest>,
+    job_receiver: Receiver<JobEvent>,
+    background_jobs: BTreeMap<u64, BackgroundJob>,
+    next_job_id: u64,
     camera: OrbitCamera,
     ui: UiState,
     cursor: Option<PhysicalPosition<f64>>,
@@ -142,18 +174,20 @@ struct Runtime {
     modifiers: ModifiersState,
     focused: bool,
     occluded: bool,
-    undo_history: VecDeque<EditableSnapshot>,
-    redo_history: VecDeque<EditableSnapshot>,
+    undo_history: VecDeque<EditOperation>,
+    redo_history: VecDeque<EditOperation>,
 }
 
 struct DocumentSession {
     id: u64,
     molecule: Option<Molecule>,
     hierarchy: Option<MoleculeHierarchy>,
+    atom_bvh: Option<AtomBvh>,
     display: Option<DisplayState>,
     named_selections: BTreeMap<String, Selection>,
     named_selection_expressions: BTreeMap<String, String>,
     named_selection_styles: BTreeMap<String, NamedSelectionStyle>,
+    named_selection_statuses: BTreeMap<String, SelectionStatus>,
     measurement_lines: Vec<MeasurementLine>,
     next_measurement_id: u64,
     hierarchy_names: BTreeMap<InspectionTarget, String>,
@@ -165,9 +199,14 @@ struct DocumentSession {
     loaded_filename: Option<String>,
     molecule_id: Option<String>,
     scene_path: Option<PathBuf>,
+    dirty: bool,
+    recovery_path: Option<PathBuf>,
+    autosave_due: Option<Instant>,
+    document_version: u64,
+    needs_cartoon_refresh: bool,
     camera: OrbitCamera,
-    undo_history: VecDeque<EditableSnapshot>,
-    redo_history: VecDeque<EditableSnapshot>,
+    undo_history: VecDeque<EditOperation>,
+    redo_history: VecDeque<EditOperation>,
 }
 
 impl DocumentSession {
@@ -177,10 +216,12 @@ impl DocumentSession {
             id,
             molecule: None,
             hierarchy: None,
+            atom_bvh: None,
             display: None,
             named_selections: BTreeMap::new(),
             named_selection_expressions: BTreeMap::new(),
             named_selection_styles: BTreeMap::new(),
+            named_selection_statuses: BTreeMap::new(),
             measurement_lines: Vec::new(),
             next_measurement_id: 1,
             hierarchy_names: BTreeMap::new(),
@@ -192,6 +233,11 @@ impl DocumentSession {
             loaded_filename: None,
             molecule_id: None,
             scene_path: None,
+            dirty: false,
+            recovery_path: None,
+            autosave_due: None,
+            document_version: 0,
+            needs_cartoon_refresh: false,
             camera: OrbitCamera::new(aspect),
             undo_history: VecDeque::new(),
             redo_history: VecDeque::new(),
@@ -202,7 +248,55 @@ impl DocumentSession {
         SessionTab {
             id: self.id,
             label: session_label(self.molecule_id.as_deref(), self.loaded_filename.as_deref()),
+            dirty: self.dirty,
         }
+    }
+
+    fn write_scene(&self, path: &Path) -> Result<()> {
+        let document = self.scene_document()?;
+        let contents = encode_scene(&document).context("could not encode scene")?;
+        atomic_write(path, &contents)
+            .with_context(|| format!("could not atomically write scene {}", path.display()))
+    }
+
+    fn scene_document(&self) -> Result<SceneDocument> {
+        let molecule = self
+            .molecule
+            .as_ref()
+            .context("recovery session has no structure")?;
+        let display = self
+            .display
+            .as_ref()
+            .context("recovery session has no display state")?;
+        Ok(SceneDocument {
+            source_name: self
+                .molecule_id
+                .clone()
+                .or_else(|| self.loaded_filename.clone())
+                .unwrap_or_default(),
+            molecule: molecule.clone(),
+            display: display.clone(),
+            named_selections: self.named_selections.clone(),
+            named_selection_expressions: self.named_selection_expressions.clone(),
+            named_selection_styles: self.named_selection_styles.clone(),
+            measurement_lines: self.measurement_lines.clone(),
+            hierarchy_names: self
+                .hierarchy_names
+                .iter()
+                .map(|(target, name)| (scene_target(*target), name.clone()))
+                .collect(),
+            inspection: self.inspection.map(scene_target),
+            hierarchy_selection: self
+                .hierarchy_selection
+                .iter()
+                .copied()
+                .map(scene_target)
+                .collect(),
+            hierarchy_selection_anchor: self.hierarchy_selection_anchor.map(scene_target),
+            focus_description: self.focus_description.clone(),
+            pivot_description: self.pivot_description.clone(),
+            camera: self.camera.clone(),
+        })
     }
 }
 
@@ -213,6 +307,93 @@ struct FetchProgress {
     bytes_per_second: f64,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PendingPick {
+    request_id: u64,
+    session_id: u64,
+    document_version: u64,
+    cpu_fallback: Option<usize>,
+}
+
+struct BackgroundJob {
+    session_id: u64,
+    version: u64,
+    kind: JobKind,
+    stage: String,
+    progress: f32,
+    cancel: Arc<AtomicBool>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JobKind {
+    Load,
+    Save,
+    Cartoon,
+}
+
+enum JobRequest {
+    Load {
+        id: u64,
+        session_id: u64,
+        version: u64,
+        path: PathBuf,
+        cancel: Arc<AtomicBool>,
+    },
+    Save {
+        id: u64,
+        session_id: u64,
+        version: u64,
+        path: PathBuf,
+        document: Box<SceneDocument>,
+        cancel: Arc<AtomicBool>,
+    },
+    Cartoon {
+        id: u64,
+        session_id: u64,
+        version: u64,
+        molecule: Box<Molecule>,
+        display: Box<DisplayState>,
+        cancel: Arc<AtomicBool>,
+    },
+}
+
+enum JobEvent {
+    Progress {
+        id: u64,
+        stage: &'static str,
+        progress: f32,
+    },
+    Complete {
+        id: u64,
+        result: Box<std::result::Result<JobOutput, String>>,
+    },
+}
+
+enum JobOutput {
+    Loaded(Box<LoadedPayload>),
+    Saved(PathBuf),
+    Cartoon(PreparedCartoon),
+    Cancelled,
+}
+
+enum LoadedPayload {
+    Structure {
+        filename: String,
+        molecule_id: String,
+        molecule: Molecule,
+        hierarchy: MoleculeHierarchy,
+        atom_bvh: AtomBvh,
+        display: Box<DisplayState>,
+    },
+    Scene {
+        filename: String,
+        path: PathBuf,
+        document: Box<SceneDocument>,
+        hierarchy: MoleculeHierarchy,
+        atom_bvh: AtomBvh,
+    },
+}
+
 #[derive(Debug)]
 enum FetchEvent {
     Progress(FetchProgress),
@@ -220,16 +401,76 @@ enum FetchEvent {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-struct EditableSnapshot {
-    display: Option<DisplayState>,
-    named_selections: BTreeMap<String, Selection>,
-    named_selection_expressions: BTreeMap<String, String>,
-    named_selection_styles: BTreeMap<String, NamedSelectionStyle>,
-    measurement_lines: Vec<MeasurementLine>,
+struct EditTransaction {
+    display: Option<DisplayStateData>,
+    named_selections: BTreeMap<String, NamedSelectionRecord>,
+    measurements: BTreeMap<u64, IndexedMeasurement>,
     hierarchy_names: BTreeMap<InspectionTarget, String>,
+    workspace: WorkspaceSelection,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct NamedSelectionRecord {
+    selection: Selection,
+    expression: Option<String>,
+    style: Option<NamedSelectionStyle>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct IndexedMeasurement {
+    index: usize,
+    line: MeasurementLine,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct WorkspaceSelection {
     inspection: Option<InspectionTarget>,
     hierarchy_selection: BTreeSet<InspectionTarget>,
     hierarchy_selection_anchor: Option<InspectionTarget>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct ValueChange<T> {
+    before: T,
+    after: T,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct NamedSelectionChange {
+    name: String,
+    value: ValueChange<Option<NamedSelectionRecord>>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct MeasurementChange {
+    id: u64,
+    value: ValueChange<Option<IndexedMeasurement>>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct HierarchyNameChange {
+    target: InspectionTarget,
+    value: ValueChange<Option<String>>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum EditChange {
+    Display(Box<ValueChange<Option<DisplayStateData>>>),
+    NamedSelection(Box<NamedSelectionChange>),
+    Measurement(Box<MeasurementChange>),
+    HierarchyName(Box<HierarchyNameChange>),
+    Workspace(Box<ValueChange<WorkspaceSelection>>),
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+struct EditOperation {
+    changes: Vec<EditChange>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum HistoryDirection {
+    Undo,
+    Redo,
 }
 
 impl Runtime {
@@ -257,6 +498,10 @@ impl Runtime {
             window.theme(),
             None,
         );
+        let (job_sender, job_requests) = mpsc::sync_channel(2);
+        let (job_events, job_receiver) = mpsc::channel();
+        let worker_window = window.clone();
+        thread::spawn(move || background_worker(job_requests, job_events, worker_window));
         let mut runtime = Self {
             window,
             renderer,
@@ -264,10 +509,12 @@ impl Runtime {
             egui_state,
             molecule: None,
             hierarchy: None,
+            atom_bvh: None,
             display: None,
             named_selections: BTreeMap::new(),
             named_selection_expressions: BTreeMap::new(),
             named_selection_styles: BTreeMap::new(),
+            named_selection_statuses: BTreeMap::new(),
             measurement_lines: Vec::new(),
             next_measurement_id: 1,
             hierarchy_names: BTreeMap::new(),
@@ -279,6 +526,13 @@ impl Runtime {
             loaded_filename: None,
             molecule_id: None,
             scene_path: None,
+            dirty: false,
+            recovery_path: None,
+            autosave_due: None,
+            document_version: 0,
+            needs_cartoon_refresh: false,
+            next_pick_request_id: 1,
+            pending_pick: None,
             inactive_sessions: Vec::new(),
             session_order: Vec::new(),
             active_session_id: 1,
@@ -287,6 +541,10 @@ impl Runtime {
             fetching_pdb_id: None,
             fetch_progress: FetchProgress::default(),
             fetch_cancel: None,
+            job_sender,
+            job_receiver,
+            background_jobs: BTreeMap::new(),
+            next_job_id: 1,
             camera,
             ui: UiState::default(),
             cursor: None,
@@ -301,22 +559,29 @@ impl Runtime {
             redo_history: VecDeque::new(),
         };
         if let Some(path) = initial_path
-            && let Err(error) = runtime.load_path(&path)
+            && let Err(error) = runtime.start_load_path(&path)
         {
             runtime.ui.latest_error = Some(error.to_string());
         }
+        runtime.offer_recovery_files();
         runtime.window.request_redraw();
         Ok(runtime)
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, event: WindowEvent) {
+        self.poll_background_jobs();
         self.poll_fetch_result();
+        self.poll_pick_result();
         let egui_response = self.egui_state.on_window_event(&self.window, &event);
         if egui_response.repaint {
             self.window.request_redraw();
         }
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => {
+                if self.request_exit() {
+                    event_loop.exit();
+                }
+            }
             WindowEvent::Resized(size) => {
                 self.renderer.resize(size);
                 self.viewport = Viewport::full(size.width, size.height);
@@ -324,7 +589,7 @@ impl Runtime {
                 self.window.request_redraw();
             }
             WindowEvent::DroppedFile(path) => {
-                if let Err(error) = self.load_path(&path) {
+                if let Err(error) = self.start_load_path(&path) {
                     self.ui.latest_error = Some(error.to_string());
                 }
                 self.window.request_redraw();
@@ -381,9 +646,7 @@ impl Runtime {
                             && !self.egui_context.is_pointer_over_egui();
                         self.left_drag = false;
                         if should_pick && let Some(position) = self.cursor {
-                            let before = self.editable_snapshot();
-                            self.pick_at(position);
-                            self.commit_edit(before);
+                            self.request_gpu_pick(position);
                             self.window.request_redraw();
                         }
                     }
@@ -408,9 +671,11 @@ impl Runtime {
                             || (self.left_drag && self.modifiers.shift_key())
                         {
                             self.camera.pan(delta, self.viewport.height);
+                            self.mark_dirty();
                             self.window.request_redraw();
                         } else if self.left_drag && self.left_drag_distance > 4.0 {
                             self.camera.orbit(delta);
+                            self.mark_dirty();
                             self.window.request_redraw();
                         }
                     }
@@ -425,6 +690,7 @@ impl Runtime {
                     MouseScrollDelta::PixelDelta(position) => position.y as f32,
                 };
                 self.camera.zoom(amount);
+                self.mark_dirty();
                 self.window.request_redraw();
             }
             WindowEvent::RedrawRequested
@@ -442,11 +708,18 @@ impl Runtime {
     fn redraw(&mut self, event_loop: &ActiveEventLoop) {
         let raw_input = self.egui_state.take_egui_input(&self.window);
         let session_tabs = self.session_tabs();
+        let background_job = self
+            .background_jobs
+            .iter()
+            .find(|(_, job)| job.session_id == self.active_session_id);
         let info = UiInfo {
             filename: self.loaded_filename.as_deref(),
             molecule_id: self.molecule_id.as_deref(),
             session_tabs: &session_tabs,
-            active_session_id: self.molecule.as_ref().map(|_| self.active_session_id),
+            active_session_id: self
+                .loaded_filename
+                .as_ref()
+                .map(|_| self.active_session_id),
             atom_count: self
                 .molecule
                 .as_ref()
@@ -465,6 +738,7 @@ impl Runtime {
             named_selections: &self.named_selections,
             named_selection_expressions: &self.named_selection_expressions,
             named_selection_styles: &self.named_selection_styles,
+            named_selection_statuses: &self.named_selection_statuses,
             measurement_lines: &self.measurement_lines,
             hierarchy_names: &self.hierarchy_names,
             inspection: self.inspection,
@@ -476,6 +750,9 @@ impl Runtime {
             fetch_downloaded_bytes: self.fetch_progress.downloaded_bytes,
             fetch_total_bytes: self.fetch_progress.total_bytes,
             fetch_bytes_per_second: self.fetch_progress.bytes_per_second,
+            background_job_id: background_job.map(|(id, _)| *id),
+            background_stage: background_job.map(|(_, job)| job.stage.as_str()),
+            background_progress: background_job.map_or(0.0, |(_, job)| job.progress),
         };
         let context = self.egui_context.clone();
         let mut actions = UiActions::default();
@@ -528,7 +805,7 @@ impl Runtime {
 
     fn handle_ui_actions(&mut self, actions: UiActions) {
         if let Some(id) = actions.close_session {
-            self.close_session(id);
+            self.request_close_session(id);
             return;
         }
         if let Some(id) = actions.activate_session {
@@ -549,7 +826,7 @@ impl Runtime {
                 .pick_files()
         {
             for path in paths {
-                if let Err(error) = self.load_path(&path) {
+                if let Err(error) = self.start_load_path(&path) {
                     self.ui.latest_error = Some(error.to_string());
                     break;
                 }
@@ -562,6 +839,9 @@ impl Runtime {
         }
         if actions.cancel_fetch {
             self.cancel_fetch();
+        }
+        if let Some(id) = actions.cancel_background_job {
+            self.cancel_background_job(id);
         }
         if actions.save_as {
             if let Err(error) = self.save_scene_as() {
@@ -579,6 +859,7 @@ impl Runtime {
         }
         if actions.fit {
             self.fit();
+            self.mark_dirty();
         }
         if actions.reset_colors
             && let (Some(molecule), Some(display)) = (&self.molecule, &mut self.display)
@@ -602,7 +883,7 @@ impl Runtime {
                 &self.named_selections,
                 &self.named_selection_styles,
             ));
-            self.renderer.update_instances(molecule, display);
+            self.needs_cartoon_refresh = true;
             self.ui.latest_error = None;
             self.commit_edit(before);
         }
@@ -628,12 +909,14 @@ impl Runtime {
         }
         if let Some(update) = actions.camera_update {
             self.apply_camera_update(update);
+            self.mark_dirty();
         }
         if let Some(request) = actions.focus_request {
             match self.resolve_focus(request) {
                 Ok((point, description)) => {
                     self.camera.depth_of_field.focus_point = point;
                     self.focus_description = description;
+                    self.mark_dirty();
                     self.ui.latest_error = None;
                 }
                 Err(error) => self.ui.latest_error = Some(error.to_string()),
@@ -644,6 +927,7 @@ impl Runtime {
                 Ok((point, description)) => {
                     self.camera.set_pivot(point);
                     self.pivot_description = description;
+                    self.mark_dirty();
                     self.ui.latest_error = None;
                 }
                 Err(error) => self.ui.latest_error = Some(error.to_string()),
@@ -655,13 +939,14 @@ impl Runtime {
         self.session_order
             .iter()
             .filter_map(|id| {
-                if *id == self.active_session_id && self.molecule.is_some() {
+                if *id == self.active_session_id && self.loaded_filename.is_some() {
                     Some(SessionTab {
                         id: *id,
                         label: session_label(
                             self.molecule_id.as_deref(),
                             self.loaded_filename.as_deref(),
                         ),
+                        dirty: self.dirty,
                     })
                 } else {
                     self.inactive_sessions
@@ -674,7 +959,7 @@ impl Runtime {
     }
 
     fn begin_new_session(&mut self) {
-        if self.molecule.is_some() {
+        if self.molecule.is_some() || self.loaded_filename.is_some() {
             let mut previous = DocumentSession::empty(self.active_session_id, self.viewport);
             self.swap_active_document(&mut previous);
             self.inactive_sessions.push(previous);
@@ -700,12 +985,87 @@ impl Runtime {
         let mut target = self.inactive_sessions.remove(position);
         let mut previous = DocumentSession::empty(self.active_session_id, self.viewport);
         self.swap_active_document(&mut previous);
-        if previous.molecule.is_some() {
+        if previous.molecule.is_some() || previous.loaded_filename.is_some() {
             self.inactive_sessions.push(previous);
         }
         self.active_session_id = id;
         self.swap_active_document(&mut target);
         self.sync_active_document();
+    }
+
+    fn request_close_session(&mut self, id: u64) {
+        if id != self.active_session_id {
+            self.activate_session(id);
+        }
+        if id == self.active_session_id && self.confirm_active_document_close() {
+            self.close_session(id);
+        }
+    }
+
+    fn request_exit(&mut self) -> bool {
+        let ids = self.session_order.clone();
+        for id in ids {
+            if id != self.active_session_id {
+                self.activate_session(id);
+            }
+            if self.molecule.is_some() && !self.confirm_active_document_close() {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn confirm_active_document_close(&mut self) -> bool {
+        if !self.dirty {
+            return true;
+        }
+        let label = session_label(self.molecule_id.as_deref(), self.loaded_filename.as_deref());
+        let answer = rfd::MessageDialog::new()
+            .set_parent(self.window.as_ref())
+            .set_level(rfd::MessageLevel::Warning)
+            .set_title("Unsaved Molecule scene")
+            .set_description(format!("Save changes to “{label}”?"))
+            .set_buttons(rfd::MessageButtons::YesNoCancelCustom(
+                "Save".into(),
+                "Discard".into(),
+                "Cancel".into(),
+            ))
+            .show();
+        match answer {
+            rfd::MessageDialogResult::Custom(value) if value == "Save" => {
+                let result = if let Some(path) = self.scene_path.clone() {
+                    self.save_scene_to(path)
+                } else {
+                    self.save_scene_as()
+                };
+                if let Err(error) = result {
+                    self.ui.latest_error = Some(error.to_string());
+                    return false;
+                }
+                !self.dirty
+            }
+            rfd::MessageDialogResult::Yes => {
+                let result = if let Some(path) = self.scene_path.clone() {
+                    self.save_scene_to(path)
+                } else {
+                    self.save_scene_as()
+                };
+                if let Err(error) = result {
+                    self.ui.latest_error = Some(error.to_string());
+                    return false;
+                }
+                !self.dirty
+            }
+            rfd::MessageDialogResult::Custom(value) if value == "Discard" => {
+                self.remove_recovery_file();
+                true
+            }
+            rfd::MessageDialogResult::No => {
+                self.remove_recovery_file();
+                true
+            }
+            _ => false,
+        }
     }
 
     fn close_session(&mut self, id: u64) {
@@ -754,6 +1114,7 @@ impl Runtime {
     fn swap_active_document(&mut self, session: &mut DocumentSession) {
         std::mem::swap(&mut self.molecule, &mut session.molecule);
         std::mem::swap(&mut self.hierarchy, &mut session.hierarchy);
+        std::mem::swap(&mut self.atom_bvh, &mut session.atom_bvh);
         std::mem::swap(&mut self.display, &mut session.display);
         std::mem::swap(&mut self.named_selections, &mut session.named_selections);
         std::mem::swap(
@@ -763,6 +1124,10 @@ impl Runtime {
         std::mem::swap(
             &mut self.named_selection_styles,
             &mut session.named_selection_styles,
+        );
+        std::mem::swap(
+            &mut self.named_selection_statuses,
+            &mut session.named_selection_statuses,
         );
         std::mem::swap(&mut self.measurement_lines, &mut session.measurement_lines);
         std::mem::swap(
@@ -784,6 +1149,14 @@ impl Runtime {
         std::mem::swap(&mut self.loaded_filename, &mut session.loaded_filename);
         std::mem::swap(&mut self.molecule_id, &mut session.molecule_id);
         std::mem::swap(&mut self.scene_path, &mut session.scene_path);
+        std::mem::swap(&mut self.dirty, &mut session.dirty);
+        std::mem::swap(&mut self.recovery_path, &mut session.recovery_path);
+        std::mem::swap(&mut self.autosave_due, &mut session.autosave_due);
+        std::mem::swap(&mut self.document_version, &mut session.document_version);
+        std::mem::swap(
+            &mut self.needs_cartoon_refresh,
+            &mut session.needs_cartoon_refresh,
+        );
         std::mem::swap(&mut self.camera, &mut session.camera);
         std::mem::swap(&mut self.undo_history, &mut session.undo_history);
         std::mem::swap(&mut self.redo_history, &mut session.redo_history);
@@ -791,8 +1164,9 @@ impl Runtime {
 
     fn sync_active_document(&mut self) {
         self.camera.set_viewport(self.viewport);
-        if let (Some(molecule), Some(display)) = (&self.molecule, &self.display) {
-            self.renderer.update_instances(molecule, display);
+        if self.molecule.is_some() && self.display.is_some() {
+            self.needs_cartoon_refresh = true;
+            self.schedule_cartoon_job();
         } else {
             let molecule = Molecule::default();
             let display = DisplayState::for_molecule(&molecule);
@@ -803,53 +1177,316 @@ impl Runtime {
         self.ui.latest_error = None;
     }
 
-    fn load_path(&mut self, path: &Path) -> Result<()> {
-        let contents =
-            fs::read(path).with_context(|| format!("could not read {}", path.display()))?;
+    fn start_load_path(&mut self, path: &Path) -> Result<()> {
         let filename = path.file_name().map_or_else(
             || path.display().to_string(),
-            |name| name.to_string_lossy().into(),
+            |name| name.to_string_lossy().into_owned(),
         );
-        if is_scene_document(&contents) {
-            let document = decode_scene(&contents)
-                .with_context(|| format!("could not decode scene {}", path.display()))?;
-            return self.load_scene_document(document, filename, path.to_owned());
-        }
-        let (molecule, _format) = parse_structure(&contents, &filename)
-            .with_context(|| format!("could not parse {}", path.display()))?;
-        let hierarchy = MoleculeHierarchy::from_molecule(&molecule);
-        let display = DisplayState::for_molecule(&molecule);
-        let molecule_id = molecule_id_from_structure(&contents, &filename);
         self.begin_new_session();
-        self.ui.document_changed();
-        self.renderer.update_instances(&molecule, &display);
-        self.loaded_filename = Some(filename);
-        self.molecule_id = Some(molecule_id);
-        self.scene_path = None;
-        self.molecule = Some(molecule);
-        self.hierarchy = Some(hierarchy);
-        self.display = Some(display);
+        self.molecule = None;
+        self.hierarchy = None;
+        self.atom_bvh = None;
+        self.display = None;
         self.named_selections.clear();
         self.named_selection_expressions.clear();
         self.named_selection_styles.clear();
+        self.named_selection_statuses.clear();
         self.measurement_lines.clear();
-        self.next_measurement_id = 1;
         self.hierarchy_names.clear();
-        self.renderer.update_measurements(&self.measurement_lines);
         self.inspection = None;
         self.hierarchy_selection.clear();
         self.hierarchy_selection_anchor = None;
-        self.undo_history.clear();
-        self.redo_history.clear();
-        self.fit();
-        self.camera.depth_of_field.focus_point = self.camera.target;
-        self.focus_description = "Molecule center".into();
-        self.pivot_description = "Molecule center".into();
+        self.loaded_filename = Some(filename);
+        self.molecule_id = Some("Loading…".into());
+        self.scene_path = None;
+        self.dirty = false;
+        self.document_version = self.document_version.wrapping_add(1);
+        self.renderer.update_measurements(&[]);
+
+        let id = self.next_job_id;
+        self.next_job_id = self.next_job_id.wrapping_add(1);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let job = JobRequest::Load {
+            id,
+            session_id: self.active_session_id,
+            version: self.document_version,
+            path: path.to_owned(),
+            cancel: cancel.clone(),
+        };
+        self.submit_job(job)?;
+        self.background_jobs.insert(
+            id,
+            BackgroundJob {
+                session_id: self.active_session_id,
+                version: self.document_version,
+                kind: JobKind::Load,
+                stage: "Queued for loading".into(),
+                progress: 0.0,
+                cancel,
+            },
+        );
         self.ui.latest_error = None;
         Ok(())
     }
 
+    fn submit_job(&self, request: JobRequest) -> Result<()> {
+        self.job_sender
+            .try_send(request)
+            .map_err(|error| match error {
+                TrySendError::Full(_) => anyhow::anyhow!(
+                    "background worker queue is full; wait for the current operation or cancel it"
+                ),
+                TrySendError::Disconnected(_) => {
+                    anyhow::anyhow!("background worker stopped unexpectedly")
+                }
+            })
+    }
+
+    fn cancel_background_job(&mut self, id: u64) {
+        if let Some(job) = self.background_jobs.get(&id) {
+            job.cancel.store(true, Ordering::Relaxed);
+        }
+    }
+
+    fn poll_background_jobs(&mut self) {
+        while let Ok(event) = self.job_receiver.try_recv() {
+            match event {
+                JobEvent::Progress {
+                    id,
+                    stage,
+                    progress,
+                } => {
+                    if let Some(job) = self.background_jobs.get_mut(&id) {
+                        job.stage = stage.into();
+                        job.progress = progress.clamp(0.0, 1.0);
+                    }
+                }
+                JobEvent::Complete { id, result } => {
+                    let Some(job) = self.background_jobs.remove(&id) else {
+                        continue;
+                    };
+                    match *result {
+                        Ok(JobOutput::Loaded(payload)) => {
+                            self.apply_loaded_job(job.session_id, job.version, *payload);
+                        }
+                        Ok(JobOutput::Saved(path)) => {
+                            self.apply_saved_job(job.session_id, job.version, path);
+                        }
+                        Ok(JobOutput::Cartoon(prepared)) => {
+                            if job.session_id == self.active_session_id
+                                && job.version == self.document_version
+                                && let (Some(molecule), Some(display)) =
+                                    (&self.molecule, &self.display)
+                            {
+                                self.renderer
+                                    .update_prepared_cartoon(molecule, display, prepared);
+                            }
+                        }
+                        Ok(JobOutput::Cancelled) => {}
+                        Err(error) if error == "background operation canceled" => {}
+                        Err(error) => self.ui.latest_error = Some(error),
+                    }
+                }
+            }
+        }
+        if self.needs_cartoon_refresh
+            && !self
+                .background_jobs
+                .values()
+                .any(|job| job.kind == JobKind::Cartoon && job.session_id == self.active_session_id)
+        {
+            self.schedule_cartoon_job();
+        }
+    }
+
+    fn schedule_cartoon_job(&mut self) {
+        let (Some(molecule), Some(display)) = (&self.molecule, &self.display) else {
+            return;
+        };
+        for job in self
+            .background_jobs
+            .values()
+            .filter(|job| job.kind == JobKind::Cartoon && job.session_id == self.active_session_id)
+        {
+            job.cancel.store(true, Ordering::Relaxed);
+        }
+        let id = self.next_job_id;
+        self.next_job_id = self.next_job_id.wrapping_add(1);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let request = JobRequest::Cartoon {
+            id,
+            session_id: self.active_session_id,
+            version: self.document_version,
+            molecule: Box::new(molecule.clone()),
+            display: Box::new(display.clone()),
+            cancel: cancel.clone(),
+        };
+        if self.submit_job(request).is_err() {
+            self.needs_cartoon_refresh = true;
+            return;
+        }
+        self.needs_cartoon_refresh = false;
+        self.background_jobs.insert(
+            id,
+            BackgroundJob {
+                session_id: self.active_session_id,
+                version: self.document_version,
+                kind: JobKind::Cartoon,
+                stage: "Queued ribbon geometry".into(),
+                progress: 0.0,
+                cancel,
+            },
+        );
+    }
+
+    fn apply_loaded_job(&mut self, session_id: u64, version: u64, payload: LoadedPayload) {
+        let original_session = self.active_session_id;
+        if session_id != original_session {
+            self.activate_session(session_id);
+        }
+        if self.active_session_id == session_id && self.document_version == version {
+            match payload {
+                LoadedPayload::Structure {
+                    filename,
+                    molecule_id,
+                    molecule,
+                    hierarchy,
+                    atom_bvh,
+                    display,
+                } => {
+                    self.loaded_filename = Some(filename);
+                    self.molecule_id = Some(molecule_id);
+                    self.scene_path = None;
+                    self.molecule = Some(molecule);
+                    self.hierarchy = Some(hierarchy);
+                    self.atom_bvh = Some(atom_bvh);
+                    self.display = Some(*display);
+                    self.named_selections.clear();
+                    self.named_selection_expressions.clear();
+                    self.named_selection_styles.clear();
+                    self.named_selection_statuses.clear();
+                    self.measurement_lines.clear();
+                    self.next_measurement_id = 1;
+                    self.hierarchy_names.clear();
+                    self.inspection = None;
+                    self.hierarchy_selection.clear();
+                    self.hierarchy_selection_anchor = None;
+                    self.undo_history.clear();
+                    self.redo_history.clear();
+                    self.fit();
+                    self.camera.depth_of_field.focus_point = self.camera.target;
+                    self.focus_description = "Molecule center".into();
+                    self.pivot_description = "Molecule center".into();
+                }
+                LoadedPayload::Scene {
+                    filename,
+                    path,
+                    document,
+                    hierarchy,
+                    atom_bvh,
+                } => {
+                    let SceneDocument {
+                        source_name,
+                        molecule,
+                        display,
+                        named_selections,
+                        named_selection_expressions,
+                        named_selection_styles,
+                        measurement_lines,
+                        hierarchy_names,
+                        inspection,
+                        hierarchy_selection,
+                        hierarchy_selection_anchor,
+                        focus_description,
+                        pivot_description,
+                        mut camera,
+                    } = *document;
+                    self.molecule_id = Some(if source_name.trim().is_empty() {
+                        molecule_id_from_filename(&filename)
+                    } else {
+                        molecule_id_from_filename(&source_name)
+                    });
+                    camera.set_viewport(self.viewport);
+                    self.next_measurement_id = measurement_lines
+                        .iter()
+                        .map(|line| line.id)
+                        .max()
+                        .unwrap_or(0)
+                        .saturating_add(1);
+                    self.loaded_filename = Some(filename);
+                    self.scene_path = Some(path);
+                    self.molecule = Some(molecule);
+                    self.hierarchy = Some(hierarchy);
+                    self.atom_bvh = Some(atom_bvh);
+                    self.display = Some(display);
+                    self.named_selections = named_selections;
+                    self.named_selection_expressions = named_selection_expressions;
+                    self.named_selection_styles = named_selection_styles;
+                    self.measurement_lines = measurement_lines;
+                    self.hierarchy_names = hierarchy_names
+                        .into_iter()
+                        .map(|(target, name)| (inspection_target(target), name))
+                        .collect();
+                    self.inspection = inspection.map(inspection_target);
+                    self.hierarchy_selection = hierarchy_selection
+                        .into_iter()
+                        .map(inspection_target)
+                        .collect();
+                    self.hierarchy_selection_anchor =
+                        hierarchy_selection_anchor.map(inspection_target);
+                    self.focus_description = focus_description;
+                    self.pivot_description = pivot_description;
+                    self.camera = camera;
+                    self.undo_history.clear();
+                    self.redo_history.clear();
+                    self.recalculate_named_selections();
+                }
+            }
+            self.dirty = false;
+            self.recovery_path = None;
+            self.autosave_due = None;
+            self.needs_cartoon_refresh = true;
+            self.renderer.update_measurements(&self.measurement_lines);
+            self.schedule_cartoon_job();
+            self.ui.document_changed();
+            self.ui.latest_error = None;
+        }
+        if session_id != original_session && self.session_order.contains(&original_session) {
+            self.activate_session(original_session);
+        }
+    }
+
+    fn apply_saved_job(&mut self, session_id: u64, version: u64, path: PathBuf) {
+        let original_session = self.active_session_id;
+        if session_id != original_session {
+            self.activate_session(session_id);
+        }
+        if self.active_session_id == session_id {
+            self.loaded_filename = Some(path.file_name().map_or_else(
+                || path.display().to_string(),
+                |name| name.to_string_lossy().into_owned(),
+            ));
+            self.scene_path = Some(path);
+            if self.document_version == version {
+                self.dirty = false;
+                self.autosave_due = None;
+                self.remove_recovery_file();
+            }
+            self.ui.latest_error = None;
+        }
+        if session_id != original_session && self.session_order.contains(&original_session) {
+            self.activate_session(original_session);
+        }
+    }
+
     fn write_scene(&self, path: &Path) -> Result<()> {
+        let document = self.scene_document()?;
+        let contents = encode_scene(&document).context("could not encode scene")?;
+        atomic_write(path, &contents)
+            .with_context(|| format!("could not atomically write scene {}", path.display()))
+    }
+
+    fn scene_document(&self) -> Result<SceneDocument> {
         let molecule = self
             .molecule
             .as_ref()
@@ -858,7 +1495,7 @@ impl Runtime {
             .display
             .as_ref()
             .context("display state is unavailable")?;
-        let document = SceneDocument {
+        Ok(SceneDocument {
             source_name: self
                 .molecule_id
                 .clone()
@@ -886,10 +1523,7 @@ impl Runtime {
             focus_description: self.focus_description.clone(),
             pivot_description: self.pivot_description.clone(),
             camera: self.camera.clone(),
-        };
-        let contents = encode_scene(&document).context("could not encode scene")?;
-        fs::write(path, contents)
-            .with_context(|| format!("could not write scene {}", path.display()))
+        })
     }
 
     fn save_scene_as(&mut self) -> Result<()> {
@@ -913,12 +1547,36 @@ impl Runtime {
 
     fn save_scene_to(&mut self, path: PathBuf) -> Result<()> {
         let path = molecule_path(path);
-        self.write_scene(&path)?;
-        self.loaded_filename = Some(path.file_name().map_or_else(
-            || path.display().to_string(),
-            |name| name.to_string_lossy().into_owned(),
-        ));
-        self.scene_path = Some(path);
+        if self
+            .background_jobs
+            .values()
+            .any(|job| job.kind == JobKind::Save && job.session_id == self.active_session_id)
+        {
+            anyhow::bail!("a Save operation is already running for this tab");
+        }
+        let document = self.scene_document()?;
+        let id = self.next_job_id;
+        self.next_job_id = self.next_job_id.wrapping_add(1);
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.submit_job(JobRequest::Save {
+            id,
+            session_id: self.active_session_id,
+            version: self.document_version,
+            path: path.clone(),
+            document: Box::new(document),
+            cancel: cancel.clone(),
+        })?;
+        self.background_jobs.insert(
+            id,
+            BackgroundJob {
+                session_id: self.active_session_id,
+                version: self.document_version,
+                kind: JobKind::Save,
+                stage: "Queued for saving".into(),
+                progress: 0.0,
+                cancel,
+            },
+        );
         self.ui.latest_error = None;
         Ok(())
     }
@@ -927,7 +1585,9 @@ impl Runtime {
         &mut self,
         document: SceneDocument,
         filename: String,
-        scene_path: PathBuf,
+        scene_path: Option<PathBuf>,
+        dirty: bool,
+        recovery_path: Option<PathBuf>,
     ) -> Result<()> {
         self.begin_new_session();
         self.ui.document_changed();
@@ -954,8 +1614,8 @@ impl Runtime {
             molecule_id_from_filename(&source_name)
         };
         let hierarchy = MoleculeHierarchy::from_molecule(&molecule);
+        let atom_bvh = AtomBvh::build(&molecule);
         camera.set_viewport(self.viewport);
-        self.renderer.update_instances(&molecule, &display);
         self.renderer.update_measurements(&measurement_lines);
         self.next_measurement_id = measurement_lines
             .iter()
@@ -965,13 +1625,15 @@ impl Runtime {
             .saturating_add(1);
         self.loaded_filename = Some(filename);
         self.molecule_id = Some(molecule_id);
-        self.scene_path = Some(scene_path);
+        self.scene_path = scene_path;
         self.molecule = Some(molecule);
         self.hierarchy = Some(hierarchy);
+        self.atom_bvh = Some(atom_bvh);
         self.display = Some(display);
         self.named_selections = named_selections;
         self.named_selection_expressions = named_selection_expressions;
         self.named_selection_styles = named_selection_styles;
+        self.recalculate_named_selections();
         self.measurement_lines = measurement_lines;
         self.hierarchy_names = hierarchy_names
             .into_iter()
@@ -988,6 +1650,11 @@ impl Runtime {
         self.camera = camera;
         self.undo_history.clear();
         self.redo_history.clear();
+        self.dirty = dirty;
+        self.recovery_path = recovery_path;
+        self.autosave_due = None;
+        self.needs_cartoon_refresh = true;
+        self.schedule_cartoon_job();
         self.ui.latest_error = None;
         Ok(())
     }
@@ -1061,7 +1728,7 @@ impl Runtime {
         self.ui.close_fetch();
         match result {
             Ok(path) => {
-                if let Err(error) = self.load_path(&path) {
+                if let Err(error) = self.start_load_path(&path) {
                     self.ui.latest_error = Some(error.to_string());
                 }
             }
@@ -1070,60 +1737,136 @@ impl Runtime {
         }
     }
 
-    fn editable_snapshot(&self) -> EditableSnapshot {
-        EditableSnapshot {
-            display: self.display.clone(),
-            named_selections: self.named_selections.clone(),
-            named_selection_expressions: self.named_selection_expressions.clone(),
-            named_selection_styles: self.named_selection_styles.clone(),
-            measurement_lines: self.measurement_lines.clone(),
+    fn begin_edit(&self) -> EditTransaction {
+        let mut names = BTreeSet::new();
+        names.extend(self.named_selections.keys().cloned());
+        names.extend(self.named_selection_expressions.keys().cloned());
+        names.extend(self.named_selection_styles.keys().cloned());
+        let named_selections = names
+            .into_iter()
+            .filter_map(|name| {
+                self.named_selections.get(&name).cloned().map(|selection| {
+                    (
+                        name.clone(),
+                        NamedSelectionRecord {
+                            selection,
+                            expression: self.named_selection_expressions.get(&name).cloned(),
+                            style: self.named_selection_styles.get(&name).copied(),
+                        },
+                    )
+                })
+            })
+            .collect();
+        let measurements = self
+            .measurement_lines
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(index, line)| (line.id, IndexedMeasurement { index, line }))
+            .collect();
+        EditTransaction {
+            display: self.display.as_ref().map(DisplayState::edit_state),
+            named_selections,
+            measurements,
             hierarchy_names: self.hierarchy_names.clone(),
-            inspection: self.inspection,
-            hierarchy_selection: self.hierarchy_selection.clone(),
-            hierarchy_selection_anchor: self.hierarchy_selection_anchor,
+            workspace: WorkspaceSelection {
+                inspection: self.inspection,
+                hierarchy_selection: self.hierarchy_selection.clone(),
+                hierarchy_selection_anchor: self.hierarchy_selection_anchor,
+            },
         }
     }
 
-    fn commit_edit(&mut self, before: EditableSnapshot) {
-        if before == self.editable_snapshot() {
+    fn commit_edit(&mut self, before: EditTransaction) {
+        let operation = EditOperation::between(before, self.begin_edit());
+        if operation.changes.is_empty() {
             return;
         }
-        push_history(&mut self.undo_history, before);
+        push_history(&mut self.undo_history, operation);
         self.redo_history.clear();
+        self.mark_dirty();
     }
 
     fn undo(&mut self) -> bool {
-        let Some(previous) = self.undo_history.pop_back() else {
+        let Some(operation) = self.undo_history.pop_back() else {
             return false;
         };
-        let current = self.editable_snapshot();
-        push_history(&mut self.redo_history, current);
-        self.restore_editable_snapshot(previous);
+        self.apply_edit_operation(&operation, HistoryDirection::Undo);
+        push_history(&mut self.redo_history, operation);
+        self.mark_dirty();
         true
     }
 
     fn redo(&mut self) -> bool {
-        let Some(next) = self.redo_history.pop_back() else {
+        let Some(operation) = self.redo_history.pop_back() else {
             return false;
         };
-        let current = self.editable_snapshot();
-        push_history(&mut self.undo_history, current);
-        self.restore_editable_snapshot(next);
+        self.apply_edit_operation(&operation, HistoryDirection::Redo);
+        push_history(&mut self.undo_history, operation);
+        self.mark_dirty();
         true
     }
 
-    fn restore_editable_snapshot(&mut self, snapshot: EditableSnapshot) {
-        self.display = snapshot.display;
-        self.named_selections = snapshot.named_selections;
-        self.named_selection_expressions = snapshot.named_selection_expressions;
-        self.named_selection_styles = snapshot.named_selection_styles;
-        self.measurement_lines = snapshot.measurement_lines;
-        self.hierarchy_names = snapshot.hierarchy_names;
-        self.inspection = snapshot.inspection;
-        self.hierarchy_selection = snapshot.hierarchy_selection;
-        self.hierarchy_selection_anchor = snapshot.hierarchy_selection_anchor;
+    fn apply_edit_operation(&mut self, operation: &EditOperation, direction: HistoryDirection) {
+        for change in &operation.changes {
+            match change {
+                EditChange::Display(change) => {
+                    let state = history_value(change, direction).clone();
+                    match (state, &self.molecule, &mut self.display) {
+                        (Some(state), Some(molecule), Some(display)) => {
+                            display.restore_edit_state(molecule, state);
+                        }
+                        (None, _, _) => self.display = None,
+                        _ => {}
+                    }
+                }
+                EditChange::NamedSelection(change) => {
+                    let value = history_value(&change.value, direction).clone();
+                    if let Some(value) = value {
+                        self.named_selections
+                            .insert(change.name.clone(), value.selection);
+                        set_optional_map_value(
+                            &mut self.named_selection_expressions,
+                            change.name.clone(),
+                            value.expression,
+                        );
+                        set_optional_map_value(
+                            &mut self.named_selection_styles,
+                            change.name.clone(),
+                            value.style,
+                        );
+                    } else {
+                        self.named_selections.remove(&change.name);
+                        self.named_selection_expressions.remove(&change.name);
+                        self.named_selection_styles.remove(&change.name);
+                        self.named_selection_statuses.remove(&change.name);
+                    }
+                }
+                EditChange::Measurement(change) => {
+                    self.measurement_lines.retain(|line| line.id != change.id);
+                    if let Some(value) = history_value(&change.value, direction) {
+                        let index = value.index.min(self.measurement_lines.len());
+                        self.measurement_lines.insert(index, value.line.clone());
+                    }
+                }
+                EditChange::HierarchyName(change) => {
+                    set_optional_map_value(
+                        &mut self.hierarchy_names,
+                        change.target,
+                        history_value(&change.value, direction).clone(),
+                    );
+                }
+                EditChange::Workspace(change) => {
+                    let value = history_value(change, direction);
+                    self.inspection = value.inspection;
+                    self.hierarchy_selection = value.hierarchy_selection.clone();
+                    self.hierarchy_selection_anchor = value.hierarchy_selection_anchor;
+                }
+            }
+        }
+        self.recalculate_named_selections();
+        self.renderer.update_measurements(&self.measurement_lines);
         self.ui.latest_error = None;
-        self.refresh_instances();
     }
 
     fn fit(&mut self) {
@@ -1132,48 +1875,222 @@ impl Runtime {
         }
     }
 
-    fn apply_command(&mut self, command: Command) -> Result<()> {
-        let (Some(molecule), Some(display)) = (&self.molecule, &mut self.display) else {
-            anyhow::bail!("load a PDB file before executing commands");
+    fn mark_dirty(&mut self) {
+        if self.molecule.is_none() {
+            return;
+        }
+        self.dirty = true;
+        self.document_version = self.document_version.wrapping_add(1);
+        self.autosave_due = Some(Instant::now() + AUTOSAVE_DELAY);
+    }
+
+    fn remove_recovery_file(&mut self) {
+        if let Some(path) = self.recovery_path.take() {
+            let _ = fs::remove_file(path);
+        }
+    }
+
+    fn next_autosave_deadline(&self) -> Option<Instant> {
+        std::iter::once(self.autosave_due)
+            .chain(
+                self.inactive_sessions
+                    .iter()
+                    .map(|session| session.autosave_due),
+            )
+            .flatten()
+            .min()
+    }
+
+    fn autosave_due_documents(&mut self) {
+        let now = Instant::now();
+        let mut errors = Vec::new();
+        if self.dirty && self.autosave_due.is_some_and(|deadline| deadline <= now) {
+            let path = self
+                .recovery_path
+                .clone()
+                .map(Ok)
+                .unwrap_or_else(|| recovery_path_for(self.active_session_id));
+            match path.and_then(|path| {
+                self.write_scene(&path)?;
+                Ok(path)
+            }) {
+                Ok(path) => {
+                    self.recovery_path = Some(path);
+                    self.autosave_due = None;
+                }
+                Err(error) => {
+                    errors.push(error.to_string());
+                    self.autosave_due = Some(now + Duration::from_secs(30));
+                }
+            }
+        }
+        for session in &mut self.inactive_sessions {
+            if !session.dirty || !session.autosave_due.is_some_and(|deadline| deadline <= now) {
+                continue;
+            }
+            let path = session
+                .recovery_path
+                .clone()
+                .map(Ok)
+                .unwrap_or_else(|| recovery_path_for(session.id));
+            match path.and_then(|path| {
+                session.write_scene(&path)?;
+                Ok(path)
+            }) {
+                Ok(path) => {
+                    session.recovery_path = Some(path);
+                    session.autosave_due = None;
+                }
+                Err(error) => {
+                    errors.push(error.to_string());
+                    session.autosave_due = Some(now + Duration::from_secs(30));
+                }
+            }
+        }
+        if !errors.is_empty() {
+            self.ui.latest_error = Some(format!("autosave failed: {}", errors.join("; ")));
+        }
+    }
+
+    fn offer_recovery_files(&mut self) {
+        let Ok(directory) = recovery_directory() else {
+            return;
         };
+        let Ok(entries) = fs::read_dir(directory) else {
+            return;
+        };
+        let mut paths: Vec<_> = entries
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.ends_with(".recovery.mol"))
+            })
+            .collect();
+        paths.sort();
+        for path in paths {
+            let contents = match read_local_file_limited(&path) {
+                Ok(contents) => contents,
+                Err(error) => {
+                    self.ui.latest_error = Some(format!(
+                        "could not inspect recovery {}: {error:#}",
+                        path.display()
+                    ));
+                    continue;
+                }
+            };
+            let document = match decode_scene(&contents) {
+                Ok(document) => document,
+                Err(error) => {
+                    self.ui.latest_error = Some(format!(
+                        "invalid recovery document {}: {error}",
+                        path.display()
+                    ));
+                    continue;
+                }
+            };
+            let label = if document.source_name.trim().is_empty() {
+                "untitled molecule".to_owned()
+            } else {
+                document.source_name.clone()
+            };
+            let answer = rfd::MessageDialog::new()
+                .set_parent(self.window.as_ref())
+                .set_level(rfd::MessageLevel::Warning)
+                .set_title("Recovered Molecule scene")
+                .set_description(format!(
+                    "An autosaved scene for “{label}” was found. Restore it?"
+                ))
+                .set_buttons(rfd::MessageButtons::YesNoCancelCustom(
+                    "Restore".into(),
+                    "Discard".into(),
+                    "Later".into(),
+                ))
+                .show();
+            match answer {
+                rfd::MessageDialogResult::Custom(value) if value == "Restore" => {
+                    let filename = format!("{label} (Recovered)");
+                    if let Err(error) =
+                        self.load_scene_document(document, filename, None, true, Some(path.clone()))
+                    {
+                        self.ui.latest_error = Some(error.to_string());
+                    }
+                }
+                rfd::MessageDialogResult::Yes => {
+                    let filename = format!("{label} (Recovered)");
+                    if let Err(error) =
+                        self.load_scene_document(document, filename, None, true, Some(path.clone()))
+                    {
+                        self.ui.latest_error = Some(error.to_string());
+                    }
+                }
+                rfd::MessageDialogResult::Custom(value) if value == "Discard" => {
+                    let _ = fs::remove_file(path);
+                }
+                rfd::MessageDialogResult::No => {
+                    let _ = fs::remove_file(path);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn apply_command(&mut self, command: Command) -> Result<()> {
+        if self.molecule.is_none() || self.display.is_none() {
+            anyhow::bail!("load a PDB file before executing commands");
+        }
         match command {
             Command::Select {
                 name,
                 source,
                 selection,
             } => {
-                let selection = evaluate_with_named(&selection, molecule, &self.named_selections)?;
-                display.selection = selection.flags().to_vec();
+                let selection = evaluate_with_named(
+                    &selection,
+                    self.molecule.as_ref().unwrap_or_else(|| unreachable!()),
+                    &self.named_selections,
+                )?;
                 if let Some(name) = name {
-                    self.named_selections.insert(name.clone(), selection);
+                    validate_unique_name(&self.named_selections, &name, None)
+                        .map_err(anyhow::Error::msg)?;
+                    self.named_selections
+                        .insert(name.clone(), selection.clone());
                     self.named_selection_expressions
                         .insert(name.clone(), source);
                     self.named_selection_styles.entry(name.clone()).or_default();
-                    display.replace_named_layers(&named_display_layers(
-                        &self.named_selections,
-                        &self.named_selection_styles,
-                    ));
+                    self.recalculate_named_selections();
+                }
+                if let Some(display) = &mut self.display {
+                    display.set_selection(selection.flags().clone());
                 }
                 self.inspection = None;
                 self.hierarchy_selection.clear();
                 self.hierarchy_selection_anchor = None;
             }
             Command::Color { color, selection } => {
-                let indices: Vec<_> =
-                    evaluate_with_named(&selection, molecule, &self.named_selections)?
-                        .indices()
-                        .collect();
-                display.set_color_override(&indices, DisplayLevel::Atom, Some(color.0));
+                let indices: Vec<_> = evaluate_with_named(
+                    &selection,
+                    self.molecule.as_ref().unwrap_or_else(|| unreachable!()),
+                    &self.named_selections,
+                )?
+                .indices()
+                .collect();
+                if let Some(display) = &mut self.display {
+                    display.set_color_override(&indices, DisplayLevel::Atom, Some(color.0));
+                }
             }
             Command::Show {
                 representation,
                 selection,
             } => {
                 let mask = representation_mask(representation);
-                for index in
-                    evaluate_with_named(&selection, molecule, &self.named_selections)?.indices()
-                {
-                    display.representations[index].insert(mask);
+                let selected = evaluate_with_named(
+                    &selection,
+                    self.molecule.as_ref().unwrap_or_else(|| unreachable!()),
+                    &self.named_selections,
+                )?;
+                if let Some(display) = &mut self.display {
+                    display.set_representation(selected.indices(), mask, true);
                 }
             }
             Command::Hide {
@@ -1181,14 +2098,17 @@ impl Runtime {
                 selection,
             } => {
                 let mask = representation_mask(representation);
-                for index in
-                    evaluate_with_named(&selection, molecule, &self.named_selections)?.indices()
-                {
-                    display.representations[index].remove(mask);
+                let selected = evaluate_with_named(
+                    &selection,
+                    self.molecule.as_ref().unwrap_or_else(|| unreachable!()),
+                    &self.named_selections,
+                )?;
+                if let Some(display) = &mut self.display {
+                    display.set_representation(selected.indices(), mask, false);
                 }
             }
         }
-        self.renderer.update_instances(molecule, display);
+        self.refresh_instances();
         Ok(())
     }
 
@@ -1214,15 +2134,18 @@ impl Runtime {
         self.camera.set_viewport(self.viewport);
     }
 
-    fn pick_at(&mut self, position: PhysicalPosition<f64>) {
+    fn request_gpu_pick(&mut self, position: PhysicalPosition<f64>) {
         let point = Vec2::new(position.x as f32, position.y as f32);
-        let picked = self
+        if !self.viewport.contains(point) || self.molecule.is_none() {
+            return;
+        }
+        let cpu_fallback = self
             .camera
             .screen_ray(point, self.viewport)
             .and_then(|ray| {
                 self.molecule.as_ref().and_then(|molecule| {
                     let display = self.display.as_ref();
-                    pick_atom_filtered_with_radius(
+                    self.atom_bvh.as_ref()?.pick_with_radius(
                         molecule,
                         ray,
                         |index| {
@@ -1230,7 +2153,7 @@ impl Runtime {
                                 let Some(atom) = molecule.atoms.get(index) else {
                                     return false;
                                 };
-                                display.visible.get(index).copied().unwrap_or(false)
+                                display.visible.get(index).unwrap_or(false)
                                     && (matches!(
                                         display.modes.get(index),
                                         Some(DisplayMode::BallAndStick | DisplayMode::Toon)
@@ -1250,6 +2173,43 @@ impl Runtime {
                     )
                 })
             });
+        let request_id = self.next_pick_request_id;
+        self.next_pick_request_id = self.next_pick_request_id.wrapping_add(1);
+        self.renderer.request_pick(
+            request_id,
+            position.x.max(0.0) as u32,
+            position.y.max(0.0) as u32,
+        );
+        self.pending_pick = Some(PendingPick {
+            request_id,
+            session_id: self.active_session_id,
+            document_version: self.document_version,
+            cpu_fallback,
+        });
+    }
+
+    fn poll_pick_result(&mut self) {
+        let Some((request_id, result)) = self.renderer.poll_pick() else {
+            return;
+        };
+        let Some(pending) = self.pending_pick.take() else {
+            return;
+        };
+        if pending.request_id != request_id
+            || pending.session_id != self.active_session_id
+            || pending.document_version != self.document_version
+        {
+            return;
+        }
+        let picked = result.unwrap_or(pending.cpu_fallback);
+        if picked.is_some_and(|index| {
+            self.molecule
+                .as_ref()
+                .is_none_or(|molecule| index >= molecule.atoms.len())
+        }) {
+            return;
+        }
+        let before = self.editable_snapshot();
         match picked {
             Some(atom_index) => {
                 let target = InspectionTarget::Atom(atom_index);
@@ -1258,13 +2218,14 @@ impl Runtime {
                 self.hierarchy_selection_anchor = Some(target);
                 self.select_indices(vec![atom_index], Some(target));
             }
-            None if self.viewport.contains(point) => {
+            None => {
                 self.hierarchy_selection.clear();
                 self.hierarchy_selection_anchor = None;
                 self.select_indices(Vec::new(), None);
             }
-            None => {}
         }
+        self.commit_edit(before);
+        self.window.request_redraw();
     }
 
     fn handle_manager_action(&mut self, action: ManagerAction) {
@@ -1401,32 +2362,29 @@ impl Runtime {
                 if let Some(selection) = self.named_selections.get(&name) {
                     self.hierarchy_selection.clear();
                     self.hierarchy_selection_anchor = None;
-                    self.set_selection(selection.flags().to_vec(), None);
+                    let flags = selection.flags().clone();
+                    if let Some(display) = &mut self.display {
+                        display.set_selection(flags);
+                    }
+                    self.inspection = None;
+                    self.refresh_instances();
                 }
             }
             ManagerAction::UpdateNamedExpression { name, expression } => {
                 let result = (|| -> Result<()> {
-                    let molecule = self
-                        .molecule
+                    self.molecule
                         .as_ref()
                         .context("load a PDB file before editing a selection")?;
                     if !self.named_selections.contains_key(&name) {
                         anyhow::bail!("named selection '{name}' does not exist");
                     }
-                    let parsed = parse_selection(&expression)?;
-                    let selection = evaluate_with_named(&parsed, molecule, &self.named_selections)?;
-                    self.named_selections
-                        .insert(name.clone(), selection.clone());
                     self.named_selection_expressions
                         .insert(name.clone(), expression);
                     self.named_selection_styles.entry(name).or_default();
+                    self.recalculate_named_selections();
                     self.hierarchy_selection.clear();
                     self.hierarchy_selection_anchor = None;
                     self.inspection = None;
-                    if let Some(display) = &mut self.display {
-                        display.selection = selection.flags().to_vec();
-                    }
-                    self.rebuild_named_display_layers();
                     Ok(())
                 })();
                 match result {
@@ -1438,7 +2396,8 @@ impl Runtime {
                 self.named_selections.remove(&name);
                 self.named_selection_expressions.remove(&name);
                 self.named_selection_styles.remove(&name);
-                self.rebuild_named_display_layers();
+                self.named_selection_statuses.remove(&name);
+                self.recalculate_named_selections();
             }
             ManagerAction::CreateMeasurement {
                 first_selection,
@@ -1476,22 +2435,21 @@ impl Runtime {
             }
             ManagerAction::SaveCurrentSelection(name) => {
                 let result = (|| -> Result<()> {
-                    if self.named_selections.contains_key(&name) {
-                        anyhow::bail!("named selection '{name}' already exists");
-                    }
+                    validate_unique_name(&self.named_selections, &name, None)
+                        .map_err(anyhow::Error::msg)?;
                     let flags = self
                         .display
                         .as_ref()
                         .context("load a structure before saving a selection")?
                         .selection
                         .clone();
-                    if !flags.iter().any(|selected| *selected) {
+                    if !flags.iter().any(|selected| selected) {
                         anyhow::bail!("select at least one atom first");
                     }
                     self.named_selections
-                        .insert(name.clone(), Selection::from_flags(flags));
+                        .insert(name.clone(), Selection::from_mask(flags));
                     self.named_selection_styles.entry(name).or_default();
-                    self.rebuild_named_display_layers();
+                    self.recalculate_named_selections();
                     Ok(())
                 })();
                 match result {
@@ -1511,9 +2469,8 @@ impl Runtime {
                     if old_name == new_name {
                         return Ok(());
                     }
-                    if self.named_selections.contains_key(&new_name) {
-                        anyhow::bail!("named selection '{new_name}' already exists");
-                    }
+                    validate_unique_name(&self.named_selections, &new_name, Some(&old_name))
+                        .map_err(anyhow::Error::msg)?;
                     let selection = self
                         .named_selections
                         .remove(&old_name)
@@ -1527,9 +2484,14 @@ impl Runtime {
                         self.named_selection_styles.insert(new_name.clone(), style);
                     }
                     for expression in self.named_selection_expressions.values_mut() {
-                        *expression = rename_selection_reference(expression, &old_name, &new_name);
+                        if let Ok(renamed) =
+                            rename_named_reference(expression, &old_name, &new_name)
+                        {
+                            *expression = renamed;
+                        }
                     }
-                    self.rebuild_named_display_layers();
+                    self.named_selection_statuses.remove(&old_name);
+                    self.recalculate_named_selections();
                     Ok(())
                 })();
                 match result {
@@ -1611,6 +2573,21 @@ impl Runtime {
         self.refresh_instances();
     }
 
+    fn recalculate_named_selections(&mut self) {
+        let Some(molecule) = &self.molecule else {
+            self.named_selection_statuses.clear();
+            return;
+        };
+        let resolution = resolve_named_expressions(
+            molecule,
+            &self.named_selection_expressions,
+            &self.named_selections,
+        );
+        self.named_selections = resolution.selections;
+        self.named_selection_statuses = resolution.statuses;
+        self.rebuild_named_display_layers();
+    }
+
     fn hierarchy_range(
         &self,
         anchor: InspectionTarget,
@@ -1684,7 +2661,7 @@ impl Runtime {
             let direct = display.visibility_override(source_atom, source_level);
             let state = match direct {
                 VisibilityOverride::Inherit => {
-                    if display.visible.get(source_atom).copied().unwrap_or(true) {
+                    if display.visible.get(source_atom).unwrap_or(true) {
                         VisibilityOverride::Show
                     } else {
                         VisibilityOverride::Hide
@@ -1790,12 +2767,12 @@ impl Runtime {
     }
 
     fn set_selection(&mut self, flags: Vec<bool>, inspection: Option<InspectionTarget>) {
-        let (Some(molecule), Some(display)) = (&self.molecule, &mut self.display) else {
+        let Some(display) = &mut self.display else {
             return;
         };
-        display.selection = flags;
+        display.set_selection_from_bools(flags);
         self.inspection = inspection;
-        self.renderer.update_instances(molecule, display);
+        self.refresh_instances();
     }
 
     fn display_target(&self, target: InspectionTarget) -> (Vec<usize>, DisplayLevel) {
@@ -1830,9 +2807,8 @@ impl Runtime {
     }
 
     fn refresh_instances(&mut self) {
-        if let (Some(molecule), Some(display)) = (&self.molecule, &self.display) {
-            self.renderer.update_instances(molecule, display);
-        }
+        self.needs_cartoon_refresh = true;
+        self.schedule_cartoon_job();
         self.renderer.update_measurements(&self.measurement_lines);
     }
 
@@ -2158,7 +3134,7 @@ fn download_pdb_with_progress(
     fs::create_dir_all(directory)
         .with_context(|| format!("could not create {}", directory.display()))?;
     let path = directory.join(filename);
-    fs::write(&path, contents)
+    atomic_write(&path, &contents)
         .with_context(|| format!("could not save downloaded structure to {}", path.display()))?;
     Ok(path)
 }
@@ -2527,45 +3503,6 @@ fn measurement_endpoint(
     })
 }
 
-fn rename_selection_reference(source: &str, old_name: &str, new_name: &str) -> String {
-    let mut output = String::with_capacity(source.len() + new_name.len());
-    let mut cursor = 0;
-    let mut expect_name = false;
-    for (start, word) in selection_words(source) {
-        output.push_str(&source[cursor..start]);
-        if expect_name && word.eq_ignore_ascii_case(old_name) {
-            output.push_str(new_name);
-        } else {
-            output.push_str(word);
-        }
-        expect_name = word.eq_ignore_ascii_case("selection");
-        cursor = start + word.len();
-    }
-    output.push_str(&source[cursor..]);
-    output
-}
-
-fn selection_words(source: &str) -> Vec<(usize, &str)> {
-    let mut words = Vec::new();
-    let mut start = None;
-    for (index, character) in source.char_indices() {
-        let is_word =
-            character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '+' | '\'' | '*');
-        match (start, is_word) {
-            (None, true) => start = Some(index),
-            (Some(word_start), false) => {
-                words.push((word_start, &source[word_start..index]));
-                start = None;
-            }
-            _ => {}
-        }
-    }
-    if let Some(word_start) = start {
-        words.push((word_start, &source[word_start..]));
-    }
-    words
-}
-
 fn representation_mask(representation: Representation) -> RepresentationMask {
     match representation {
         Representation::Spheres => RepresentationMask::SPHERES,
@@ -2645,12 +3582,286 @@ fn inclusive_target_range(
     Some(ordered[start..=end].to_vec())
 }
 
+fn read_local_file_limited(path: &Path) -> Result<Vec<u8>> {
+    let file =
+        fs::File::open(path).with_context(|| format!("could not open {}", path.display()))?;
+    let size = file
+        .metadata()
+        .with_context(|| format!("could not inspect {}", path.display()))?
+        .len();
+    if size > MAX_LOCAL_FILE_SIZE {
+        anyhow::bail!(
+            "{} is {} bytes; the local-file safety limit is {} bytes",
+            path.display(),
+            size,
+            MAX_LOCAL_FILE_SIZE
+        );
+    }
+    let mut contents = Vec::with_capacity(size.min(8 * 1024 * 1024) as usize);
+    file.take(MAX_LOCAL_FILE_SIZE.saturating_add(1))
+        .read_to_end(&mut contents)
+        .with_context(|| format!("could not read {}", path.display()))?;
+    if contents.len() as u64 > MAX_LOCAL_FILE_SIZE {
+        anyhow::bail!(
+            "{} grew beyond the {} byte local-file safety limit while it was being read",
+            path.display(),
+            MAX_LOCAL_FILE_SIZE
+        );
+    }
+    Ok(contents)
+}
+
+fn background_worker(
+    requests: Receiver<JobRequest>,
+    events: Sender<JobEvent>,
+    window: Arc<Window>,
+) {
+    while let Ok(request) = requests.recv() {
+        let (id, result) = match request {
+            JobRequest::Load {
+                id,
+                session_id,
+                version,
+                path,
+                cancel,
+            } => (
+                id,
+                load_in_background(id, session_id, version, &path, &cancel, &events, &window)
+                    .map(|payload| JobOutput::Loaded(Box::new(payload))),
+            ),
+            JobRequest::Save {
+                id,
+                session_id,
+                version,
+                path,
+                document,
+                cancel,
+            } => {
+                let _ = (session_id, version);
+                send_job_progress(&events, &window, id, "Encoding Molecule scene", 0.25);
+                let result = if cancel.load(Ordering::Relaxed) {
+                    Ok(JobOutput::Cancelled)
+                } else {
+                    encode_scene(&document)
+                        .context("could not encode scene")
+                        .and_then(|contents| {
+                            if cancel.load(Ordering::Relaxed) {
+                                return Ok(JobOutput::Cancelled);
+                            }
+                            send_job_progress(
+                                &events,
+                                &window,
+                                id,
+                                "Synchronizing scene file",
+                                0.8,
+                            );
+                            atomic_write(&path, &contents)?;
+                            Ok(JobOutput::Saved(path))
+                        })
+                        .map_err(|error| error.to_string())
+                };
+                (id, result)
+            }
+            JobRequest::Cartoon {
+                id,
+                session_id,
+                version,
+                molecule,
+                display,
+                cancel,
+            } => {
+                let _ = (session_id, version);
+                send_job_progress(&events, &window, id, "Building ribbon geometry", 0.2);
+                let result = if cancel.load(Ordering::Relaxed) {
+                    Ok(JobOutput::Cancelled)
+                } else {
+                    let prepared = prepare_cartoon(&molecule, &display);
+                    if cancel.load(Ordering::Relaxed) {
+                        Ok(JobOutput::Cancelled)
+                    } else {
+                        Ok(JobOutput::Cartoon(prepared))
+                    }
+                };
+                (id, result)
+            }
+        };
+        let _ = events.send(JobEvent::Complete {
+            id,
+            result: Box::new(result),
+        });
+        window.request_redraw();
+    }
+}
+
+fn load_in_background(
+    id: u64,
+    _session_id: u64,
+    _version: u64,
+    path: &Path,
+    cancel: &AtomicBool,
+    events: &Sender<JobEvent>,
+    window: &Window,
+) -> std::result::Result<LoadedPayload, String> {
+    send_job_progress(events, window, id, "Reading file", 0.1);
+    let contents = read_local_file_limited(path).map_err(|error| error.to_string())?;
+    if cancel.load(Ordering::Relaxed) {
+        return Err("background operation canceled".into());
+    }
+    let filename = path.file_name().map_or_else(
+        || path.display().to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    );
+    send_job_progress(events, window, id, "Parsing structure", 0.45);
+    if is_scene_document(&contents) {
+        let document = decode_scene(&contents).map_err(|error| error.to_string())?;
+        if cancel.load(Ordering::Relaxed) {
+            return Err("background operation canceled".into());
+        }
+        send_job_progress(
+            events,
+            window,
+            id,
+            "Building hierarchy and spatial index",
+            0.82,
+        );
+        let hierarchy = MoleculeHierarchy::from_molecule(&document.molecule);
+        let atom_bvh = AtomBvh::build(&document.molecule);
+        return Ok(LoadedPayload::Scene {
+            filename,
+            path: path.to_owned(),
+            document: Box::new(document),
+            hierarchy,
+            atom_bvh,
+        });
+    }
+    if path
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case(SCENE_EXTENSION))
+    {
+        return Err(format!(
+            "{} is not a Molecule 1.0 document (missing MOLECULE magic). MDL Molfile is not supported yet",
+            path.display()
+        ));
+    }
+    let (molecule, _) = parse_structure(&contents, &filename).map_err(|error| error.to_string())?;
+    if cancel.load(Ordering::Relaxed) {
+        return Err("background operation canceled".into());
+    }
+    send_job_progress(
+        events,
+        window,
+        id,
+        "Building hierarchy and spatial index",
+        0.82,
+    );
+    let hierarchy = MoleculeHierarchy::from_molecule(&molecule);
+    let atom_bvh = AtomBvh::build(&molecule);
+    let display = DisplayState::for_molecule(&molecule);
+    let molecule_id = molecule_id_from_structure(&contents, &filename);
+    Ok(LoadedPayload::Structure {
+        filename,
+        molecule_id,
+        molecule,
+        hierarchy,
+        atom_bvh,
+        display: Box::new(display),
+    })
+}
+
+fn send_job_progress(
+    events: &Sender<JobEvent>,
+    window: &Window,
+    id: u64,
+    stage: &'static str,
+    progress: f32,
+) {
+    let _ = events.send(JobEvent::Progress {
+        id,
+        stage,
+        progress,
+    });
+    window.request_redraw();
+}
+
+fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent).with_context(|| format!("could not create {}", parent.display()))?;
+    let filename = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("molecule.mol");
+    let nonce = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let temporary = parent.join(format!(".{filename}.{}.{}.tmp", std::process::id(), nonce));
+    let result = (|| -> Result<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .with_context(|| format!("could not create {}", temporary.display()))?;
+        file.write_all(contents)
+            .with_context(|| format!("could not write {}", temporary.display()))?;
+        file.flush()
+            .with_context(|| format!("could not flush {}", temporary.display()))?;
+        file.sync_all()
+            .with_context(|| format!("could not sync {}", temporary.display()))?;
+        drop(file);
+        fs::rename(&temporary, path).with_context(|| {
+            format!(
+                "could not replace {} with {}",
+                path.display(),
+                temporary.display()
+            )
+        })?;
+        if let Ok(directory) = OpenOptions::new().read(true).open(parent) {
+            let _ = directory.sync_all();
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn recovery_directory() -> Result<PathBuf> {
+    #[cfg(target_os = "macos")]
+    let base = env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|home| home.join("Library/Application Support"));
+    #[cfg(target_os = "windows")]
+    let base = env::var_os("LOCALAPPDATA").map(PathBuf::from);
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let base = env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| {
+            env::var_os("HOME")
+                .map(PathBuf::from)
+                .map(|home| home.join(".local/state"))
+        });
+    let directory = base
+        .context("could not determine the user data directory")?
+        .join("molview/recovery");
+    fs::create_dir_all(&directory)
+        .with_context(|| format!("could not create {}", directory.display()))?;
+    Ok(directory)
+}
+
+fn recovery_path_for(session_id: u64) -> Result<PathBuf> {
+    Ok(recovery_directory()?.join(format!(
+        "molview-{}-{session_id}.recovery.mol",
+        std::process::id()
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use molview::{
         molecule::{Atom, Element},
-        selection::evaluate,
+        selection::{evaluate, parse_selection},
     };
 
     fn measurement_molecule() -> Molecule {
@@ -2747,18 +3958,6 @@ mod tests {
     }
 
     #[test]
-    fn renaming_named_selection_updates_only_named_references() {
-        assert_eq!(
-            rename_selection_reference(
-                "selection old and (selection older or selection OLD)",
-                "old",
-                "new",
-            ),
-            "selection new and (selection older or selection new)"
-        );
-    }
-
-    #[test]
     fn edit_history_keeps_only_the_newest_fifty_events() {
         let mut history = VecDeque::new();
         for index in 0..60 {
@@ -2823,6 +4022,31 @@ mod tests {
             molecule_path(PathBuf::from("scene.MOL")),
             PathBuf::from("scene.MOL")
         );
+    }
+
+    #[test]
+    fn atomic_write_replaces_complete_files_and_limited_read_checks_metadata() {
+        let directory = env::temp_dir().join(format!(
+            "molview-p0-{}-{}",
+            std::process::id(),
+            TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("scene.mol");
+        atomic_write(&path, b"first complete scene").unwrap();
+        atomic_write(&path, b"second complete scene").unwrap();
+        assert_eq!(
+            read_local_file_limited(&path).unwrap(),
+            b"second complete scene"
+        );
+
+        let oversized = directory.join("oversized.cif");
+        fs::File::create(&oversized)
+            .unwrap()
+            .set_len(MAX_LOCAL_FILE_SIZE + 1)
+            .unwrap();
+        assert!(read_local_file_limited(&oversized).is_err());
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     collections::HashMap,
     io::{Cursor, Read},
     str::FromStr,
@@ -10,6 +11,11 @@ use rmpv::Value;
 use thiserror::Error;
 
 use super::{Atom, Element, Molecule, PdbError, infer_bonds, parse_pdb, pdb::infer_element};
+
+pub const MAX_DECOMPRESSED_STRUCTURE_SIZE: u64 = 512 * 1024 * 1024;
+const MAX_BINARY_CIF_VALUES: usize = MAX_DECOMPRESSED_STRUCTURE_SIZE as usize / 8;
+const MAX_GZIP_EXPANSION_RATIO: u64 = 200;
+const GZIP_RATIO_CHECK_THRESHOLD: u64 = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StructureFormat {
@@ -34,6 +40,10 @@ impl StructureFormat {
 pub enum StructureError {
     #[error("could not decompress gzip data: {0}")]
     Gzip(#[source] std::io::Error),
+    #[error("structure input exceeds the {limit} byte safety limit (decoded {actual} bytes)")]
+    TooLarge { actual: u64, limit: u64 },
+    #[error("gzip expansion ratio is suspicious ({decoded} decoded bytes from {compressed} bytes)")]
+    SuspiciousCompressionRatio { compressed: u64, decoded: u64 },
     #[error("{format} input is not valid UTF-8: {source}")]
     Utf8 {
         format: &'static str,
@@ -85,15 +95,40 @@ pub fn parse_structure(
     Ok((molecule, format))
 }
 
-fn decompress_if_needed(bytes: &[u8]) -> Result<Vec<u8>, StructureError> {
+fn decompress_if_needed(bytes: &[u8]) -> Result<Cow<'_, [u8]>, StructureError> {
     if !bytes.starts_with(&[0x1f, 0x8b]) {
-        return Ok(bytes.to_vec());
+        check_structure_size(bytes.len() as u64, MAX_DECOMPRESSED_STRUCTURE_SIZE)?;
+        return Ok(Cow::Borrowed(bytes));
     }
+    decompress_gzip_with_limit(bytes, MAX_DECOMPRESSED_STRUCTURE_SIZE).map(Cow::Owned)
+}
+
+fn decompress_gzip_with_limit(bytes: &[u8], limit: u64) -> Result<Vec<u8>, StructureError> {
     let mut decoded = Vec::new();
     GzDecoder::new(bytes)
+        .take(limit.saturating_add(1))
         .read_to_end(&mut decoded)
         .map_err(StructureError::Gzip)?;
+    check_structure_size(decoded.len() as u64, limit)?;
+    let compressed = bytes.len().max(1) as u64;
+    let decoded_len = decoded.len() as u64;
+    if decoded_len >= GZIP_RATIO_CHECK_THRESHOLD
+        && decoded_len > compressed.saturating_mul(MAX_GZIP_EXPANSION_RATIO)
+    {
+        return Err(StructureError::SuspiciousCompressionRatio {
+            compressed,
+            decoded: decoded_len,
+        });
+    }
     Ok(decoded)
+}
+
+fn check_structure_size(actual: u64, limit: u64) -> Result<(), StructureError> {
+    if actual > limit {
+        Err(StructureError::TooLarge { actual, limit })
+    } else {
+        Ok(())
+    }
 }
 
 fn filename_hint(filename: &str) -> Option<StructureFormat> {
@@ -448,6 +483,7 @@ fn parse_binary_cif(input: &[u8]) -> Result<Molecule, StructureError> {
     let row_count = map_get(category, "rowCount")
         .and_then(value_usize)
         .ok_or_else(|| StructureError::BinaryCif("atom_site has no rowCount".into()))?;
+    check_binary_allocation::<Atom>(row_count, "atom_site rowCount")?;
     let columns = map_get(category, "columns")
         .and_then(Value::as_array)
         .ok_or_else(|| StructureError::BinaryCif("atom_site has no columns".into()))?;
@@ -611,8 +647,41 @@ fn decode_with_encodings(bytes: Vec<u8>, encodings: &[Value]) -> Result<Decoded,
                 )));
             }
         };
+        check_decoded_size(&decoded, kind)?;
     }
     Ok(decoded)
+}
+
+fn check_binary_value_count(count: usize, label: &str) -> Result<(), StructureError> {
+    if count > MAX_BINARY_CIF_VALUES {
+        Err(StructureError::BinaryCif(format!(
+            "{label} requests {count} values, exceeding the safety limit of {MAX_BINARY_CIF_VALUES}"
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+fn check_binary_allocation<T>(count: usize, label: &str) -> Result<(), StructureError> {
+    let bytes = count
+        .checked_mul(std::mem::size_of::<T>().max(1))
+        .ok_or_else(|| StructureError::BinaryCif(format!("{label} allocation overflow")))?;
+    if bytes > MAX_DECOMPRESSED_STRUCTURE_SIZE as usize {
+        Err(StructureError::BinaryCif(format!(
+            "{label} requests {bytes} bytes, exceeding the {MAX_DECOMPRESSED_STRUCTURE_SIZE} byte safety limit"
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+fn check_decoded_size(decoded: &Decoded, label: &str) -> Result<(), StructureError> {
+    match decoded {
+        Decoded::Bytes(values) => check_binary_allocation::<u8>(values.len(), label),
+        Decoded::Integers(values) => check_binary_allocation::<i64>(values.len(), label),
+        Decoded::Floats(values) => check_binary_allocation::<f64>(values.len(), label),
+        Decoded::Strings(values) => check_binary_allocation::<String>(values.len(), label),
+    }
 }
 
 fn decode_byte_array(value: Decoded, encoding: &Value) -> Result<Decoded, StructureError> {
@@ -629,6 +698,18 @@ fn decode_byte_array(value: Decoded, encoding: &Value) -> Result<Decoded, Struct
             .then_some(bytes.chunks_exact(size))
             .ok_or_else(|| StructureError::BinaryCif("misaligned ByteArray data".into()))
     };
+    let output_count = match data_type {
+        1 | 4 => bytes.len(),
+        2 | 5 => bytes.len() / 2,
+        3 | 6 | 32 => bytes.len() / 4,
+        33 => bytes.len() / 8,
+        _ => 0,
+    };
+    if data_type == 32 || data_type == 33 {
+        check_binary_allocation::<f64>(output_count, "ByteArray output")?;
+    } else {
+        check_binary_allocation::<i64>(output_count, "ByteArray output")?;
+    }
     match data_type {
         1 => Ok(Decoded::Integers(
             bytes.iter().map(|value| i64::from(*value as i8)).collect(),
@@ -702,6 +783,9 @@ fn decode_integer_packing(value: Decoded, encoding: &Value) -> Result<Decoded, S
     };
     let lower = if unsigned { i64::MIN } else { -upper - 1 };
     let mut values = Vec::new();
+    values.try_reserve(packed.len()).map_err(|_| {
+        StructureError::BinaryCif("IntegerPacking output allocation is too large".into())
+    })?;
     let mut cursor = 0;
     while cursor < packed.len() {
         let mut value = 0_i64;
@@ -710,7 +794,9 @@ fn decode_integer_packing(value: Decoded, encoding: &Value) -> Result<Decoded, S
                 StructureError::BinaryCif("truncated IntegerPacking value".into())
             })?;
             cursor += 1;
-            value += part;
+            value = value
+                .checked_add(part)
+                .ok_or_else(|| StructureError::BinaryCif("IntegerPacking value overflow".into()))?;
             if part != upper && part != lower {
                 break;
             }
@@ -727,7 +813,18 @@ fn decode_run_length(value: Decoded) -> Result<Decoded, StructureError> {
             "RunLength data has an incomplete pair".into(),
         ));
     }
+    let total = packed.chunks_exact(2).try_fold(0_usize, |total, pair| {
+        let count = usize::try_from(pair[1])
+            .map_err(|_| StructureError::BinaryCif("negative RunLength count".into()))?;
+        total
+            .checked_add(count)
+            .ok_or_else(|| StructureError::BinaryCif("RunLength size overflow".into()))
+    })?;
+    check_binary_value_count(total, "RunLength output")?;
     let mut values = Vec::new();
+    values.try_reserve_exact(total).map_err(|_| {
+        StructureError::BinaryCif("RunLength output allocation is too large".into())
+    })?;
     for pair in packed.chunks_exact(2) {
         let count = usize::try_from(pair[1])
             .map_err(|_| StructureError::BinaryCif("negative RunLength count".into()))?;
@@ -741,15 +838,17 @@ fn decode_delta(value: Decoded, encoding: &Value) -> Result<Decoded, StructureEr
     let mut running = map_get(encoding, "origin")
         .and_then(Value::as_i64)
         .unwrap_or(0);
-    Ok(Decoded::Integers(
-        deltas
-            .into_iter()
-            .map(|delta| {
-                running += delta;
-                running
-            })
-            .collect(),
-    ))
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(deltas.len())
+        .map_err(|_| StructureError::BinaryCif("Delta output allocation is too large".into()))?;
+    for delta in deltas {
+        running = running
+            .checked_add(delta)
+            .ok_or_else(|| StructureError::BinaryCif("Delta value overflow".into()))?;
+        values.push(running);
+    }
+    Ok(Decoded::Integers(values))
 }
 
 fn decode_fixed_point(value: Decoded, encoding: &Value) -> Result<Decoded, StructureError> {
@@ -757,6 +856,11 @@ fn decode_fixed_point(value: Decoded, encoding: &Value) -> Result<Decoded, Struc
     let factor = map_get(encoding, "factor")
         .and_then(value_f64)
         .ok_or_else(|| StructureError::BinaryCif("FixedPoint has no factor".into()))?;
+    if !factor.is_finite() || factor == 0.0 {
+        return Err(StructureError::BinaryCif(
+            "FixedPoint factor must be finite and non-zero".into(),
+        ));
+    }
     Ok(Decoded::Floats(
         values
             .into_iter()
@@ -776,6 +880,11 @@ fn decode_interval(value: Decoded, encoding: &Value) -> Result<Decoded, Structur
     let steps = map_get(encoding, "numSteps")
         .and_then(value_f64)
         .ok_or_else(|| StructureError::BinaryCif("IntervalQuantization has no numSteps".into()))?;
+    if !minimum.is_finite() || !maximum.is_finite() || !steps.is_finite() || steps < 2.0 {
+        return Err(StructureError::BinaryCif(
+            "IntervalQuantization parameters must be finite and numSteps must be at least 2".into(),
+        ));
+    }
     let delta = (maximum - minimum) / (steps - 1.0);
     Ok(Decoded::Floats(
         values
@@ -818,7 +927,20 @@ fn decode_string_array(value: Decoded, encoding: &Value) -> Result<Decoded, Stru
     let string_data = map_get(encoding, "stringData")
         .and_then(Value::as_str)
         .ok_or_else(|| StructureError::BinaryCif("StringArray has no stringData".into()))?;
-    let mut values = Vec::with_capacity(indices.len());
+    if offsets
+        .windows(2)
+        .any(|pair| pair[0] < 0 || pair[1] < pair[0])
+    {
+        return Err(StructureError::BinaryCif(
+            "StringArray offsets must be non-negative and monotonic".into(),
+        ));
+    }
+    check_binary_allocation::<String>(indices.len(), "StringArray output")?;
+    let mut values = Vec::new();
+    values.try_reserve_exact(indices.len()).map_err(|_| {
+        StructureError::BinaryCif("StringArray output allocation is too large".into())
+    })?;
+    let mut output_text_bytes = 0_usize;
     for index in indices {
         if index < 0 {
             values.push(String::new());
@@ -834,12 +956,14 @@ fn decode_string_array(value: Decoded, encoding: &Value) -> Result<Decoded, Stru
             .get(index + 1)
             .and_then(|value| usize::try_from(*value).ok())
             .ok_or_else(|| StructureError::BinaryCif("StringArray offset is missing".into()))?;
-        values.push(
-            string_data
-                .get(start..end)
-                .ok_or_else(|| StructureError::BinaryCif("invalid StringArray range".into()))?
-                .to_string(),
-        );
+        let value = string_data
+            .get(start..end)
+            .ok_or_else(|| StructureError::BinaryCif("invalid StringArray range".into()))?;
+        output_text_bytes = output_text_bytes
+            .checked_add(value.len())
+            .ok_or_else(|| StructureError::BinaryCif("StringArray text size overflow".into()))?;
+        check_binary_allocation::<u8>(output_text_bytes, "StringArray text")?;
+        values.push(value.to_string());
     }
     Ok(Decoded::Strings(values))
 }
@@ -969,6 +1093,34 @@ mod tests {
         let (molecule, format) = parse_structure(&compressed, "demo.cif.gz").unwrap();
         assert_eq!(format, StructureFormat::Mmcif);
         assert_eq!(molecule.atoms.len(), 2);
+    }
+
+    #[test]
+    fn gzip_decoder_stops_at_the_configured_limit() {
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::best());
+        encoder.write_all(&vec![b'A'; 2048]).unwrap();
+        let compressed = encoder.finish().unwrap();
+        assert!(matches!(
+            decompress_gzip_with_limit(&compressed, 1024),
+            Err(StructureError::TooLarge {
+                actual: 1025,
+                limit: 1024
+            })
+        ));
+    }
+
+    #[test]
+    fn binary_cif_rejects_unbounded_run_length_before_allocation() {
+        let count = i64::try_from(MAX_BINARY_CIF_VALUES).unwrap() + 1;
+        let error = decode_run_length(Decoded::Integers(vec![7, count])).unwrap_err();
+        assert!(error.to_string().contains("safety limit"));
+    }
+
+    #[test]
+    fn binary_cif_rejects_delta_overflow() {
+        let encoding = object(vec![("origin", Value::from(i64::MAX))]);
+        let error = decode_delta(Decoded::Integers(vec![1]), &encoding).unwrap_err();
+        assert!(error.to_string().contains("overflow"));
     }
 
     #[test]

@@ -34,6 +34,13 @@ pub struct ChainGroup {
 #[derive(Debug, Clone, Default)]
 pub struct MoleculeHierarchy {
     pub chains: Vec<ChainGroup>,
+    atom_paths: Vec<Option<AtomHierarchyPath>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AtomHierarchyPath {
+    pub chain_index: usize,
+    pub residue_index: usize,
 }
 
 impl MoleculeHierarchy {
@@ -42,6 +49,7 @@ impl MoleculeHierarchy {
         let mut chain_indices = HashMap::<String, usize>::new();
         let mut residue_indices = Vec::<HashMap<ResidueId, usize>>::new();
 
+        let mut atom_paths = vec![None; molecule.atoms.len()];
         for (atom_index, atom) in molecule.atoms.iter().enumerate() {
             let chain_index = if let Some(&index) = chain_indices.get(&atom.chain_id) {
                 index
@@ -77,13 +85,21 @@ impl MoleculeHierarchy {
                 .atom_indices
                 .push(atom_index);
             chains[chain_index].atom_count += 1;
+            atom_paths[atom_index] = Some(AtomHierarchyPath {
+                chain_index,
+                residue_index,
+            });
         }
 
-        Self { chains }
+        Self { chains, atom_paths }
     }
 
     pub fn residue(&self, chain_index: usize, residue_index: usize) -> Option<&ResidueGroup> {
         self.chains.get(chain_index)?.residues.get(residue_index)
+    }
+
+    pub fn atom_path(&self, atom_index: usize) -> Option<AtomHierarchyPath> {
+        self.atom_paths.get(atom_index).copied().flatten()
     }
 }
 

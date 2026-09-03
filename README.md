@@ -78,7 +78,10 @@ modal PDB ID dialog with cancellable download progress and transfer speed. Large
 four HTTP byte-range workers when RCSB advertises range support; small files use one stream
 to avoid connection overhead. Downloads are stored under `~/downloads/pdb/` and opened
 without blocking the UI. Save as
-creates a Molecule 1.0 `.mol` project; subsequent Save operations update that file.
+creates a Molecule 1.0 `.mol` project; subsequent Save operations update that file atomically.
+Unsaved tabs carry a dot indicator, prompt before closing, and are autosaved to a separate recovery
+area after an idle delay. Molecule `.mol` projects are identified by their `MOLECULE` magic; MDL
+Molfile uses the same extension but is reported as unsupported rather than misdecoded.
 
 Open can select one or several files. Every structure or `.mol` scene opens in its own tab
 above the viewport; tabs can be switched or closed with `×`. Molecule display state,

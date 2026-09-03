@@ -23,5 +23,9 @@ wgpu = "30"
 winit = "0.30"
 zstd = "0.13"
 
+[build-dependencies]
+prost-build = "0.14"
+protoc-bin-vendored = "3"
+
 [profile.release]
 lto = "thin"

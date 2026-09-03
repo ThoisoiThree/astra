@@ -18,6 +18,7 @@ struct VertexInput {
     @location(5) model_3: vec4<f32>,
     @location(6) color: vec4<f32>,
     @location(7) highlight: vec4<f32>,
+    @location(8) semantic_ids: vec4<u32>,
 };
 
 struct VertexOutput {
@@ -26,6 +27,7 @@ struct VertexOutput {
     @location(1) normal: vec3<f32>,
     @location(2) color: vec4<f32>,
     @location(3) highlight: f32,
+    @location(4) @interpolate(flat) semantic_ids: vec4<u32>,
 };
 
 struct CartoonVertexInput {
@@ -33,6 +35,7 @@ struct CartoonVertexInput {
     @location(1) normal: vec3<f32>,
     @location(2) color: vec4<f32>,
     @location(3) highlight: vec4<f32>,
+    @location(4) semantic_ids: vec4<u32>,
 };
 
 @vertex
@@ -45,6 +48,7 @@ fn vertex_main(input: VertexInput) -> VertexOutput {
     output.normal = normalize((model * vec4<f32>(input.normal, 0.0)).xyz);
     output.color = input.color;
     output.highlight = input.highlight.x;
+    output.semantic_ids = input.semantic_ids;
     return output;
 }
 
@@ -56,6 +60,7 @@ fn cartoon_vertex_main(input: CartoonVertexInput) -> VertexOutput {
     output.normal = normalize(input.normal);
     output.color = input.color;
     output.highlight = input.highlight.x;
+    output.semantic_ids = input.semantic_ids;
     return output;
 }
 
@@ -82,7 +87,7 @@ struct SceneFragmentOutput {
 fn fragment_scene(input: VertexOutput) -> SceneFragmentOutput {
     var output: SceneFragmentOutput;
     output.color = shaded_color(input);
-    output.semantic_ids = vec4<u32>(0u);
+    output.semantic_ids = input.semantic_ids;
     return output;
 }
 

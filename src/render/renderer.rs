@@ -1,4 +1,7 @@
-use std::{borrow::Cow, sync::Arc};
+use std::{
+    borrow::Cow,
+    sync::{Arc, mpsc},
+};
 
 use bytemuck::{Pod, Zeroable};
 use egui::TexturesDelta;
@@ -79,16 +82,18 @@ struct InstanceRaw {
     model: [[f32; 4]; 4],
     color: [f32; 4],
     highlight: [f32; 4],
+    semantic_ids: [u32; 4],
 }
 
 impl InstanceRaw {
-    const ATTRIBUTES: [wgpu::VertexAttribute; 6] = wgpu::vertex_attr_array![
+    const ATTRIBUTES: [wgpu::VertexAttribute; 7] = wgpu::vertex_attr_array![
         2 => Float32x4,
         3 => Float32x4,
         4 => Float32x4,
         5 => Float32x4,
         6 => Float32x4,
-        7 => Float32x4
+        7 => Float32x4,
+        8 => Uint32x4
     ];
 
     fn new(model: Mat4, color: [f32; 4], highlighted: bool) -> Self {
@@ -96,7 +101,13 @@ impl InstanceRaw {
             model: model.to_cols_array_2d(),
             color,
             highlight: [f32::from(highlighted), 0.0, 0.0, 0.0],
+            semantic_ids: [0; 4],
         }
+    }
+
+    fn with_semantic_ids(mut self, semantic_ids: [u32; 4]) -> Self {
+        self.semantic_ids = semantic_ids;
+        self
     }
 
     fn layout() -> wgpu::VertexBufferLayout<'static> {
@@ -115,22 +126,31 @@ struct CartoonVertex {
     normal: [f32; 3],
     color: [f32; 4],
     highlight: [f32; 4],
+    semantic_ids: [u32; 4],
 }
 
 impl CartoonVertex {
-    const ATTRIBUTES: [wgpu::VertexAttribute; 4] = wgpu::vertex_attr_array![
+    const ATTRIBUTES: [wgpu::VertexAttribute; 5] = wgpu::vertex_attr_array![
         0 => Float32x3,
         1 => Float32x3,
         2 => Float32x4,
-        3 => Float32x4
+        3 => Float32x4,
+        4 => Uint32x4
     ];
 
-    fn new(position: Vec3, normal: Vec3, color: [f32; 4], highlighted: bool) -> Self {
+    fn new(
+        position: Vec3,
+        normal: Vec3,
+        color: [f32; 4],
+        highlighted: bool,
+        atom_index: usize,
+    ) -> Self {
         Self {
             position: position.to_array(),
             normal: normal.to_array(),
             color,
             highlight: [f32::from(highlighted), 0.0, 0.0, 0.0],
+            semantic_ids: [(atom_index as u32).saturating_add(1), 0, 0, 1],
         }
     }
 
@@ -260,7 +280,7 @@ impl ColorTarget {
 }
 
 struct SemanticTarget {
-    _texture: wgpu::Texture,
+    texture: wgpu::Texture,
     view: wgpu::TextureView,
 }
 
@@ -277,15 +297,20 @@ impl SemanticTarget {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: SEMANTIC_FORMAT,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        Self {
-            _texture: texture,
-            view,
-        }
+        Self { texture, view }
     }
+}
+
+struct PendingPickReadback {
+    request_id: u64,
+    buffer: wgpu::Buffer,
+    receiver: mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>,
 }
 
 struct PostProcess {
@@ -913,6 +938,14 @@ pub struct Renderer {
     depth: DepthTarget,
     post_process: PostProcess,
     egui_renderer: egui_wgpu::Renderer,
+    requested_pick: Option<(u64, u32, u32)>,
+    pending_pick: Option<PendingPickReadback>,
+}
+
+pub struct PreparedCartoon(CartoonRenderData);
+
+pub fn prepare_cartoon(molecule: &Molecule, display: &DisplayState) -> PreparedCartoon {
+    PreparedCartoon(cartoon_render_data(molecule, display))
 }
 
 impl Renderer {
@@ -1043,6 +1076,8 @@ impl Renderer {
             depth,
             post_process,
             egui_renderer,
+            requested_pick: None,
+            pending_pick: None,
         })
     }
 
@@ -1068,8 +1103,51 @@ impl Renderer {
         Ok(())
     }
 
+    pub fn request_pick(&mut self, request_id: u64, x: u32, y: u32) {
+        if x < self.config.width && y < self.config.height {
+            self.requested_pick = Some((request_id, x, y));
+        }
+    }
+
+    pub fn poll_pick(&mut self) -> Option<(u64, Result<Option<usize>, ()>)> {
+        let _ = self.device.poll(wgpu::PollType::Poll);
+        let ready = self
+            .pending_pick
+            .as_ref()
+            .and_then(|pending| pending.receiver.try_recv().ok())?;
+        let pending = self.pending_pick.take()?;
+        let atom = if ready.is_ok() {
+            match pending.buffer.get_mapped_range(0..16) {
+                Ok(mapped) => {
+                    let value = mapped
+                        .get(..4)
+                        .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
+                        .map(u32::from_le_bytes)
+                        .unwrap_or(0);
+                    drop(mapped);
+                    pending.buffer.unmap();
+                    Ok(value.checked_sub(1).map(|index| index as usize))
+                }
+                Err(_) => Err(()),
+            }
+        } else {
+            Err(())
+        };
+        Some((pending.request_id, atom))
+    }
+
     pub fn update_instances(&mut self, molecule: &Molecule, display: &DisplayState) {
-        let cartoon = cartoon_render_data(molecule, display);
+        self.update_prepared_cartoon(molecule, display, prepare_cartoon(molecule, display));
+    }
+
+    pub fn update_prepared_cartoon(
+        &mut self,
+        molecule: &Molecule,
+        display: &DisplayState,
+        prepared: PreparedCartoon,
+    ) {
+        let cartoon = prepared.0;
+        let semantic_ids = toon_semantic_ids(molecule);
         let atoms: Vec<_> = molecule
             .atoms
             .iter()
@@ -1092,6 +1170,7 @@ impl Renderer {
                     display.colors[index],
                     selected,
                 )
+                .with_semantic_ids(semantic_ids[index])
             })
             .collect();
 
@@ -1136,7 +1215,6 @@ impl Renderer {
             })
             .collect();
 
-        let semantic_ids = toon_semantic_ids(molecule);
         let toon_atoms: Vec<_> = molecule
             .atoms
             .iter()
@@ -1224,7 +1302,7 @@ impl Renderer {
                 focal_length,
                 camera.depth_of_field.blade_count as f32,
                 camera.depth_of_field.blade_rotation,
-                0.0,
+                f32::from(global_mode == DisplayMode::Toon),
             ],
             ao: [
                 ambient_occlusion.strength.clamp(0.0, 3.0),
@@ -1377,6 +1455,36 @@ impl Renderer {
             pass.set_vertex_buffer(0, self.toon_instances.slice(..));
             pass.draw(0..6, 0..self.toon_instance_count);
         }
+        let pick_readback = self.requested_pick.take().map(|(request_id, x, y)| {
+            let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("molecule ID pick readback"),
+                size: 256,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            encoder.copy_texture_to_buffer(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &self.post_process.semantic.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d { x, y, z: 0 },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &buffer,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(256),
+                        rows_per_image: None,
+                    },
+                },
+                wgpu::Extent3d {
+                    width: 1,
+                    height: 1,
+                    depth_or_array_layers: 1,
+                },
+            );
+            (request_id, buffer)
+        });
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("raw ambient occlusion pass"),
@@ -1522,6 +1630,17 @@ impl Renderer {
 
         self.queue
             .submit(callback_buffers.into_iter().chain([encoder.finish()]));
+        if let Some((request_id, buffer)) = pick_readback {
+            let (sender, receiver) = mpsc::channel();
+            buffer.map_async(wgpu::MapMode::Read, 0..16, move |result| {
+                let _ = sender.send(result);
+            });
+            self.pending_pick = Some(PendingPickReadback {
+                request_id,
+                buffer,
+                receiver,
+            });
+        }
         self.queue.present(output);
         for id in &textures_delta.free {
             self.egui_renderer.free_texture(id);
@@ -1662,11 +1781,7 @@ fn cartoon_render_data(molecule: &Molecule, display: &DisplayState) -> CartoonRe
 
         let mut run = Vec::new();
         for anchor in anchors {
-            let drawable = display
-                .visible
-                .get(anchor.atom_index)
-                .copied()
-                .unwrap_or(false)
+            let drawable = display.visible.get(anchor.atom_index).unwrap_or(false)
                 && display.modes.get(anchor.atom_index) == Some(&DisplayMode::Cartoon);
             let continuous = run.last().is_none_or(|previous: &BackboneAnchor| {
                 anchor.residue_index == previous.residue_index + 1
@@ -1844,7 +1959,13 @@ fn append_ribbon_run(
         ];
         let selected = display.selection[run[segment].atom_index]
             || display.selection[run[segment + 1].atom_index];
+        let atom_index = if t < 0.5 {
+            run[segment].atom_index
+        } else {
+            run[segment + 1].atom_index
+        };
         samples.push(CartoonSample {
+            atom_index,
             position: positions[index],
             tangent,
             side,
@@ -1881,6 +2002,7 @@ fn append_ribbon_run(
 
 #[derive(Clone, Copy)]
 struct CartoonSample {
+    atom_index: usize,
     position: Vec3,
     tangent: Vec3,
     side: Vec3,
@@ -1930,6 +2052,7 @@ fn append_rectangular_strip(
                     surface_normal,
                     sample.color,
                     sample.selected,
+                    sample.atom_index,
                 ));
             }
         }
@@ -1939,10 +2062,34 @@ fn append_rectangular_strip(
         let right_top = ribbon_surface_position(sample, 0.5, true);
         let right_bottom = ribbon_surface_position(sample, 0.5, false);
         vertices.extend_from_slice(&[
-            CartoonVertex::new(left_bottom, -sample.side, sample.color, sample.selected),
-            CartoonVertex::new(left_top, -sample.side, sample.color, sample.selected),
-            CartoonVertex::new(right_top, sample.side, sample.color, sample.selected),
-            CartoonVertex::new(right_bottom, sample.side, sample.color, sample.selected),
+            CartoonVertex::new(
+                left_bottom,
+                -sample.side,
+                sample.color,
+                sample.selected,
+                sample.atom_index,
+            ),
+            CartoonVertex::new(
+                left_top,
+                -sample.side,
+                sample.color,
+                sample.selected,
+                sample.atom_index,
+            ),
+            CartoonVertex::new(
+                right_top,
+                sample.side,
+                sample.color,
+                sample.selected,
+                sample.atom_index,
+            ),
+            CartoonVertex::new(
+                right_bottom,
+                sample.side,
+                sample.color,
+                sample.selected,
+                sample.atom_index,
+            ),
         ]);
     }
     for ring in 0..samples.len().saturating_sub(1) as u32 {
@@ -2015,6 +2162,7 @@ fn append_rectangular_cap(
             cap_normal,
             sample.color,
             sample.selected,
+            sample.atom_index,
         ));
     }
     indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
@@ -2037,6 +2185,7 @@ fn append_tube_strip(
                 radial,
                 sample.color,
                 sample.selected,
+                sample.atom_index,
             ));
         }
     }

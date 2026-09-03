@@ -186,6 +186,8 @@ enum ColoringMode {
   COLORING_MODE_RESIDUE_TYPE = 3;
   COLORING_MODE_B_FACTOR = 4;
   COLORING_MODE_UNIFORM = 5;
+  // Requires Molecule reader version 2.
+  COLORING_MODE_SECONDARY_STRUCTURE = 6;
 }
 
 enum VisibilityOverride {

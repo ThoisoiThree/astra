@@ -1,4 +1,4 @@
 mod mesh;
 mod renderer;
 
-pub use renderer::{RenderError, Renderer, SurfaceIssue};
+pub use renderer::{PreparedCartoon, RenderError, Renderer, SurfaceIssue, prepare_cartoon};

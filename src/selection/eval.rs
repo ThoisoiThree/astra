@@ -2,14 +2,17 @@ use std::collections::BTreeMap;
 
 use thiserror::Error;
 
-use crate::molecule::{Atom, Molecule};
+use crate::{
+    bitset::AtomMask,
+    molecule::{Atom, Molecule},
+};
 
 use super::SelectionExpr;
 
 /// Renderer-independent selection result. The representation can later become a bitset.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Selection {
-    flags: Vec<bool>,
+    flags: AtomMask,
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -20,34 +23,38 @@ pub enum SelectionEvaluationError {
 
 impl Selection {
     pub fn from_flags(flags: Vec<bool>) -> Self {
+        Self {
+            flags: AtomMask::from_bools(flags),
+        }
+    }
+
+    pub fn from_mask(flags: AtomMask) -> Self {
         Self { flags }
     }
 
-    pub fn flags(&self) -> &[bool] {
+    pub fn flags(&self) -> &AtomMask {
         &self.flags
     }
 
     pub fn count(&self) -> usize {
-        self.flags.iter().filter(|selected| **selected).count()
+        self.flags.count()
     }
 
     pub fn indices(&self) -> impl Iterator<Item = usize> + '_ {
-        self.flags
-            .iter()
-            .enumerate()
-            .filter_map(|(index, selected)| selected.then_some(index))
+        self.flags.indices()
     }
 }
 
 pub fn evaluate(expression: &SelectionExpr, molecule: &Molecule) -> Selection {
     let named = BTreeMap::new();
     Selection {
-        flags: molecule
-            .atoms
-            .iter()
-            .enumerate()
-            .map(|(index, atom)| matches_atom(expression, atom, index, &named))
-            .collect(),
+        flags: AtomMask::from_bools(
+            molecule
+                .atoms
+                .iter()
+                .enumerate()
+                .map(|(index, atom)| matches_atom(expression, atom, index, &named)),
+        ),
     }
 }
 
@@ -58,12 +65,13 @@ pub fn evaluate_with_named(
 ) -> Result<Selection, SelectionEvaluationError> {
     validate_named(expression, named)?;
     Ok(Selection {
-        flags: molecule
-            .atoms
-            .iter()
-            .enumerate()
-            .map(|(index, atom)| matches_atom(expression, atom, index, named))
-            .collect(),
+        flags: AtomMask::from_bools(
+            molecule
+                .atoms
+                .iter()
+                .enumerate()
+                .map(|(index, atom)| matches_atom(expression, atom, index, named)),
+        ),
     })
 }
 
@@ -107,7 +115,6 @@ fn matches_atom(
         SelectionExpr::Serial(serial) => atom.serial == *serial,
         SelectionExpr::Named(name) => find_named(named, name)
             .and_then(|selection| selection.flags.get(atom_index))
-            .copied()
             .unwrap_or(false),
         SelectionExpr::Hetatm => atom.hetero,
         SelectionExpr::Polymer => !atom.hetero,

@@ -1,3 +1,4 @@
+pub mod bitset;
 pub mod camera;
 pub mod command;
 pub mod measurement;
@@ -9,6 +10,7 @@ pub mod selection;
 
 use std::collections::HashMap;
 
+use bitset::AtomMask;
 use molecule::Molecule;
 
 pub type DisplayColor = [f32; 4];
@@ -210,17 +212,111 @@ impl VisibilityOverride {
     }
 }
 
-/// Per-atom visual state, kept separate from immutable chemical data.
-///
-/// Hierarchical overrides are stored per atom so the renderer receives flat,
-/// contiguous arrays while the application remains responsible for mapping
-/// hierarchy nodes to atom indices.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HierarchyMembership {
+    chain: u32,
+    residue: u32,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct HierarchyOverrides<T> {
+    chains: HashMap<u32, T>,
+    residues: HashMap<u32, T>,
+    atoms: HashMap<usize, T>,
+}
+
+impl<T> Default for HierarchyOverrides<T> {
+    fn default() -> Self {
+        Self {
+            chains: HashMap::new(),
+            residues: HashMap::new(),
+            atoms: HashMap::new(),
+        }
+    }
+}
+
+impl<T: Copy> HierarchyOverrides<T> {
+    fn get(
+        &self,
+        atom_index: usize,
+        level: DisplayLevel,
+        membership: &[HierarchyMembership],
+    ) -> Option<T> {
+        match level {
+            DisplayLevel::Chain => membership
+                .get(atom_index)
+                .and_then(|path| self.chains.get(&path.chain)),
+            DisplayLevel::Residue => membership
+                .get(atom_index)
+                .and_then(|path| self.residues.get(&path.residue)),
+            DisplayLevel::Atom => self.atoms.get(&atom_index),
+        }
+        .copied()
+    }
+
+    fn set(
+        &mut self,
+        indices: &[usize],
+        level: DisplayLevel,
+        value: Option<T>,
+        membership: &[HierarchyMembership],
+    ) {
+        for &index in indices {
+            match level {
+                DisplayLevel::Chain => {
+                    if let Some(path) = membership.get(index) {
+                        set_sparse(&mut self.chains, path.chain, value);
+                    }
+                }
+                DisplayLevel::Residue => {
+                    if let Some(path) = membership.get(index) {
+                        set_sparse(&mut self.residues, path.residue, value);
+                    }
+                }
+                DisplayLevel::Atom => set_sparse(&mut self.atoms, index, value),
+            }
+        }
+    }
+
+    fn clear(&mut self) {
+        self.chains.clear();
+        self.residues.clear();
+        self.atoms.clear();
+    }
+}
+
+fn set_sparse<K: Eq + std::hash::Hash, T>(map: &mut HashMap<K, T>, key: K, value: Option<T>) {
+    if let Some(value) = value {
+        map.insert(key, value);
+    } else {
+        map.remove(&key);
+    }
+}
+
+/// Authoritative, history-safe portion of a display state. Dense renderer
+/// caches and immutable hierarchy membership are intentionally excluded.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DisplayStateData {
+    global_mode: DisplayMode,
+    coloring_mode: ColoringMode,
+    uniform_color: DisplayColor,
+    ambient_occlusion: AmbientOcclusionSettings,
+    ambient_occlusion_customized: bool,
+    selection: AtomMask,
+    representation_overrides: HashMap<usize, RepresentationMask>,
+    colors: HierarchyOverrides<DisplayColor>,
+    visibility: HierarchyOverrides<VisibilityOverride>,
+    modes: HierarchyOverrides<ModeOverride>,
+}
+
+/// Per-document display state. Hierarchy edits are sparse; the public flat
+/// arrays are a derived renderer cache rebuilt from the authoritative state.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DisplayState {
     pub colors: Vec<DisplayColor>,
-    pub visible: Vec<bool>,
+    pub visible: AtomMask,
     pub representations: Vec<RepresentationMask>,
-    pub selection: Vec<bool>,
+    pub selection: AtomMask,
     pub modes: Vec<DisplayMode>,
     pub global_mode: DisplayMode,
     pub coloring_mode: ColoringMode,
@@ -229,38 +325,26 @@ pub struct DisplayState {
     ambient_occlusion_customized: bool,
     base_colors: Vec<DisplayColor>,
     named_colors: Vec<Option<DisplayColor>>,
-    chain_colors: Vec<Option<DisplayColor>>,
-    residue_colors: Vec<Option<DisplayColor>>,
-    atom_colors: Vec<Option<DisplayColor>>,
-    chain_visibility: Vec<VisibilityOverride>,
     named_visibility: Vec<VisibilityOverride>,
-    residue_visibility: Vec<VisibilityOverride>,
-    atom_visibility: Vec<VisibilityOverride>,
     named_modes: Vec<ModeOverride>,
-    chain_modes: Vec<ModeOverride>,
-    residue_modes: Vec<ModeOverride>,
-    atom_modes: Vec<ModeOverride>,
+    membership: Vec<HierarchyMembership>,
+    default_representations: Vec<RepresentationMask>,
+    representation_overrides: HashMap<usize, RepresentationMask>,
+    hierarchy_colors: HierarchyOverrides<DisplayColor>,
+    hierarchy_visibility: HierarchyOverrides<VisibilityOverride>,
+    hierarchy_modes: HierarchyOverrides<ModeOverride>,
 }
 
 impl DisplayState {
     pub fn for_molecule(molecule: &Molecule) -> Self {
         let atom_count = molecule.atoms.len();
         let base_colors = indexed_categorical_colors(molecule, |atom| atom.chain_id.clone());
+        let default_representations = default_representations(molecule);
         Self {
             colors: base_colors.clone(),
-            visible: vec![true; atom_count],
-            representations: molecule
-                .atoms
-                .iter()
-                .map(|atom| {
-                    if atom.element == molecule::Element::H {
-                        RepresentationMask::STICKS
-                    } else {
-                        RepresentationMask::SPHERES | RepresentationMask::STICKS
-                    }
-                })
-                .collect(),
-            selection: vec![false; atom_count],
+            visible: AtomMask::new(atom_count, true),
+            representations: default_representations.clone(),
+            selection: AtomMask::new(atom_count, false),
             modes: vec![DisplayMode::Cartoon; atom_count],
             global_mode: DisplayMode::Cartoon,
             coloring_mode: ColoringMode::Chain,
@@ -269,42 +353,103 @@ impl DisplayState {
             ambient_occlusion_customized: false,
             base_colors,
             named_colors: vec![None; atom_count],
-            chain_colors: vec![None; atom_count],
-            residue_colors: vec![None; atom_count],
-            atom_colors: vec![None; atom_count],
-            chain_visibility: vec![VisibilityOverride::Inherit; atom_count],
             named_visibility: vec![VisibilityOverride::Inherit; atom_count],
-            residue_visibility: vec![VisibilityOverride::Inherit; atom_count],
-            atom_visibility: vec![VisibilityOverride::Inherit; atom_count],
             named_modes: vec![ModeOverride::Inherit; atom_count],
-            chain_modes: vec![ModeOverride::Inherit; atom_count],
-            residue_modes: vec![ModeOverride::Inherit; atom_count],
-            atom_modes: vec![ModeOverride::Inherit; atom_count],
+            membership: hierarchy_membership(molecule),
+            default_representations,
+            representation_overrides: HashMap::new(),
+            hierarchy_colors: HierarchyOverrides::default(),
+            hierarchy_visibility: HierarchyOverrides::default(),
+            hierarchy_modes: HierarchyOverrides::default(),
         }
+    }
+
+    pub fn edit_state(&self) -> DisplayStateData {
+        DisplayStateData {
+            global_mode: self.global_mode,
+            coloring_mode: self.coloring_mode,
+            uniform_color: self.uniform_color,
+            ambient_occlusion: self.ambient_occlusion,
+            ambient_occlusion_customized: self.ambient_occlusion_customized,
+            selection: self.selection.clone(),
+            representation_overrides: self.representation_overrides.clone(),
+            colors: self.hierarchy_colors.clone(),
+            visibility: self.hierarchy_visibility.clone(),
+            modes: self.hierarchy_modes.clone(),
+        }
+    }
+
+    pub fn restore_edit_state(&mut self, molecule: &Molecule, state: DisplayStateData) {
+        self.global_mode = state.global_mode;
+        self.coloring_mode = state.coloring_mode;
+        self.uniform_color = state.uniform_color;
+        self.ambient_occlusion = state.ambient_occlusion;
+        self.ambient_occlusion_customized = state.ambient_occlusion_customized;
+        self.selection = state.selection;
+        self.representation_overrides = state.representation_overrides;
+        self.hierarchy_colors = state.colors;
+        self.hierarchy_visibility = state.visibility;
+        self.hierarchy_modes = state.modes;
+        self.base_colors = base_colors(molecule, self.coloring_mode, self.uniform_color);
+        self.recompute_all();
+    }
+
+    pub fn set_selection(&mut self, selection: AtomMask) {
+        if selection.len() == self.selection.len() {
+            self.selection = selection;
+        }
+    }
+
+    pub fn set_selection_from_bools(&mut self, selection: Vec<bool>) {
+        self.set_selection(AtomMask::from_bools(selection));
+    }
+
+    pub fn set_representation(
+        &mut self,
+        indices: impl IntoIterator<Item = usize>,
+        representation: RepresentationMask,
+        shown: bool,
+    ) {
+        for index in indices {
+            let Some(default) = self.default_representations.get(index).copied() else {
+                continue;
+            };
+            let mut value = self
+                .representation_overrides
+                .get(&index)
+                .copied()
+                .unwrap_or(default);
+            if shown {
+                value.insert(representation);
+            } else {
+                value.remove(representation);
+            }
+            set_sparse(
+                &mut self.representation_overrides,
+                index,
+                (value != default).then_some(value),
+            );
+            self.representations[index] = value;
+        }
+    }
+
+    pub fn load_representations(&mut self, values: Vec<RepresentationMask>) {
+        self.representation_overrides.clear();
+        for (index, value) in values.into_iter().enumerate() {
+            if self
+                .default_representations
+                .get(index)
+                .is_some_and(|default| *default != value)
+            {
+                self.representation_overrides.insert(index, value);
+            }
+        }
+        self.recompute_representations();
     }
 
     pub fn set_coloring_mode(&mut self, molecule: &Molecule, mode: ColoringMode) {
         self.coloring_mode = mode;
-        self.base_colors = match mode {
-            ColoringMode::Element => element_colors(molecule),
-            ColoringMode::Chain => {
-                indexed_categorical_colors(molecule, |atom| atom.chain_id.clone())
-            }
-            ColoringMode::Residue => indexed_categorical_colors(molecule, |atom| {
-                format!(
-                    "{}:{}:{}:{:?}",
-                    atom.chain_id, atom.residue_name, atom.residue_number, atom.insertion_code
-                )
-            }),
-            ColoringMode::ResidueType => molecule
-                .atoms
-                .iter()
-                .map(|atom| categorical_color(&atom.residue_name))
-                .collect(),
-            ColoringMode::SecondaryStructure => secondary_structure_colors(molecule),
-            ColoringMode::BFactor => b_factor_colors(molecule),
-            ColoringMode::Uniform => vec![self.uniform_color; molecule.atoms.len()],
-        };
+        self.base_colors = base_colors(molecule, mode, self.uniform_color);
         self.recompute_colors();
     }
 
@@ -379,16 +524,8 @@ impl DisplayState {
         operations: &[(Vec<usize>, DisplayLevel, DisplayColor)],
     ) {
         for (indices, level, color) in operations {
-            let overrides = match level {
-                DisplayLevel::Chain => &mut self.chain_colors,
-                DisplayLevel::Residue => &mut self.residue_colors,
-                DisplayLevel::Atom => &mut self.atom_colors,
-            };
-            for &index in indices {
-                if let Some(value) = overrides.get_mut(index) {
-                    *value = Some(opaque(*color));
-                }
-            }
+            self.hierarchy_colors
+                .set(indices, *level, Some(opaque(*color)), &self.membership);
         }
         self.recompute_colors();
     }
@@ -399,16 +536,8 @@ impl DisplayState {
         level: DisplayLevel,
         color: Option<DisplayColor>,
     ) {
-        let overrides = match level {
-            DisplayLevel::Chain => &mut self.chain_colors,
-            DisplayLevel::Residue => &mut self.residue_colors,
-            DisplayLevel::Atom => &mut self.atom_colors,
-        };
-        for &index in indices {
-            if let Some(value) = overrides.get_mut(index) {
-                *value = color;
-            }
-        }
+        self.hierarchy_colors
+            .set(indices, level, color, &self.membership);
         self.recompute_colors();
     }
 
@@ -425,30 +554,23 @@ impl DisplayState {
             .flatten()
             .unwrap_or(base);
         let chain = self
-            .chain_colors
-            .get(atom_index)
-            .copied()
-            .flatten()
+            .hierarchy_colors
+            .get(atom_index, DisplayLevel::Chain, &self.membership)
             .unwrap_or(base);
         match level {
             DisplayLevel::Chain => chain,
             DisplayLevel::Residue => self
-                .residue_colors
-                .get(atom_index)
-                .copied()
-                .flatten()
+                .hierarchy_colors
+                .get(atom_index, DisplayLevel::Residue, &self.membership)
                 .unwrap_or(chain),
             DisplayLevel::Atom => self.colors.get(atom_index).copied().unwrap_or(chain),
         }
     }
 
     pub fn color_is_overridden(&self, atom_index: usize, level: DisplayLevel) -> bool {
-        match level {
-            DisplayLevel::Chain => self.chain_colors.get(atom_index),
-            DisplayLevel::Residue => self.residue_colors.get(atom_index),
-            DisplayLevel::Atom => self.atom_colors.get(atom_index),
-        }
-        .is_some_and(Option::is_some)
+        self.hierarchy_colors
+            .get(atom_index, level, &self.membership)
+            .is_some()
     }
 
     pub fn cycle_visibility(&mut self, indices: &[usize], level: DisplayLevel) {
@@ -466,16 +588,12 @@ impl DisplayState {
         level: DisplayLevel,
         state: VisibilityOverride,
     ) {
-        let overrides = match level {
-            DisplayLevel::Chain => &mut self.chain_visibility,
-            DisplayLevel::Residue => &mut self.residue_visibility,
-            DisplayLevel::Atom => &mut self.atom_visibility,
-        };
-        for &index in indices {
-            if let Some(value) = overrides.get_mut(index) {
-                *value = state;
-            }
-        }
+        self.hierarchy_visibility.set(
+            indices,
+            level,
+            (state != VisibilityOverride::Inherit).then_some(state),
+            &self.membership,
+        );
         self.recompute_visibility();
     }
 
@@ -484,16 +602,12 @@ impl DisplayState {
         operations: &[(Vec<usize>, DisplayLevel, VisibilityOverride)],
     ) {
         for (indices, level, state) in operations {
-            let overrides = match level {
-                DisplayLevel::Chain => &mut self.chain_visibility,
-                DisplayLevel::Residue => &mut self.residue_visibility,
-                DisplayLevel::Atom => &mut self.atom_visibility,
-            };
-            for &index in indices {
-                if let Some(value) = overrides.get_mut(index) {
-                    *value = *state;
-                }
-            }
+            self.hierarchy_visibility.set(
+                indices,
+                *level,
+                (*state != VisibilityOverride::Inherit).then_some(*state),
+                &self.membership,
+            );
         }
         self.recompute_visibility();
     }
@@ -503,13 +617,9 @@ impl DisplayState {
         atom_index: usize,
         level: DisplayLevel,
     ) -> VisibilityOverride {
-        match level {
-            DisplayLevel::Chain => self.chain_visibility.get(atom_index),
-            DisplayLevel::Residue => self.residue_visibility.get(atom_index),
-            DisplayLevel::Atom => self.atom_visibility.get(atom_index),
-        }
-        .copied()
-        .unwrap_or_default()
+        self.hierarchy_visibility
+            .get(atom_index, level, &self.membership)
+            .unwrap_or_default()
     }
 
     pub fn set_global_mode(&mut self, mode: DisplayMode) {
@@ -522,18 +632,15 @@ impl DisplayState {
         }
         self.global_mode = mode;
         let redundant = ModeOverride::from_mode(mode);
-        for overrides in [
-            &mut self.named_modes,
-            &mut self.chain_modes,
-            &mut self.residue_modes,
-            &mut self.atom_modes,
-        ] {
-            for value in overrides {
-                if *value == redundant {
-                    *value = ModeOverride::Inherit;
-                }
-            }
-        }
+        self.hierarchy_modes
+            .chains
+            .retain(|_, value| *value != redundant);
+        self.hierarchy_modes
+            .residues
+            .retain(|_, value| *value != redundant);
+        self.hierarchy_modes
+            .atoms
+            .retain(|_, value| *value != redundant);
         self.recompute_modes();
     }
 
@@ -553,16 +660,12 @@ impl DisplayState {
         } else {
             state
         };
-        let overrides = match level {
-            DisplayLevel::Chain => &mut self.chain_modes,
-            DisplayLevel::Residue => &mut self.residue_modes,
-            DisplayLevel::Atom => &mut self.atom_modes,
-        };
-        for &index in indices {
-            if let Some(value) = overrides.get_mut(index) {
-                *value = state;
-            }
-        }
+        self.hierarchy_modes.set(
+            indices,
+            level,
+            (state != ModeOverride::Inherit).then_some(state),
+            &self.membership,
+        );
         self.recompute_modes();
     }
 
@@ -573,28 +676,20 @@ impl DisplayState {
             } else {
                 *state
             };
-            let overrides = match level {
-                DisplayLevel::Chain => &mut self.chain_modes,
-                DisplayLevel::Residue => &mut self.residue_modes,
-                DisplayLevel::Atom => &mut self.atom_modes,
-            };
-            for &index in indices {
-                if let Some(value) = overrides.get_mut(index) {
-                    *value = state;
-                }
-            }
+            self.hierarchy_modes.set(
+                indices,
+                *level,
+                (state != ModeOverride::Inherit).then_some(state),
+                &self.membership,
+            );
         }
         self.recompute_modes();
     }
 
     pub fn mode_override(&self, atom_index: usize, level: DisplayLevel) -> ModeOverride {
-        match level {
-            DisplayLevel::Chain => self.chain_modes.get(atom_index),
-            DisplayLevel::Residue => self.residue_modes.get(atom_index),
-            DisplayLevel::Atom => self.atom_modes.get(atom_index),
-        }
-        .copied()
-        .unwrap_or_default()
+        self.hierarchy_modes
+            .get(atom_index, level, &self.membership)
+            .unwrap_or_default()
     }
 
     pub fn mode_at_level(&self, atom_index: usize, level: DisplayLevel) -> DisplayMode {
@@ -605,17 +700,15 @@ impl DisplayState {
             .and_then(ModeOverride::mode)
             .unwrap_or(self.global_mode);
         let chain = self
-            .chain_modes
-            .get(atom_index)
-            .copied()
+            .hierarchy_modes
+            .get(atom_index, DisplayLevel::Chain, &self.membership)
             .and_then(ModeOverride::mode)
             .unwrap_or(named);
         match level {
             DisplayLevel::Chain => chain,
             DisplayLevel::Residue => self
-                .residue_modes
-                .get(atom_index)
-                .copied()
+                .hierarchy_modes
+                .get(atom_index, DisplayLevel::Residue, &self.membership)
                 .and_then(ModeOverride::mode)
                 .unwrap_or(chain),
             DisplayLevel::Atom => self.modes.get(atom_index).copied().unwrap_or(chain),
@@ -623,22 +716,28 @@ impl DisplayState {
     }
 
     pub fn reset_colors(&mut self, molecule: &Molecule) {
-        self.chain_colors.fill(None);
-        self.residue_colors.fill(None);
-        self.atom_colors.fill(None);
+        self.hierarchy_colors.clear();
         self.uniform_color = DEFAULT_UNIFORM_COLOR;
         self.set_coloring_mode(molecule, ColoringMode::Chain);
     }
 
     pub fn selection_count(&self) -> usize {
-        self.selection.iter().filter(|selected| **selected).count()
+        self.selection.count()
     }
 
     fn recompute_colors(&mut self) {
         for index in 0..self.colors.len() {
-            self.colors[index] = self.atom_colors[index]
-                .or(self.residue_colors[index])
-                .or(self.chain_colors[index])
+            self.colors[index] = self
+                .hierarchy_colors
+                .get(index, DisplayLevel::Atom, &self.membership)
+                .or_else(|| {
+                    self.hierarchy_colors
+                        .get(index, DisplayLevel::Residue, &self.membership)
+                })
+                .or_else(|| {
+                    self.hierarchy_colors
+                        .get(index, DisplayLevel::Chain, &self.membership)
+                })
                 .or(self.named_colors[index])
                 .unwrap_or(self.base_colors[index]);
         }
@@ -659,17 +758,16 @@ impl DisplayState {
         match level {
             DisplayLevel::Chain => base,
             DisplayLevel::Residue => self
-                .chain_colors
-                .get(atom_index)
-                .copied()
-                .flatten()
+                .hierarchy_colors
+                .get(atom_index, DisplayLevel::Chain, &self.membership)
                 .unwrap_or(base),
             DisplayLevel::Atom => self
-                .residue_colors
-                .get(atom_index)
-                .copied()
-                .flatten()
-                .or_else(|| self.chain_colors.get(atom_index).copied().flatten())
+                .hierarchy_colors
+                .get(atom_index, DisplayLevel::Residue, &self.membership)
+                .or_else(|| {
+                    self.hierarchy_colors
+                        .get(atom_index, DisplayLevel::Chain, &self.membership)
+                })
                 .unwrap_or(base),
         }
     }
@@ -678,15 +776,21 @@ impl DisplayState {
         for index in 0..self.visible.len() {
             let state = [
                 self.named_visibility[index],
-                self.chain_visibility[index],
-                self.residue_visibility[index],
-                self.atom_visibility[index],
+                self.hierarchy_visibility
+                    .get(index, DisplayLevel::Chain, &self.membership)
+                    .unwrap_or_default(),
+                self.hierarchy_visibility
+                    .get(index, DisplayLevel::Residue, &self.membership)
+                    .unwrap_or_default(),
+                self.hierarchy_visibility
+                    .get(index, DisplayLevel::Atom, &self.membership)
+                    .unwrap_or_default(),
             ]
             .into_iter()
             .rev()
             .find(|state| *state != VisibilityOverride::Inherit)
             .unwrap_or(VisibilityOverride::Show);
-            self.visible[index] = state == VisibilityOverride::Show;
+            self.visible.set(index, state == VisibilityOverride::Show);
         }
     }
 
@@ -694,15 +798,179 @@ impl DisplayState {
         for index in 0..self.modes.len() {
             self.modes[index] = [
                 self.named_modes[index],
-                self.chain_modes[index],
-                self.residue_modes[index],
-                self.atom_modes[index],
+                self.hierarchy_modes
+                    .get(index, DisplayLevel::Chain, &self.membership)
+                    .unwrap_or_default(),
+                self.hierarchy_modes
+                    .get(index, DisplayLevel::Residue, &self.membership)
+                    .unwrap_or_default(),
+                self.hierarchy_modes
+                    .get(index, DisplayLevel::Atom, &self.membership)
+                    .unwrap_or_default(),
             ]
             .into_iter()
             .rev()
             .find_map(ModeOverride::mode)
             .unwrap_or(self.global_mode);
         }
+    }
+
+    fn recompute_representations(&mut self) {
+        self.representations
+            .clone_from(&self.default_representations);
+        for (&index, &value) in &self.representation_overrides {
+            if let Some(slot) = self.representations.get_mut(index) {
+                *slot = value;
+            }
+        }
+    }
+
+    fn recompute_all(&mut self) {
+        self.recompute_representations();
+        self.recompute_colors();
+        self.recompute_visibility();
+        self.recompute_modes();
+    }
+
+    pub fn color_override_values(&self, level: DisplayLevel) -> Vec<Option<DisplayColor>> {
+        (0..self.colors.len())
+            .map(|index| self.hierarchy_colors.get(index, level, &self.membership))
+            .collect()
+    }
+
+    pub fn visibility_override_values(&self, level: DisplayLevel) -> Vec<VisibilityOverride> {
+        (0..self.colors.len())
+            .map(|index| self.visibility_override(index, level))
+            .collect()
+    }
+
+    pub fn mode_override_values(&self, level: DisplayLevel) -> Vec<ModeOverride> {
+        (0..self.colors.len())
+            .map(|index| self.mode_override(index, level))
+            .collect()
+    }
+
+    pub fn load_color_override_values(
+        &mut self,
+        level: DisplayLevel,
+        values: Vec<Option<DisplayColor>>,
+    ) {
+        for (index, value) in values.into_iter().enumerate() {
+            self.hierarchy_colors
+                .set(&[index], level, value.map(opaque), &self.membership);
+        }
+        self.recompute_colors();
+    }
+
+    pub fn load_visibility_override_values(
+        &mut self,
+        level: DisplayLevel,
+        values: Vec<VisibilityOverride>,
+    ) {
+        for (index, value) in values.into_iter().enumerate() {
+            self.hierarchy_visibility.set(
+                &[index],
+                level,
+                (value != VisibilityOverride::Inherit).then_some(value),
+                &self.membership,
+            );
+        }
+        self.recompute_visibility();
+    }
+
+    pub fn load_mode_override_values(&mut self, level: DisplayLevel, values: Vec<ModeOverride>) {
+        for (index, value) in values.into_iter().enumerate() {
+            self.hierarchy_modes.set(
+                &[index],
+                level,
+                (value != ModeOverride::Inherit).then_some(value),
+                &self.membership,
+            );
+        }
+        self.recompute_modes();
+    }
+
+    pub fn estimated_edit_state_bytes(&self) -> usize {
+        self.selection.estimated_heap_bytes()
+            + self.representation_overrides.capacity()
+                * (size_of::<usize>() + size_of::<RepresentationMask>())
+            + override_bytes(&self.hierarchy_colors)
+            + override_bytes(&self.hierarchy_visibility)
+            + override_bytes(&self.hierarchy_modes)
+    }
+}
+
+fn override_bytes<T>(overrides: &HierarchyOverrides<T>) -> usize {
+    overrides.chains.capacity() * (size_of::<u32>() + size_of::<T>())
+        + overrides.residues.capacity() * (size_of::<u32>() + size_of::<T>())
+        + overrides.atoms.capacity() * (size_of::<usize>() + size_of::<T>())
+}
+
+fn default_representations(molecule: &Molecule) -> Vec<RepresentationMask> {
+    molecule
+        .atoms
+        .iter()
+        .map(|atom| {
+            if atom.element == molecule::Element::H {
+                RepresentationMask::STICKS
+            } else {
+                RepresentationMask::SPHERES | RepresentationMask::STICKS
+            }
+        })
+        .collect()
+}
+
+fn hierarchy_membership(molecule: &Molecule) -> Vec<HierarchyMembership> {
+    let mut chain_ids = HashMap::<String, u32>::new();
+    let mut residue_ids = HashMap::<(String, i32, Option<char>), u32>::new();
+    let mut next_chain = 0_u32;
+    let mut next_residue = 0_u32;
+    molecule
+        .atoms
+        .iter()
+        .map(|atom| {
+            let chain = *chain_ids.entry(atom.chain_id.clone()).or_insert_with(|| {
+                let id = next_chain;
+                next_chain = next_chain.saturating_add(1);
+                id
+            });
+            let residue_key = (
+                atom.chain_id.clone(),
+                atom.residue_number,
+                atom.insertion_code,
+            );
+            let residue = *residue_ids.entry(residue_key).or_insert_with(|| {
+                let id = next_residue;
+                next_residue = next_residue.saturating_add(1);
+                id
+            });
+            HierarchyMembership { chain, residue }
+        })
+        .collect()
+}
+
+fn base_colors(
+    molecule: &Molecule,
+    mode: ColoringMode,
+    uniform_color: DisplayColor,
+) -> Vec<DisplayColor> {
+    match mode {
+        ColoringMode::Element => element_colors(molecule),
+        ColoringMode::Chain => indexed_categorical_colors(molecule, |atom| atom.chain_id.clone()),
+        ColoringMode::Residue => indexed_categorical_colors(molecule, |atom| {
+            format!(
+                "{}:{}:{}:{:?}",
+                atom.chain_id, atom.residue_name, atom.residue_number, atom.insertion_code
+            )
+        }),
+        ColoringMode::ResidueType => molecule
+            .atoms
+            .iter()
+            .map(|atom| categorical_color(&atom.residue_name))
+            .collect(),
+        ColoringMode::SecondaryStructure => secondary_structure_colors(molecule),
+        ColoringMode::BFactor => b_factor_colors(molecule),
+        ColoringMode::Uniform => vec![uniform_color; molecule.atoms.len()],
     }
 }
 

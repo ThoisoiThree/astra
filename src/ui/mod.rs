@@ -6,7 +6,7 @@ use molview::{
     camera::OrbitCamera,
     measurement::{MAX_MEASUREMENT_THICKNESS, MeasurementLine},
     molecule::{Atom, Molecule, MoleculeHierarchy, ResidueGroup},
-    selection::Selection,
+    selection::{Selection, SelectionStatus},
 };
 
 #[derive(Debug, Default)]
@@ -235,6 +235,7 @@ pub struct UiActions {
     pub open: bool,
     pub fetch: Option<String>,
     pub cancel_fetch: bool,
+    pub cancel_background_job: Option<u64>,
     pub activate_session: Option<u64>,
     pub close_session: Option<u64>,
     pub save: bool,
@@ -255,6 +256,7 @@ impl Default for UiActions {
             open: false,
             fetch: None,
             cancel_fetch: false,
+            cancel_background_job: None,
             activate_session: None,
             close_session: None,
             save: false,
@@ -275,6 +277,7 @@ impl Default for UiActions {
 pub struct SessionTab {
     pub id: u64,
     pub label: String,
+    pub dirty: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -292,6 +295,7 @@ pub struct UiInfo<'a> {
     pub named_selections: &'a BTreeMap<String, Selection>,
     pub named_selection_expressions: &'a BTreeMap<String, String>,
     pub named_selection_styles: &'a BTreeMap<String, NamedSelectionStyle>,
+    pub named_selection_statuses: &'a BTreeMap<String, SelectionStatus>,
     pub measurement_lines: &'a [MeasurementLine],
     pub hierarchy_names: &'a BTreeMap<InspectionTarget, String>,
     pub inspection: Option<InspectionTarget>,
@@ -303,6 +307,9 @@ pub struct UiInfo<'a> {
     pub fetch_downloaded_bytes: u64,
     pub fetch_total_bytes: Option<u64>,
     pub fetch_bytes_per_second: f64,
+    pub background_job_id: Option<u64>,
+    pub background_stage: Option<&'a str>,
+    pub background_progress: f32,
 }
 
 impl UiState {
@@ -335,6 +342,18 @@ impl UiState {
                 }
                 ui.separator();
                 ui.strong(info.filename.unwrap_or("No molecule loaded"));
+                if let (Some(job_id), Some(stage)) = (info.background_job_id, info.background_stage)
+                {
+                    ui.spinner();
+                    ui.add(
+                        egui::ProgressBar::new(info.background_progress)
+                            .desired_width(110.0)
+                            .text(stage),
+                    );
+                    if ui.small_button("Cancel").clicked() {
+                        actions.cancel_background_job = Some(job_id);
+                    }
+                }
             });
         });
         if let Some(response) = &file_button {
@@ -406,7 +425,11 @@ impl UiState {
                                             if ui
                                                 .selectable_label(
                                                     selected,
-                                                    format!("◉ {}", tab.label),
+                                                    format!(
+                                                        "◉ {}{}",
+                                                        tab.label,
+                                                        if tab.dirty { " ●" } else { "" }
+                                                    ),
                                                 )
                                                 .clicked()
                                             {
@@ -1477,10 +1500,15 @@ fn named_selections(
         return;
     };
     for (name, selection) in info.named_selections {
+        let status = info
+            .named_selection_statuses
+            .get(name)
+            .unwrap_or(&SelectionStatus::Valid);
         let indices: Vec<_> = selection.indices().collect();
         let Some(first_atom) = indices.first().copied() else {
             ui.horizontal(|ui| {
-                let response = ui.weak(format!("{name}  (empty)"));
+                selection_status_badge(ui, status);
+                let response = ui.weak(format!("{name}  (empty · {})", status.label()));
                 named_expression_menu(
                     response,
                     name,
@@ -1513,6 +1541,7 @@ fn named_selections(
         );
         state
             .show_header(ui, |ui| {
+                selection_status_badge(ui, status);
                 let effective_mode = style.mode.mode().unwrap_or(display.global_mode);
                 let mode_response = mode_button(ui, effective_mode, style.mode)
                     .on_hover_text("Named selection display mode");
@@ -1576,7 +1605,7 @@ fn named_selections(
                     if ui.button("Set to children").clicked() {
                         let effective = match style.visibility {
                             VisibilityOverride::Inherit => {
-                                if display.visible.get(first_atom).copied().unwrap_or(true) {
+                                if display.visible.get(first_atom).unwrap_or(true) {
                                     VisibilityOverride::Show
                                 } else {
                                     VisibilityOverride::Hide
@@ -1598,7 +1627,7 @@ fn named_selections(
                     });
                 }
 
-                let label = format!("{name}  ({})", selection.count());
+                let label = format!("{name}  ({} · {})", selection.count(), status.label());
                 let name_response = ui
                     .selectable_label(false, label)
                     .on_hover_text("Activate selection · right-click to edit expression");
@@ -1624,6 +1653,28 @@ fn named_selections(
                 named_selection_hierarchy(ui, name, selection, molecule, hierarchy, info, actions);
             });
     }
+}
+
+fn selection_status_badge(ui: &mut egui::Ui, status: &SelectionStatus) {
+    let (color, detail) = match status {
+        SelectionStatus::Valid => (
+            egui::Color32::from_rgb(70, 190, 105),
+            "Expression is valid".into(),
+        ),
+        SelectionStatus::Broken(names) => (
+            egui::Color32::from_rgb(225, 90, 75),
+            format!("Missing dependencies: {}", names.join(", ")),
+        ),
+        SelectionStatus::Cyclic => (
+            egui::Color32::from_rgb(215, 80, 190),
+            "Cyclic selection dependency".into(),
+        ),
+        SelectionStatus::Stale(error) => (
+            egui::Color32::from_rgb(225, 165, 55),
+            format!("Using the last valid result: {error}"),
+        ),
+    };
+    ui.colored_label(color, "●").on_hover_text(detail);
 }
 
 fn named_expression_menu(
@@ -1665,7 +1716,7 @@ fn named_selection_hierarchy(
             .residues
             .iter()
             .flat_map(|residue| residue.atom_indices.iter().copied())
-            .filter(|index| selection.flags().get(*index).copied().unwrap_or(false))
+            .filter(|index| selection.flags().get(*index).unwrap_or(false))
             .collect();
         if chain_indices.is_empty() {
             continue;
@@ -1698,7 +1749,7 @@ fn named_selection_hierarchy(
                         .atom_indices
                         .iter()
                         .copied()
-                        .filter(|index| selection.flags().get(*index).copied().unwrap_or(false))
+                        .filter(|index| selection.flags().get(*index).unwrap_or(false))
                         .collect();
                     if residue_indices.is_empty() {
                         continue;
@@ -1898,17 +1949,8 @@ fn hierarchy_tree(
             return None;
         };
         hierarchy
-            .chains
-            .iter()
-            .enumerate()
-            .find_map(|(chain_index, chain)| {
-                chain
-                    .residues
-                    .iter()
-                    .enumerate()
-                    .find(|(_, residue)| residue.atom_indices.contains(&atom_index))
-                    .map(|(residue_index, _)| (chain_index, residue_index, atom_index))
-            })
+            .atom_path(atom_index)
+            .map(|path| (path.chain_index, path.residue_index, atom_index))
     });
     for (chain_index, chain) in hierarchy.chains.iter().enumerate() {
         let chain_target = InspectionTarget::Chain(chain_index);
