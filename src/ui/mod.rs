@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use molview::{
+use astra::{
     AmbientOcclusionSettings, ColoringMode, DisplayColor, DisplayLevel, DisplayMode, DisplayState,
     ModeOverride, NamedSelectionStyle, VisibilityOverride,
     camera::OrbitCamera,

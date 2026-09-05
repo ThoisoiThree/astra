@@ -771,7 +771,7 @@ pub(super) fn recovery_directory() -> Result<PathBuf> {
         });
     let directory = base
         .context("could not determine the user data directory")?
-        .join("molview/recovery");
+        .join("astra/recovery");
     fs::create_dir_all(&directory)
         .with_context(|| format!("could not create {}", directory.display()))?;
     Ok(directory)
@@ -779,7 +779,7 @@ pub(super) fn recovery_directory() -> Result<PathBuf> {
 
 pub(super) fn recovery_path_for(session_id: u64) -> Result<PathBuf> {
     Ok(recovery_directory()?.join(format!(
-        "molview-{}-{session_id}.recovery.mol",
+        "astra-{}-{session_id}.recovery.mol",
         std::process::id()
     )))
 }

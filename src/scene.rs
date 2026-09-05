@@ -27,7 +27,7 @@ use crate::{AmbientOcclusionQuality, ColoringMode, DisplayMode, molecule::Elemen
 
 pub const SCENE_EXTENSION: &str = "mol";
 pub const SCENE_FORMAT_NAME: &str = "Molecule 1.0";
-pub const SCENE_MIME_TYPE: &str = "application/vnd.molview.molecule";
+pub const SCENE_MIME_TYPE: &str = "application/vnd.astra.molecule";
 pub const SCENE_SCHEMA_VERSION: u32 = 1;
 pub const SCENE_READER_VERSION: u32 = 2;
 

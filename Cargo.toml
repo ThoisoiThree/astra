@@ -8,7 +8,6 @@ readme = "README.md"
 description = "Astra: a native molecular viewer built with Rust and wgpu"
 
 [lib]
-name = "molview"
 path = "src/lib.rs"
 
 [dependencies]

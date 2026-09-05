@@ -1,10 +1,10 @@
 use std::{hint::black_box, time::Instant};
 
-use glam::Vec3;
-use molview::{
+use astra::{
     DisplayLevel, DisplayState,
     molecule::{Atom, Element, Molecule},
 };
+use glam::Vec3;
 
 fn molecule(atom_count: usize) -> Molecule {
     let template = Atom {

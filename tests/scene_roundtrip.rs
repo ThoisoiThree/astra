@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use molview::{
+use astra::{
     DisplayState,
     camera::OrbitCamera,
     molecule::parse_structure,

@@ -5,8 +5,8 @@ all selections and expressions, hierarchy and selection styling, representations
 camera projection, clipping, pivot, and depth of field. GPU resources, tessellated meshes, viewport
 pixels, undo history, and transient dialogs are intentionally excluded and rebuilt on load.
 
-The media type is `application/vnd.molview.molecule`. The `.mol` suffix is also traditionally used
-by MDL Molfile, so the suffix alone never identifies this format. molview always checks the leading
+The media type is `application/vnd.astra.molecule`. The `.mol` suffix is also traditionally used
+by MDL Molfile, so the suffix alone never identifies this format. Astra always checks the leading
 ASCII magic `MOLECULE`; a `.mol` file without it is reported explicitly as an unsupported MDL
 Molfile instead of being passed to the Molecule decoder.
 
@@ -67,7 +67,7 @@ Save encodes to a uniquely named temporary file in the destination directory, fl
 it, then atomically renames it over the destination. A failed write leaves the previous project intact.
 Changed tabs show a dirty indicator and require an explicit Save, Discard, or Cancel decision on close.
 
-Dirty documents are autosaved after a short idle delay into molview's per-user recovery directory.
+Dirty documents are autosaved after a short idle delay into Astra's per-user recovery directory.
 Recovery files never replace the user's project and are offered for restore at the next start. A
 successful Save or an explicit Discard removes the corresponding recovery file.
 

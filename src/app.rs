@@ -15,8 +15,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use glam::{Vec2, Vec3};
-use molview::{
+use astra::{
     DisplayColor, DisplayLevel, DisplayMode, DisplayState, DisplayStateData, ModeOverride,
     NamedSelectionStyle, RepresentationMask, VisibilityOverride,
     camera::{OrbitCamera, Viewport},
@@ -37,6 +36,7 @@ use molview::{
         resolve_named_expressions, validate_unique_name,
     },
 };
+use glam::{Vec2, Vec3};
 use winit::{
     application::ApplicationHandler,
     dpi::{LogicalSize, PhysicalPosition},
@@ -1843,7 +1843,7 @@ impl Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use molview::{
+    use astra::{
         molecule::{Atom, Element},
         selection::{evaluate, parse_selection},
     };
@@ -2021,7 +2021,7 @@ mod tests {
     #[test]
     fn atomic_write_replaces_complete_files_and_limited_read_checks_metadata() {
         let directory = env::temp_dir().join(format!(
-            "molview-p0-{}-{}",
+            "astra-p0-{}-{}",
             std::process::id(),
             TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
@@ -2046,7 +2046,7 @@ mod tests {
     #[test]
     #[ignore = "requires access to files.rcsb.org"]
     fn fetches_and_validates_a_real_rcsb_entry() {
-        let directory = env::temp_dir().join(format!("molview-fetch-test-{}", std::process::id()));
+        let directory = env::temp_dir().join(format!("astra-fetch-test-{}", std::process::id()));
         let path = download_pdb("4R8P", &directory).unwrap();
         let contents = fs::read(&path).unwrap();
         let (molecule, _) = parse_structure(&contents, "4R8P.cif").unwrap();

@@ -2,7 +2,7 @@ use super::*;
 
 pub fn run(initial_path: Option<PathBuf>) -> Result<()> {
     let event_loop = EventLoop::new().context("could not create the native event loop")?;
-    let mut application = MolviewApplication {
+    let mut application = AstraApplication {
         runtime: None,
         initial_path,
         startup_error: None,
@@ -17,13 +17,13 @@ pub fn run(initial_path: Option<PathBuf>) -> Result<()> {
     }
 }
 
-struct MolviewApplication {
+struct AstraApplication {
     runtime: Option<Runtime>,
     initial_path: Option<PathBuf>,
     startup_error: Option<anyhow::Error>,
 }
 
-impl ApplicationHandler for MolviewApplication {
+impl ApplicationHandler for AstraApplication {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.runtime.is_some() {
             return;

@@ -476,8 +476,8 @@ pub(super) fn hierarchy_row(
 
 #[cfg(test)]
 mod tests {
+    use astra::molecule::{Atom, Element, Molecule};
     use glam::Vec3;
-    use molview::molecule::{Atom, Element, Molecule};
 
     use super::*;
 

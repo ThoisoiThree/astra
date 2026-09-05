@@ -38,12 +38,12 @@ impl GpuProfiler {
             .contains(wgpu::Features::TIMESTAMP_QUERY)
             .then(|| Self {
                 query_set: device.create_query_set(&wgpu::QuerySetDescriptor {
-                    label: Some("molview GPU timestamps"),
+                    label: Some("Astra GPU timestamps"),
                     ty: wgpu::QueryType::Timestamp,
                     count: QUERY_COUNT,
                 }),
                 resolve_buffer: device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("molview GPU timestamp resolve"),
+                    label: Some("Astra GPU timestamp resolve"),
                     size: QUERY_BYTES,
                     usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
                     mapped_at_creation: false,
@@ -110,7 +110,7 @@ impl GpuProfiler {
         }
         encoder.resolve_query_set(&self.query_set, 0..QUERY_COUNT, &self.resolve_buffer, 0);
         let readback = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("molview GPU timestamp readback"),
+            label: Some("Astra GPU timestamp readback"),
             size: QUERY_BYTES,
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,

@@ -3,7 +3,7 @@ use super::*;
 pub(super) fn performance_overlay(
     context: &egui::Context,
     viewport: egui::Rect,
-    stats: molview::render::RenderStats,
+    stats: astra::render::RenderStats,
 ) {
     let position = egui::pos2(
         (viewport.right() - 238.0).max(viewport.left()),
@@ -96,7 +96,7 @@ impl UiState {
                 egui::ComboBox::from_label("Quality")
                     .selected_text(ao.quality.label())
                     .show_ui(ui, |ui| {
-                        for quality in molview::AmbientOcclusionQuality::ALL {
+                        for quality in astra::AmbientOcclusionQuality::ALL {
                             changed |= ui
                                 .selectable_value(&mut ao.quality, quality, quality.label())
                                 .changed();

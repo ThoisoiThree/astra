@@ -1,9 +1,9 @@
 use std::{error::Error, fs, path::PathBuf};
 
-use molview::molecule::{
+use astra::molecule::{
     MoleculeHierarchy, SecondaryStructure, assign_secondary_structure, parse_pdb,
 };
-use molview::selection::{evaluate, parse_selection};
+use astra::selection::{evaluate, parse_selection};
 
 #[test]
 fn supplied_4r8p_builds_expected_hierarchy() -> Result<(), Box<dyn Error>> {

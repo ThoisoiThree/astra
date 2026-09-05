@@ -171,7 +171,7 @@ impl Renderer {
         let optional_features = adapter.features() & wgpu::Features::TIMESTAMP_QUERY;
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
-                label: Some("molview device"),
+                label: Some("Astra device"),
                 required_features: optional_features,
                 required_limits: wgpu::Limits::default(),
                 experimental_features: wgpu::ExperimentalFeatures::disabled(),
@@ -591,7 +591,7 @@ impl Renderer {
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("molview frame encoder"),
+                label: Some("Astra frame encoder"),
             });
         let screen = ScreenDescriptor {
             size_in_pixels: [self.config.width, self.config.height],
