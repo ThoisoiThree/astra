@@ -41,10 +41,10 @@ pub(super) enum JobRequest {
     },
     Cartoon {
         id: u64,
-        session_id: u64,
-        version: u64,
         molecule: Box<Molecule>,
         display: Box<DisplayState>,
+        hierarchy: Box<MoleculeHierarchy>,
+        secondary_structure: Vec<Vec<SecondaryStructure>>,
         cancel: Arc<AtomicBool>,
     },
 }
@@ -74,6 +74,7 @@ pub(super) enum LoadedPayload {
         molecule_id: String,
         molecule: Molecule,
         hierarchy: MoleculeHierarchy,
+        secondary_structure: Vec<Vec<SecondaryStructure>>,
         atom_bvh: AtomBvh,
         display: Box<DisplayState>,
     },
@@ -82,6 +83,7 @@ pub(super) enum LoadedPayload {
         path: PathBuf,
         document: Box<SceneDocument>,
         hierarchy: MoleculeHierarchy,
+        secondary_structure: Vec<Vec<SecondaryStructure>>,
         atom_bvh: AtomBvh,
     },
 }
@@ -267,7 +269,7 @@ pub(super) fn pdb_agent() -> ureq::Agent {
 pub(super) fn download_metadata(agent: &ureq::Agent, url: &str) -> (bool, Option<u64>) {
     let Ok(response) = agent
         .head(url)
-        .header("User-Agent", concat!("molview/", env!("CARGO_PKG_VERSION")))
+        .header("User-Agent", concat!("Astra/", env!("CARGO_PKG_VERSION")))
         .call()
     else {
         return (false, None);
@@ -296,7 +298,7 @@ pub(super) fn download_pdb_stream(
 ) -> Result<Vec<u8>> {
     let mut response = agent
         .get(url)
-        .header("User-Agent", concat!("molview/", env!("CARGO_PKG_VERSION")))
+        .header("User-Agent", concat!("Astra/", env!("CARGO_PKG_VERSION")))
         .call()
         .with_context(|| format!("could not fetch PDB entry {id} from RCSB"))?;
     let total_bytes = response.body().content_length().or(advertised_size);
@@ -456,7 +458,7 @@ pub(super) fn download_pdb_range(
 ) -> Result<Vec<u8>> {
     let mut response = pdb_agent()
         .get(url)
-        .header("User-Agent", concat!("molview/", env!("CARGO_PKG_VERSION")))
+        .header("User-Agent", concat!("Astra/", env!("CARGO_PKG_VERSION")))
         .header("Range", format!("bytes={start}-{end}"))
         .call()
         .with_context(|| format!("could not fetch PDB entry {id} from RCSB"))?;
@@ -582,18 +584,22 @@ pub(super) fn background_worker(
             }
             JobRequest::Cartoon {
                 id,
-                session_id,
-                version,
                 molecule,
                 display,
+                hierarchy,
+                secondary_structure,
                 cancel,
             } => {
-                let _ = (session_id, version);
                 send_job_progress(&events, &window, id, "Building ribbon geometry", 0.2);
                 let result = if cancel.load(Ordering::Relaxed) {
                     Ok(JobOutput::Cancelled)
                 } else {
-                    let prepared = prepare_cartoon(&molecule, &display);
+                    let prepared = prepare_cartoon_cached(
+                        &molecule,
+                        &display,
+                        &hierarchy,
+                        &secondary_structure,
+                    );
                     if cancel.load(Ordering::Relaxed) {
                         Ok(JobOutput::Cancelled)
                     } else {
@@ -643,12 +649,14 @@ pub(super) fn load_in_background(
             0.82,
         );
         let hierarchy = MoleculeHierarchy::from_molecule(&document.molecule);
+        let secondary_structure = assign_secondary_structure(&document.molecule, &hierarchy);
         let atom_bvh = AtomBvh::build(&document.molecule);
         return Ok(LoadedPayload::Scene {
             filename,
             path: path.to_owned(),
             document: Box::new(document),
             hierarchy,
+            secondary_structure,
             atom_bvh,
         });
     }
@@ -673,6 +681,7 @@ pub(super) fn load_in_background(
         0.82,
     );
     let hierarchy = MoleculeHierarchy::from_molecule(&molecule);
+    let secondary_structure = assign_secondary_structure(&molecule, &hierarchy);
     let atom_bvh = AtomBvh::build(&molecule);
     let display = DisplayState::for_molecule(&molecule);
     let molecule_id = molecule_id_from_structure(&contents, &filename);
@@ -681,6 +690,7 @@ pub(super) fn load_in_background(
         molecule_id,
         molecule,
         hierarchy,
+        secondary_structure,
         atom_bvh,
         display: Box::new(display),
     })

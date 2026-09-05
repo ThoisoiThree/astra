@@ -8,6 +8,8 @@ struct PostUniform {
     aperture: vec4<f32>,
     // AO strength, world-space radius, normal bias, sample count (zero disables)
     ao: vec4<f32>,
+    // DOF samples, DOF resolution scale, reserved, reserved
+    quality: vec4<f32>,
 };
 
 @group(0) @binding(0)
@@ -22,6 +24,8 @@ var<uniform> post: PostUniform;
 var filtered_ao: texture_2d<f32>;
 @group(0) @binding(5)
 var semantic_ids: texture_2d<u32>;
+@group(0) @binding(6)
+var dof_color: texture_2d<f32>;
 
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
@@ -162,12 +166,12 @@ fn antialiased_scene(uv: vec2<f32>, dimensions: vec2<f32>) -> vec4<f32> {
     return vec4<f32>(resolved, center.a);
 }
 
-fn semantic_at(pixel: vec2<i32>, dimensions: vec2<u32>) -> vec4<u32> {
+fn semantic_at(pixel: vec2<i32>, dimensions: vec2<u32>) -> vec2<u32> {
     return textureLoad(
         semantic_ids,
         clamp(pixel, vec2<i32>(0), vec2<i32>(dimensions) - 1),
         0,
-    );
+    ).xy;
 }
 
 fn toon_outline(pixel: vec2<i32>, dimensions: vec2<u32>) -> f32 {
@@ -184,14 +188,20 @@ fn toon_outline(pixel: vec2<i32>, dimensions: vec2<u32>) -> f32 {
             let neighbor = semantic_at(pixel + vec2<i32>(x, y), dimensions);
             var radius = 0.0;
             var edge_strength = 1.0;
-            if center.w == 0u && neighbor.w != 0u {
+            let center_present = center.x != 0u;
+            let neighbor_present = neighbor.x != 0u;
+            let center_chain = center.y >> 20u;
+            let neighbor_chain = neighbor.y >> 20u;
+            let center_residue = center.y & 0xFFFFFu;
+            let neighbor_residue = neighbor.y & 0xFFFFFu;
+            if !center_present && neighbor_present {
                 radius = 2.4;
-            } else if center.w != 0u && neighbor.w == 0u {
+            } else if center_present && !neighbor_present {
                 radius = 2.4;
-            } else if center.w != 0u && neighbor.w != 0u {
-                if center.z != neighbor.z {
+            } else if center_present && neighbor_present {
+                if center_chain != neighbor_chain {
                     radius = 2.25;
-                } else if center.y != neighbor.y {
+                } else if center_residue != neighbor_residue {
                     radius = 1.85;
                     let neighbor_pixel = clamp(
                         pixel + vec2<i32>(x, y),
@@ -248,37 +258,47 @@ fn compose_toon(
     return vec4<f32>(mix(color.rgb * ao, ink, outline), color.a);
 }
 
-@fragment
-fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
-    let dimensions_u = textureDimensions(scene_color);
-    let dimensions = vec2<f32>(dimensions_u);
-    let pixel = vec2<i32>(clamp(input.position.xy, vec2<f32>(0.0), dimensions - 1.0));
-    let uv = input.position.xy / dimensions;
+fn gathered_dof(uv: vec2<f32>, dimensions: vec2<f32>) -> vec4<f32> {
+    let pixel = vec2<i32>(clamp(uv * dimensions, vec2<f32>(0.0), dimensions - 1.0));
     let center = antialiased_scene(uv, dimensions);
     let center_depth = textureLoad(scene_depth, pixel, 0);
-    let ao = textureLoad(filtered_ao, pixel, 0).r;
-    if post.lens.w < 0.5 || post.lens.z <= 0.0 {
-        return compose_toon(center, ao, pixel, dimensions_u);
-    }
-
     let center_coc = circle_of_confusion(optical_depth(uv, center_depth), dimensions.y);
 
-    // A source-based aperture gather approximates optical scatter. Coverage and
-    // near/far classification are deliberately continuous: binary CoC tests make
-    // small atoms and highlights pop as the camera crosses a sample boundary.
-    const SAMPLE_COUNT = 64u;
+    // Classify an 8x8 source tile from its center and corners. Sharp tiles bypass the
+    // aperture gather completely, which is the common case for focused molecules.
+    let tile_origin = (pixel / 8) * 8;
+    var maximum_coc = abs(center_coc);
+    for (var corner = 0u; corner < 4u; corner += 1u) {
+        let corner_offset = vec2<i32>(i32((corner & 1u) * 7u), i32((corner >> 1u) * 7u));
+        let sample_pixel = clamp(
+            tile_origin + corner_offset,
+            vec2<i32>(0),
+            vec2<i32>(dimensions) - 1,
+        );
+        let sample_uv = (vec2<f32>(sample_pixel) + 0.5) / dimensions;
+        let sample_depth = textureLoad(scene_depth, sample_pixel, 0);
+        maximum_coc = max(
+            maximum_coc,
+            abs(circle_of_confusion(optical_depth(sample_uv, sample_depth), dimensions.y)),
+        );
+    }
+    if maximum_coc < 0.55 {
+        return center;
+    }
+
+    let sample_count = max(u32(round(post.quality.x)), 1u);
     var accumulated = center;
     var accumulated_weight = 1.0;
-    for (var index = 0u; index < SAMPLE_COUNT; index += 1u) {
-        let aperture_point = aperture_sample(f32(index), f32(SAMPLE_COUNT));
+    for (var index = 0u; index < 64u; index += 1u) {
+        if index >= sample_count {
+            break;
+        }
+        let aperture_point = aperture_sample(f32(index), f32(sample_count));
         let offset_pixels = aperture_point * post.lens.z;
         let sample_uv = clamp(uv + offset_pixels / dimensions, vec2<f32>(0.0), vec2<f32>(1.0));
         let sample_pixel = vec2<i32>(clamp(sample_uv * dimensions, vec2<f32>(0.0), dimensions - 1.0));
         let sample_depth = textureLoad(scene_depth, sample_pixel, 0);
-        let sample_coc = circle_of_confusion(
-            optical_depth(sample_uv, sample_depth),
-            dimensions.y,
-        );
+        let sample_coc = circle_of_confusion(optical_depth(sample_uv, sample_depth), dimensions.y);
         let required_radius = aperture_metric(aperture_point) * post.lens.z;
         let coc_radius = abs(sample_coc);
         let coverage = 1.0 - smoothstep(
@@ -293,10 +313,33 @@ fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
             + (1.0 - near_strength) * far_source_strength * far_receiver_strength;
         let rim_weight = 0.8 + 0.4 * aperture_metric(aperture_point);
         let weight = coverage * layer_strength * rim_weight;
-        let sample_color = textureSampleLevel(scene_color, scene_sampler, sample_uv, 0.0);
-        accumulated += sample_color * weight;
+        accumulated += textureSampleLevel(scene_color, scene_sampler, sample_uv, 0.0) * weight;
         accumulated_weight += weight;
     }
-    let resolved = accumulated / accumulated_weight;
+    return accumulated / accumulated_weight;
+}
+
+@fragment
+fn dof_main(input: VertexOutput) -> @location(0) vec4<f32> {
+    let dimensions_u = textureDimensions(scene_color);
+    let dimensions = vec2<f32>(dimensions_u);
+    let target_dimensions = dimensions * post.quality.y;
+    let uv = input.position.xy / target_dimensions;
+    return gathered_dof(uv, dimensions);
+}
+
+@fragment
+fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
+    let dimensions_u = textureDimensions(scene_color);
+    let dimensions = vec2<f32>(dimensions_u);
+    let pixel = vec2<i32>(clamp(input.position.xy, vec2<f32>(0.0), dimensions - 1.0));
+    let uv = input.position.xy / dimensions;
+    var resolved = antialiased_scene(uv, dimensions);
+    if post.lens.w >= 0.5 && post.lens.z > 0.0 {
+        // Linear upsampling is the full-resolution resolve for Preview/Medium. High binds a
+        // full-resolution gather target through the same path.
+        resolved = textureSampleLevel(dof_color, scene_sampler, uv, 0.0);
+    }
+    let ao = select(1.0, textureLoad(filtered_ao, pixel, 0).r, post.ao.w > 0.5);
     return compose_toon(resolved, ao, pixel, dimensions_u);
 }

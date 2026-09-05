@@ -138,7 +138,7 @@ pub(super) fn mode_override_from_code(code: u32) -> Result<ModeOverride, SceneEr
 
 pub(super) fn ao_quality_code(quality: AmbientOcclusionQuality) -> i32 {
     match quality {
-        AmbientOcclusionQuality::Low => 0,
+        AmbientOcclusionQuality::Preview => 0,
         AmbientOcclusionQuality::Medium => 1,
         AmbientOcclusionQuality::High => 2,
     }
@@ -146,7 +146,7 @@ pub(super) fn ao_quality_code(quality: AmbientOcclusionQuality) -> i32 {
 
 pub(super) fn ao_quality_from_code(code: i32) -> Result<AmbientOcclusionQuality, SceneError> {
     match code {
-        0 => Ok(AmbientOcclusionQuality::Low),
+        0 => Ok(AmbientOcclusionQuality::Preview),
         1 => Ok(AmbientOcclusionQuality::Medium),
         2 => Ok(AmbientOcclusionQuality::High),
         value => Err(invalid(format!("unknown AO quality {value}"))),

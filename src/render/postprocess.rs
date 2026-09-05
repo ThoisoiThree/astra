@@ -18,6 +18,7 @@ pub(super) struct PostUniform {
     pub(super) lens: [f32; 4],
     pub(super) aperture: [f32; 4],
     pub(super) ao: [f32; 4],
+    pub(super) quality: [f32; 4],
 }
 
 pub(super) struct PostProcess {
@@ -25,11 +26,15 @@ pub(super) struct PostProcess {
     pub(super) semantic: SemanticTarget,
     pub(super) ao_raw: ColorTarget,
     pub(super) ao_filtered: ColorTarget,
+    pub(super) dof_color: ColorTarget,
+    pub(super) dof_scale: f32,
     pub(super) uniform: wgpu::Buffer,
     pub(super) sampler: wgpu::Sampler,
     pub(super) bind_group_layout: wgpu::BindGroupLayout,
     pub(super) bind_group: wgpu::BindGroup,
+    pub(super) dof_source_bind_group: wgpu::BindGroup,
     pub(super) pipeline: wgpu::RenderPipeline,
+    pub(super) dof_pipeline: wgpu::RenderPipeline,
     pub(super) ao_bind_group_layout: wgpu::BindGroupLayout,
     pub(super) ao_raw_bind_group: wgpu::BindGroup,
     pub(super) ao_blur_bind_group: wgpu::BindGroup,
@@ -54,6 +59,14 @@ impl PostProcess {
             width,
             height,
             AO_FORMAT,
+        );
+        let dof_scale = 0.5;
+        let dof_color = ColorTarget::new(
+            device,
+            "half-resolution depth of field",
+            scaled_dimension(width, dof_scale),
+            scaled_dimension(height, dof_scale),
+            SCENE_FORMAT,
         );
         let uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("DOF postprocess uniform"),
@@ -127,6 +140,16 @@ impl PostProcess {
                     },
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 6,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
         let bind_group = create_post_bind_group(
@@ -138,6 +161,18 @@ impl PostProcess {
             &uniform,
             &ao_filtered.view,
             &semantic.view,
+            &dof_color.view,
+        );
+        let dof_source_bind_group = create_post_bind_group(
+            device,
+            &bind_group_layout,
+            &scene.view,
+            &sampler,
+            depth_view,
+            &uniform,
+            &ao_filtered.view,
+            &semantic.view,
+            &scene.view,
         );
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("DOF postprocess shader"),
@@ -173,6 +208,14 @@ impl PostProcess {
             multiview_mask: None,
             cache: None,
         });
+        let dof_pipeline = create_fullscreen_pipeline(
+            device,
+            "depth of field gather pipeline",
+            &pipeline_layout,
+            &shader,
+            "dof_main",
+            SCENE_FORMAT,
+        );
 
         let ao_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -254,11 +297,15 @@ impl PostProcess {
             semantic,
             ao_raw,
             ao_filtered,
+            dof_color,
+            dof_scale,
             uniform,
             sampler,
             bind_group_layout,
             bind_group,
+            dof_source_bind_group,
             pipeline,
+            dof_pipeline,
             ao_bind_group_layout,
             ao_raw_bind_group,
             ao_blur_bind_group,
@@ -284,6 +331,13 @@ impl PostProcess {
             height,
             AO_FORMAT,
         );
+        self.dof_color = ColorTarget::new(
+            device,
+            "depth of field color",
+            scaled_dimension(width, self.dof_scale),
+            scaled_dimension(height, self.dof_scale),
+            SCENE_FORMAT,
+        );
         self.bind_group = create_post_bind_group(
             device,
             &self.bind_group_layout,
@@ -293,6 +347,18 @@ impl PostProcess {
             &self.uniform,
             &self.ao_filtered.view,
             &self.semantic.view,
+            &self.dof_color.view,
+        );
+        self.dof_source_bind_group = create_post_bind_group(
+            device,
+            &self.bind_group_layout,
+            &self.scene.view,
+            &self.sampler,
+            depth_view,
+            &self.uniform,
+            &self.ao_filtered.view,
+            &self.semantic.view,
+            &self.scene.view,
         );
         self.ao_raw_bind_group = create_ao_bind_group(
             device,
@@ -309,6 +375,43 @@ impl PostProcess {
             &self.ao_raw.view,
         );
     }
+
+    pub(super) fn set_dof_scale(
+        &mut self,
+        device: &wgpu::Device,
+        width: u32,
+        height: u32,
+        depth_view: &wgpu::TextureView,
+        scale: f32,
+    ) {
+        let scale = scale.clamp(0.5, 1.0);
+        if (self.dof_scale - scale).abs() <= f32::EPSILON {
+            return;
+        }
+        self.dof_scale = scale;
+        self.dof_color = ColorTarget::new(
+            device,
+            "depth of field color",
+            scaled_dimension(width, scale),
+            scaled_dimension(height, scale),
+            SCENE_FORMAT,
+        );
+        self.bind_group = create_post_bind_group(
+            device,
+            &self.bind_group_layout,
+            &self.scene.view,
+            &self.sampler,
+            depth_view,
+            &self.uniform,
+            &self.ao_filtered.view,
+            &self.semantic.view,
+            &self.dof_color.view,
+        );
+    }
+}
+
+fn scaled_dimension(value: u32, scale: f32) -> u32 {
+    ((value.max(1) as f32 * scale).round() as u32).max(1)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -321,6 +424,7 @@ fn create_post_bind_group(
     uniform: &wgpu::Buffer,
     ao_view: &wgpu::TextureView,
     semantic_view: &wgpu::TextureView,
+    dof_view: &wgpu::TextureView,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("DOF postprocess bind group"),
@@ -349,6 +453,10 @@ fn create_post_bind_group(
             wgpu::BindGroupEntry {
                 binding: 5,
                 resource: wgpu::BindingResource::TextureView(semantic_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 6,
+                resource: wgpu::BindingResource::TextureView(dof_view),
             },
         ],
     })

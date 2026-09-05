@@ -1,6 +1,8 @@
 use super::*;
 
 #[derive(Debug, Clone, PartialEq)]
+/// Snapshot of undoable editor state. Camera, focus, pivot, and viewport state are intentionally
+/// absent: they are saved in a scene but camera interaction must never consume an undo step.
 pub(super) struct EditTransaction {
     pub(super) display: Option<DisplayStateData>,
     pub(super) named_selections: BTreeMap<String, NamedSelectionRecord>,

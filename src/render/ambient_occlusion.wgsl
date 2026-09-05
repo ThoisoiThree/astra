@@ -6,6 +6,7 @@ struct PostUniform {
     aperture: vec4<f32>,
     // strength, world-space radius, normal bias, sample count (zero disables)
     ao: vec4<f32>,
+    quality: vec4<f32>,
 };
 
 @group(0) @binding(0)

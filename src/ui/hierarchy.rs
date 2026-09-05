@@ -104,6 +104,84 @@ pub(super) fn property_grid(ui: &mut egui::Ui, properties: &[(&str, String)]) {
         });
 }
 
+#[derive(Debug, Clone, Copy)]
+enum HierarchyListRow {
+    Chain(usize),
+    Residue {
+        chain_index: usize,
+        residue_index: usize,
+    },
+    Atom {
+        atom_index: usize,
+        depth: usize,
+    },
+}
+
+fn hierarchy_open(ui: &egui::Ui, id: egui::Id, force_open: bool) -> bool {
+    let mut state =
+        egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, false);
+    if force_open && !state.is_open() {
+        state.set_open(true);
+        state.store(ui.ctx());
+    }
+    state.is_open()
+}
+
+fn disclosure_button(ui: &mut egui::Ui, id: egui::Id, open: bool) {
+    let symbol = if open { "▾" } else { "▸" };
+    let response = ui
+        .push_id(id.with("toggle"), |ui| {
+            ui.add_sized(
+                [ui.spacing().indent, ui.spacing().interact_size.y],
+                egui::Button::new(symbol).frame(false),
+            )
+        })
+        .inner;
+    if response.clicked() {
+        let mut state =
+            egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, false);
+        state.toggle(ui);
+        state.store(ui.ctx());
+    }
+}
+
+fn visible_hierarchy_rows(
+    ui: &egui::Ui,
+    hierarchy: &MoleculeHierarchy,
+    inspected_atom_path: Option<(usize, usize, usize)>,
+) -> Vec<HierarchyListRow> {
+    let mut rows = Vec::new();
+    for (chain_index, chain) in hierarchy.chains.iter().enumerate() {
+        rows.push(HierarchyListRow::Chain(chain_index));
+        let chain_on_path = inspected_atom_path
+            .is_some_and(|(inspected_chain, _, _)| inspected_chain == chain_index);
+        let chain_id = ui.make_persistent_id(("chain", chain_index));
+        if !hierarchy_open(ui, chain_id, chain_on_path) {
+            continue;
+        }
+        for (residue_index, residue) in chain.residues.iter().enumerate() {
+            rows.push(HierarchyListRow::Residue {
+                chain_index,
+                residue_index,
+            });
+            let residue_on_path =
+                inspected_atom_path.is_some_and(|(inspected_chain, inspected_residue, _)| {
+                    inspected_chain == chain_index && inspected_residue == residue_index
+                });
+            let residue_id = ui.make_persistent_id(("residue", chain_index, residue_index));
+            if hierarchy_open(ui, residue_id, residue_on_path) {
+                rows.extend(residue.atom_indices.iter().copied().map(|atom_index| {
+                    HierarchyListRow::Atom {
+                        atom_index,
+                        depth: 2,
+                    }
+                }));
+            }
+        }
+    }
+    rows
+}
+
 pub(super) fn hierarchy_tree(
     ui: &mut egui::Ui,
     info: UiInfo<'_>,
@@ -127,132 +205,117 @@ pub(super) fn hierarchy_tree(
             .atom_path(atom_index)
             .map(|path| (path.chain_index, path.residue_index, atom_index))
     });
-    for (chain_index, chain) in hierarchy.chains.iter().enumerate() {
-        let chain_target = InspectionTarget::Chain(chain_index);
-        let chain_default_name = format!("Chain {}", display_chain(&chain.id));
-        let chain_name = info
-            .hierarchy_names
-            .get(&chain_target)
-            .unwrap_or(&chain_default_name);
-        let chain_label = format!(
-            "{} · {} residues · {} atoms",
-            chain_name,
-            chain.residues.len(),
-            chain.atom_count
-        );
-        let first_atom = chain
-            .residues
-            .iter()
-            .find_map(|residue| residue.atom_indices.first().copied());
-        let chain_on_inspected_path = inspected_atom_path
-            .is_some_and(|(inspected_chain, _, _)| inspected_chain == chain_index);
-        let mut chain_state = egui::collapsing_header::CollapsingState::load_with_default_open(
-            ui.ctx(),
-            ui.make_persistent_id(("chain", chain_index)),
-            false,
-        );
-        if chain_on_inspected_path {
-            chain_state.set_open(true);
-        }
-        chain_state
-            .show_header(ui, |ui| {
-                hierarchy_row(
-                    ui,
-                    display,
-                    chain_target,
-                    DisplayLevel::Chain,
-                    first_atom,
-                    &chain_label,
-                    info.hierarchy_selection.contains(&chain_target) || chain_on_inspected_path,
-                    info.hierarchy_selection,
-                    actions,
-                    color_editor,
-                    rename_editor,
-                    &chain_default_name,
-                    info.hierarchy_names.get(&chain_target),
-                );
-            })
-            .body(|ui| {
-                for (residue_index, residue) in chain.residues.iter().enumerate() {
-                    let residue_target = InspectionTarget::Residue {
+    let rows = visible_hierarchy_rows(ui, hierarchy, inspected_atom_path);
+    let row_height = ui.spacing().interact_size.y;
+    egui::ScrollArea::vertical()
+        .id_salt("virtual molecule hierarchy")
+        .auto_shrink([false, false])
+        .show_rows(ui, row_height, rows.len(), |ui, visible_range| {
+            for row in &rows[visible_range] {
+                ui.horizontal(|ui| match *row {
+                    HierarchyListRow::Chain(chain_index) => {
+                        let Some(chain) = hierarchy.chains.get(chain_index) else {
+                            return;
+                        };
+                        let target = InspectionTarget::Chain(chain_index);
+                        let default_name = format!("Chain {}", display_chain(&chain.id));
+                        let name = info.hierarchy_names.get(&target).unwrap_or(&default_name);
+                        let label = format!(
+                            "{} · {} residues · {} atoms",
+                            name,
+                            chain.residues.len(),
+                            chain.atom_count
+                        );
+                        let first_atom = chain
+                            .residues
+                            .iter()
+                            .find_map(|residue| residue.atom_indices.first().copied());
+                        let on_path = inspected_atom_path
+                            .is_some_and(|(inspected_chain, _, _)| inspected_chain == chain_index);
+                        let id = ui.make_persistent_id(("chain", chain_index));
+                        disclosure_button(ui, id, hierarchy_open(ui, id, on_path));
+                        hierarchy_row(
+                            ui,
+                            display,
+                            target,
+                            DisplayLevel::Chain,
+                            first_atom,
+                            &label,
+                            info.hierarchy_selection.contains(&target) || on_path,
+                            info.hierarchy_selection,
+                            actions,
+                            color_editor,
+                            rename_editor,
+                            &default_name,
+                            info.hierarchy_names.get(&target),
+                        );
+                    }
+                    HierarchyListRow::Residue {
                         chain_index,
                         residue_index,
-                    };
-                    let residue_default_name = residue.id.label();
-                    let residue_name = info
-                        .hierarchy_names
-                        .get(&residue_target)
-                        .unwrap_or(&residue_default_name);
-                    let residue_label =
-                        format!("{} · {} atoms", residue_name, residue.atom_indices.len());
-                    let residue_on_inspected_path = inspected_atom_path.is_some_and(
-                        |(inspected_chain, inspected_residue, _)| {
-                            inspected_chain == chain_index && inspected_residue == residue_index
-                        },
-                    );
-                    let mut residue_state =
-                        egui::collapsing_header::CollapsingState::load_with_default_open(
-                            ui.ctx(),
-                            ui.make_persistent_id(("residue", chain_index, residue_index)),
-                            false,
+                    } => {
+                        let Some(residue) = hierarchy.residue(chain_index, residue_index) else {
+                            return;
+                        };
+                        ui.add_space(ui.spacing().indent);
+                        let target = InspectionTarget::Residue {
+                            chain_index,
+                            residue_index,
+                        };
+                        let default_name = residue.id.label();
+                        let name = info.hierarchy_names.get(&target).unwrap_or(&default_name);
+                        let label = format!("{} · {} atoms", name, residue.atom_indices.len());
+                        let on_path = inspected_atom_path.is_some_and(
+                            |(inspected_chain, inspected_residue, _)| {
+                                inspected_chain == chain_index && inspected_residue == residue_index
+                            },
                         );
-                    if residue_on_inspected_path {
-                        residue_state.set_open(true);
+                        let id = ui.make_persistent_id(("residue", chain_index, residue_index));
+                        disclosure_button(ui, id, hierarchy_open(ui, id, on_path));
+                        hierarchy_row(
+                            ui,
+                            display,
+                            target,
+                            DisplayLevel::Residue,
+                            residue.atom_indices.first().copied(),
+                            &label,
+                            info.hierarchy_selection.contains(&target) || on_path,
+                            info.hierarchy_selection,
+                            actions,
+                            color_editor,
+                            rename_editor,
+                            &default_name,
+                            info.hierarchy_names.get(&target),
+                        );
                     }
-                    residue_state
-                        .show_header(ui, |ui| {
-                            hierarchy_row(
-                                ui,
-                                display,
-                                residue_target,
-                                DisplayLevel::Residue,
-                                residue.atom_indices.first().copied(),
-                                &residue_label,
-                                info.hierarchy_selection.contains(&residue_target)
-                                    || residue_on_inspected_path,
-                                info.hierarchy_selection,
-                                actions,
-                                color_editor,
-                                rename_editor,
-                                &residue_default_name,
-                                info.hierarchy_names.get(&residue_target),
-                            );
-                        })
-                        .body(|ui| {
-                            for &atom_index in &residue.atom_indices {
-                                if let Some(atom) = molecule.atoms.get(atom_index) {
-                                    let target = InspectionTarget::Atom(atom_index);
-                                    let atom_default_name =
-                                        format!("#{} {}", atom.serial, atom.name);
-                                    let atom_name = info
-                                        .hierarchy_names
-                                        .get(&target)
-                                        .unwrap_or(&atom_default_name);
-                                    let label =
-                                        format!("{} · {}", atom_name, atom.element.symbol());
-                                    ui.horizontal(|ui| {
-                                        hierarchy_row(
-                                            ui,
-                                            display,
-                                            target,
-                                            DisplayLevel::Atom,
-                                            Some(atom_index),
-                                            &label,
-                                            info.hierarchy_selection.contains(&target),
-                                            info.hierarchy_selection,
-                                            actions,
-                                            color_editor,
-                                            rename_editor,
-                                            &atom_default_name,
-                                            info.hierarchy_names.get(&target),
-                                        );
-                                    });
-                                }
-                            }
-                        });
-                }
-            });
-    }
+                    HierarchyListRow::Atom { atom_index, depth } => {
+                        let Some(atom) = molecule.atoms.get(atom_index) else {
+                            return;
+                        };
+                        ui.add_space(ui.spacing().indent * (depth as f32 + 1.0));
+                        let target = InspectionTarget::Atom(atom_index);
+                        let default_name = format!("#{} {}", atom.serial, atom.name);
+                        let name = info.hierarchy_names.get(&target).unwrap_or(&default_name);
+                        let label = format!("{} · {}", name, atom.element.symbol());
+                        hierarchy_row(
+                            ui,
+                            display,
+                            target,
+                            DisplayLevel::Atom,
+                            Some(atom_index),
+                            &label,
+                            info.hierarchy_selection.contains(&target),
+                            info.hierarchy_selection,
+                            actions,
+                            color_editor,
+                            rename_editor,
+                            &default_name,
+                            info.hierarchy_names.get(&target),
+                        );
+                    }
+                });
+            }
+        });
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -408,5 +471,66 @@ pub(super) fn hierarchy_row(
             HierarchySelectionGesture::Replace
         };
         actions.manager = Some(ManagerAction::SelectHierarchy { target, gesture });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use glam::Vec3;
+    use molview::molecule::{Atom, Element, Molecule};
+
+    use super::*;
+
+    fn two_residue_hierarchy() -> MoleculeHierarchy {
+        let atoms = [1, 2]
+            .into_iter()
+            .enumerate()
+            .map(|(index, residue_number)| Atom {
+                serial: index as u32 + 1,
+                name: "CA".into(),
+                element: Element::C,
+                residue_name: "GLY".into(),
+                residue_number,
+                insertion_code: None,
+                chain_id: "A".into(),
+                position: Vec3::new(index as f32, 0.0, 0.0),
+                occupancy: 1.0,
+                b_factor: 0.0,
+                hetero: false,
+            })
+            .collect();
+        MoleculeHierarchy::from_molecule(&Molecule {
+            atoms,
+            bonds: Vec::new(),
+        })
+    }
+
+    #[test]
+    fn virtual_hierarchy_flattens_only_open_branches() {
+        let hierarchy = two_residue_hierarchy();
+        egui::__run_test_ui(|ui| {
+            assert_eq!(visible_hierarchy_rows(ui, &hierarchy, None).len(), 1);
+
+            let chain_id = ui.make_persistent_id(("chain", 0));
+            let mut chain_state = egui::collapsing_header::CollapsingState::load_with_default_open(
+                ui.ctx(),
+                chain_id,
+                false,
+            );
+            chain_state.set_open(true);
+            chain_state.store(ui.ctx());
+            assert_eq!(visible_hierarchy_rows(ui, &hierarchy, None).len(), 3);
+
+            let residue_id = ui.make_persistent_id(("residue", 0, 0));
+            let mut residue_state =
+                egui::collapsing_header::CollapsingState::load_with_default_open(
+                    ui.ctx(),
+                    residue_id,
+                    false,
+                );
+            residue_state.set_open(true);
+            residue_state.store(ui.ctx());
+            assert_eq!(visible_hierarchy_rows(ui, &hierarchy, None).len(), 4);
+        });
     }
 }

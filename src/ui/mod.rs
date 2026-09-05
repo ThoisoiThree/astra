@@ -6,6 +6,7 @@ use molview::{
     camera::OrbitCamera,
     measurement::{MAX_MEASUREMENT_THICKNESS, MeasurementLine},
     molecule::{Atom, Molecule, MoleculeHierarchy, ResidueGroup},
+    render::RenderStats,
     selection::{Selection, SelectionStatus},
 };
 
@@ -20,6 +21,7 @@ mod selections;
 use actions::*;
 use camera::*;
 use hierarchy::*;
+use mode::*;
 use selections::*;
 
 #[derive(Debug, Default)]
@@ -35,6 +37,7 @@ pub struct UiState {
     coloring_open: bool,
     mode_open: bool,
     actions_open: bool,
+    performance_overlay: bool,
     measurement_first: String,
     measurement_second: String,
     color_editor: Option<ColorEditor>,
@@ -323,6 +326,7 @@ pub struct UiInfo<'a> {
     pub background_job_id: Option<u64>,
     pub background_stage: Option<&'a str>,
     pub background_progress: f32,
+    pub render_stats: RenderStats,
 }
 
 impl UiState {
@@ -395,32 +399,27 @@ impl UiState {
                     &mut self.rename_editor,
                 );
                 ui.separator();
-                egui::ScrollArea::vertical()
-                    .id_salt("molecule hierarchy scroll")
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        inspector(ui, info);
-                        if info.inspection.is_some() {
-                            ui.separator();
-                        }
-                        if !info.measurement_lines.is_empty() {
-                            measurement_lines(
-                                ui,
-                                info,
-                                &mut actions,
-                                &mut self.measurement_color_editor,
-                                &mut self.rename_editor,
-                            );
-                            ui.separator();
-                        }
-                        hierarchy_tree(
-                            ui,
-                            info,
-                            &mut actions,
-                            &mut self.color_editor,
-                            &mut self.rename_editor,
-                        );
-                    });
+                inspector(ui, info);
+                if info.inspection.is_some() {
+                    ui.separator();
+                }
+                if !info.measurement_lines.is_empty() {
+                    measurement_lines(
+                        ui,
+                        info,
+                        &mut actions,
+                        &mut self.measurement_color_editor,
+                        &mut self.rename_editor,
+                    );
+                    ui.separator();
+                }
+                hierarchy_tree(
+                    ui,
+                    info,
+                    &mut actions,
+                    &mut self.color_editor,
+                    &mut self.rename_editor,
+                );
             });
         if !info.session_tabs.is_empty() {
             egui::Panel::top("document tabs")
@@ -460,6 +459,9 @@ impl UiState {
         }
         let viewport = root.available_rect_before_wrap();
         measurement_labels(root.painter(), viewport, info);
+        if self.performance_overlay {
+            performance_overlay(root.ctx(), viewport, info.render_stats);
+        }
         self.mode_window(root.ctx(), info, &mut actions);
         self.coloring_window(root.ctx(), info, &mut actions);
         self.camera_window(root.ctx(), info, &mut actions);

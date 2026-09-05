@@ -13,34 +13,114 @@ use std::collections::HashMap;
 use bitset::AtomMask;
 use molecule::Molecule;
 
+/// UI and scene-file color. Components are encoded in the sRGB transfer function.
 pub type DisplayColor = [f32; 4];
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SrgbColor(pub DisplayColor);
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LinearColor(pub [f32; 4]);
+
+impl SrgbColor {
+    pub fn to_linear(self) -> LinearColor {
+        let [red, green, blue, alpha] = self.0;
+        LinearColor([
+            srgb_channel_to_linear(red),
+            srgb_channel_to_linear(green),
+            srgb_channel_to_linear(blue),
+            alpha.clamp(0.0, 1.0),
+        ])
+    }
+}
+
+fn srgb_channel_to_linear(value: f32) -> f32 {
+    let value = value.clamp(0.0, 1.0);
+    if value <= 0.040_45 {
+        value / 12.92
+    } else {
+        ((value + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+#[cfg(test)]
+mod color_tests {
+    use super::*;
+
+    #[test]
+    fn srgb_transfer_preserves_endpoints_and_alpha() {
+        assert_eq!(
+            SrgbColor([0.0, 1.0, 0.0, 0.4]).to_linear(),
+            LinearColor([0.0, 1.0, 0.0, 0.4])
+        );
+    }
+
+    #[test]
+    fn srgb_midpoint_is_converted_to_linear_light() {
+        let linear = SrgbColor([0.5, 0.5, 0.5, 1.0]).to_linear().0;
+        for channel in &linear[..3] {
+            assert!((*channel - 0.214_041_14).abs() < 1.0e-6);
+        }
+    }
+}
 
 const DEFAULT_UNIFORM_COLOR: DisplayColor = [0.55, 0.67, 0.82, 1.0];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AmbientOcclusionQuality {
-    Low,
+    Preview,
     #[default]
     Medium,
     High,
 }
 
 impl AmbientOcclusionQuality {
-    pub const ALL: [Self; 3] = [Self::Low, Self::Medium, Self::High];
+    pub const ALL: [Self; 3] = [Self::Preview, Self::Medium, Self::High];
 
     pub const fn label(self) -> &'static str {
         match self {
-            Self::Low => "Low · 16 samples",
-            Self::Medium => "Medium · 32 samples",
-            Self::High => "High · 48 samples",
+            Self::Preview => "Preview",
+            Self::Medium => "Medium",
+            Self::High => "High",
         }
     }
 
     pub const fn sample_count(self) -> u32 {
         match self {
-            Self::Low => 16,
+            Self::Preview => 12,
             Self::Medium => 32,
             Self::High => 48,
+        }
+    }
+
+    pub const fn dof_sample_count(self) -> u32 {
+        match self {
+            Self::Preview => 16,
+            Self::Medium => 32,
+            Self::High => 64,
+        }
+    }
+
+    pub const fn dof_resolution_scale(self) -> f32 {
+        match self {
+            Self::Preview | Self::Medium => 0.5,
+            Self::High => 1.0,
+        }
+    }
+
+    pub const fn cartoon_samples_per_residue(self) -> usize {
+        match self {
+            Self::Preview => 5,
+            Self::Medium => 10,
+            Self::High => 14,
+        }
+    }
+
+    pub const fn cartoon_width_segments(self) -> u32 {
+        match self {
+            Self::Preview => 4,
+            Self::Medium => 8,
+            Self::High => 12,
         }
     }
 }

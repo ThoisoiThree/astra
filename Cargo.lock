@@ -149,6 +149,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "astra"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytemuck",
+ "egui",
+ "egui-wgpu",
+ "egui-winit",
+ "flate2",
+ "glam",
+ "naga",
+ "pollster 1.0.1",
+ "prost",
+ "prost-build",
+ "protoc-bin-vendored",
+ "rfd",
+ "rmpv",
+ "thiserror 2.0.20",
+ "ureq",
+ "wgpu",
+ "winit",
+ "zstd",
+]
+
+[[package]]
 name = "atomic-waker"
 version = "1.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1338,30 +1363,6 @@ checksum = "1fa76a2c86f704bdb222d66965fb3d63269ce38518b83cb0575fca855ebb6316"
 dependencies = [
  "adler2",
  "simd-adler32",
-]
-
-[[package]]
-name = "molview"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bytemuck",
- "egui",
- "egui-wgpu",
- "egui-winit",
- "flate2",
- "glam",
- "pollster 1.0.1",
- "prost",
- "prost-build",
- "protoc-bin-vendored",
- "rfd",
- "rmpv",
- "thiserror 2.0.20",
- "ureq",
- "wgpu",
- "winit",
- "zstd",
 ]
 
 [[package]]

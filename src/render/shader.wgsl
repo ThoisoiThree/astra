@@ -33,15 +33,16 @@ struct VertexOutput {
 struct CartoonVertexInput {
     @location(0) position: vec3<f32>,
     @location(1) normal: vec3<f32>,
-    @location(2) color: vec4<f32>,
-    @location(3) highlight: vec4<f32>,
-    @location(4) semantic_ids: vec4<u32>,
+    @location(2) semantic_ids: vec4<u32>,
+    @location(3) color: vec4<f32>,
+    @location(4) highlight: vec4<f32>,
 };
 
 @vertex
 fn vertex_main(input: VertexInput) -> VertexOutput {
     let model = mat4x4<f32>(input.model_0, input.model_1, input.model_2, input.model_3);
-    let world = model * vec4<f32>(input.position, 1.0);
+    let selected_scale = 1.0 + input.highlight.y;
+    let world = model * vec4<f32>(input.position * selected_scale, 1.0);
     var output: VertexOutput;
     output.clip_position = camera.view_projection * world;
     output.world_position = world.xyz;
@@ -80,14 +81,17 @@ fn shaded_color(input: VertexOutput) -> vec4<f32> {
 
 struct SceneFragmentOutput {
     @location(0) color: vec4<f32>,
-    @location(1) semantic_ids: vec4<u32>,
+    @location(1) semantic_ids: vec2<u32>,
 };
 
 @fragment
 fn fragment_scene(input: VertexOutput) -> SceneFragmentOutput {
     var output: SceneFragmentOutput;
     output.color = shaded_color(input);
-    output.semantic_ids = input.semantic_ids;
+    output.semantic_ids = vec2<u32>(
+        input.semantic_ids.x,
+        (input.semantic_ids.z << 20u) | (input.semantic_ids.y & 0xFFFFFu),
+    );
     return output;
 }
 

@@ -1,30 +1,32 @@
 use std::{
     borrow::Cow,
     sync::{Arc, mpsc},
+    time::Instant,
 };
 
 use bytemuck::{Pod, Zeroable};
 use egui::TexturesDelta;
 use egui_wgpu::{RendererOptions, ScreenDescriptor};
-use glam::{Mat4, Quat, Vec3};
+use glam::Vec3;
 use thiserror::Error;
 use wgpu::util::DeviceExt;
 use winit::{dpi::PhysicalSize, window::Window};
 
 use crate::{
-    DisplayMode, DisplayState, RepresentationMask,
+    DisplayMode, DisplayState,
     camera::{OrbitCamera, Viewport},
     measurement::MeasurementLine,
-    molecule::Molecule,
+    molecule::{Molecule, MoleculeHierarchy, SecondaryStructure},
 };
 
+#[cfg(test)]
+use super::instances::semantic_ids_from_hierarchy;
+
 use super::{
-    cartoon::{CartoonRenderData, cartoon_render_data},
+    cartoon::{CartoonRenderData, cartoon_render_data, cartoon_render_data_cached},
     instances::{
-        GpuMesh, InstanceRaw, ToonInstanceRaw, cartoon_index_buffer, cartoon_vertex_buffer,
-        empty_cartoon_index_buffer, empty_cartoon_vertex_buffer, empty_instance_buffer,
-        empty_toon_instance_buffer, instance_buffer, measurement_instances, toon_instance_buffer,
-        toon_semantic_ids,
+        GpuMesh, ReusableBuffer, cartoon_display_attributes, display_attributes, display_topology,
+        measurement_instances,
     },
     mesh,
     pipelines::{
@@ -32,13 +34,16 @@ use super::{
         create_toon_pipeline,
     },
     postprocess::{PostProcess, PostUniform},
+    profiling::{GpuProfiler, PASS_COUNT, ProfilePass},
     targets::{DepthTarget, PendingPickReadback},
 };
 
 pub(super) const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 pub(super) const SCENE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 pub(super) const AO_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R16Float;
-pub(super) const SEMANTIC_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba32Uint;
+// Atom ID plus packed residue/chain ID. This is half the memory of Rgba32Uint while retaining
+// every hierarchy boundary required by picking and toon outlines.
+pub(super) const SEMANTIC_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rg32Uint;
 
 #[derive(Debug, Error)]
 pub enum RenderError {
@@ -68,6 +73,18 @@ pub enum SurfaceIssue {
     Validation,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RenderStats {
+    pub cpu_frame_ms: f32,
+    pub gpu_pass_ms: [f32; PASS_COUNT],
+    pub gpu_memory_bytes: u64,
+    pub atom_instances: u32,
+    pub bond_instances: u32,
+    pub cartoon_triangles: u32,
+    pub toon_triangles: u32,
+    pub gpu_timestamps_supported: bool,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct CameraUniform {
@@ -93,28 +110,49 @@ pub struct Renderer {
     camera_bind_group: wgpu::BindGroup,
     sphere: GpuMesh,
     cylinder: GpuMesh,
-    atom_instances: wgpu::Buffer,
-    bond_instances: wgpu::Buffer,
-    cartoon_vertices: wgpu::Buffer,
-    cartoon_indices: wgpu::Buffer,
-    toon_instances: wgpu::Buffer,
-    measurement_instances: wgpu::Buffer,
+    atom_topology: ReusableBuffer,
+    atom_display: ReusableBuffer,
+    bond_topology: ReusableBuffer,
+    bond_display: ReusableBuffer,
+    cartoon_vertices: ReusableBuffer,
+    cartoon_display: ReusableBuffer,
+    cartoon_indices: ReusableBuffer,
+    toon_topology: ReusableBuffer,
+    toon_display: ReusableBuffer,
+    measurement_instances: ReusableBuffer,
     atom_instance_count: u32,
     bond_instance_count: u32,
     cartoon_index_count: u32,
     toon_instance_count: u32,
     measurement_instance_count: u32,
+    cartoon_data: CartoonRenderData,
     depth: DepthTarget,
     post_process: PostProcess,
     egui_renderer: egui_wgpu::Renderer,
     requested_pick: Option<(u64, u32, u32)>,
     pending_pick: Option<PendingPickReadback>,
+    profiler: Option<GpuProfiler>,
+    cpu_frame_ms: f32,
 }
 
 pub struct PreparedCartoon(CartoonRenderData);
 
 pub fn prepare_cartoon(molecule: &Molecule, display: &DisplayState) -> PreparedCartoon {
     PreparedCartoon(cartoon_render_data(molecule, display))
+}
+
+pub fn prepare_cartoon_cached(
+    molecule: &Molecule,
+    display: &DisplayState,
+    hierarchy: &MoleculeHierarchy,
+    secondary_structure: &[Vec<SecondaryStructure>],
+) -> PreparedCartoon {
+    PreparedCartoon(cartoon_render_data_cached(
+        molecule,
+        display,
+        hierarchy,
+        secondary_structure,
+    ))
 }
 
 impl Renderer {
@@ -130,10 +168,11 @@ impl Renderer {
                 apply_limit_buckets: false,
             })
             .await?;
+        let optional_features = adapter.features() & wgpu::Features::TIMESTAMP_QUERY;
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("molview device"),
-                required_features: wgpu::Features::empty(),
+                required_features: optional_features,
                 required_limits: wgpu::Limits::default(),
                 experimental_features: wgpu::ExperimentalFeatures::disabled(),
                 memory_hints: wgpu::MemoryHints::Performance,
@@ -199,12 +238,44 @@ impl Renderer {
 
         let sphere = GpuMesh::new(&device, "sphere", mesh::uv_sphere(14, 22));
         let cylinder = GpuMesh::new(&device, "cylinder", mesh::cylinder(16));
-        let atom_instances = empty_instance_buffer(&device, "atom instances");
-        let bond_instances = empty_instance_buffer(&device, "bond instances");
-        let cartoon_vertices = empty_cartoon_vertex_buffer(&device);
-        let cartoon_indices = empty_cartoon_index_buffer(&device);
-        let toon_instances = empty_toon_instance_buffer(&device);
-        let measurement_instances = empty_instance_buffer(&device, "measurement instances");
+        let atom_topology =
+            ReusableBuffer::new(&device, "atom topology", wgpu::BufferUsages::VERTEX);
+        let atom_display = ReusableBuffer::new(
+            &device,
+            "atom display attributes",
+            wgpu::BufferUsages::VERTEX,
+        );
+        let bond_topology =
+            ReusableBuffer::new(&device, "bond topology", wgpu::BufferUsages::VERTEX);
+        let bond_display = ReusableBuffer::new(
+            &device,
+            "bond display attributes",
+            wgpu::BufferUsages::VERTEX,
+        );
+        let cartoon_vertices = ReusableBuffer::new(
+            &device,
+            "continuous cartoon vertices",
+            wgpu::BufferUsages::VERTEX,
+        );
+        let cartoon_display = ReusableBuffer::new(
+            &device,
+            "continuous cartoon display attributes",
+            wgpu::BufferUsages::VERTEX,
+        );
+        let cartoon_indices = ReusableBuffer::new(
+            &device,
+            "continuous cartoon indices",
+            wgpu::BufferUsages::INDEX,
+        );
+        let toon_topology =
+            ReusableBuffer::new(&device, "toon sphere topology", wgpu::BufferUsages::VERTEX);
+        let toon_display = ReusableBuffer::new(
+            &device,
+            "toon sphere display attributes",
+            wgpu::BufferUsages::VERTEX,
+        );
+        let measurement_instances =
+            ReusableBuffer::new(&device, "measurement instances", wgpu::BufferUsages::VERTEX);
         let depth = DepthTarget::new(&device, config.width, config.height);
         let post_process = PostProcess::new(
             &device,
@@ -215,6 +286,7 @@ impl Renderer {
         );
         let egui_renderer =
             egui_wgpu::Renderer::new(&device, config.format, RendererOptions::default());
+        let profiler = GpuProfiler::new(&device, &queue);
 
         Ok(Self {
             instance,
@@ -231,27 +303,68 @@ impl Renderer {
             camera_bind_group,
             sphere,
             cylinder,
-            atom_instances,
-            bond_instances,
+            atom_topology,
+            atom_display,
+            bond_topology,
+            bond_display,
             cartoon_vertices,
+            cartoon_display,
             cartoon_indices,
-            toon_instances,
+            toon_topology,
+            toon_display,
             measurement_instances,
             atom_instance_count: 0,
             bond_instance_count: 0,
             cartoon_index_count: 0,
             toon_instance_count: 0,
             measurement_instance_count: 0,
+            cartoon_data: CartoonRenderData::default(),
             depth,
             post_process,
             egui_renderer,
             requested_pick: None,
             pending_pick: None,
+            profiler,
+            cpu_frame_ms: 0.0,
         })
     }
 
     pub fn size(&self) -> PhysicalSize<u32> {
         PhysicalSize::new(self.config.width, self.config.height)
+    }
+
+    pub fn stats(&self) -> RenderStats {
+        let dynamic_bytes = self.atom_topology.estimated_bytes()
+            + self.atom_display.estimated_bytes()
+            + self.bond_topology.estimated_bytes()
+            + self.bond_display.estimated_bytes()
+            + self.cartoon_vertices.estimated_bytes()
+            + self.cartoon_display.estimated_bytes()
+            + self.cartoon_indices.estimated_bytes()
+            + self.toon_topology.estimated_bytes()
+            + self.toon_display.estimated_bytes()
+            + self.measurement_instances.estimated_bytes();
+        let pixel_count = self.config.width as u64 * self.config.height as u64;
+        let dof_width = (self.config.width as f32 * self.post_process.dof_scale).round() as u64;
+        let dof_height = (self.config.height as f32 * self.post_process.dof_scale).round() as u64;
+        // scene RGBA16F + semantic RG32U + depth32F + two R16F AO targets + DOF RGBA16F.
+        let target_bytes = pixel_count * (8 + 8 + 4 + 2 + 2) + dof_width * dof_height * 8;
+        RenderStats {
+            cpu_frame_ms: self.cpu_frame_ms,
+            gpu_pass_ms: self
+                .profiler
+                .as_ref()
+                .map_or([0.0; PASS_COUNT], GpuProfiler::latest_ms),
+            gpu_memory_bytes: dynamic_bytes
+                + self.sphere.estimated_bytes
+                + self.cylinder.estimated_bytes
+                + target_bytes,
+            atom_instances: self.atom_instance_count,
+            bond_instances: self.bond_instance_count,
+            cartoon_triangles: self.cartoon_index_count / 3,
+            toon_triangles: self.toon_instance_count * 2,
+            gpu_timestamps_supported: self.profiler.is_some(),
+        }
     }
 
     pub fn resize(&mut self, size: PhysicalSize<u32>) {
@@ -315,114 +428,60 @@ impl Renderer {
         display: &DisplayState,
         prepared: PreparedCartoon,
     ) {
-        let cartoon = prepared.0;
-        let semantic_ids = toon_semantic_ids(molecule);
-        let atoms: Vec<_> = molecule
-            .atoms
-            .iter()
-            .enumerate()
-            .filter(|(index, _)| {
-                display.visible[*index]
-                    && cartoon.standard_atomic[*index]
-                    && display.representations[*index].contains(RepresentationMask::SPHERES)
-            })
-            .map(|(index, atom)| {
-                let selected = display.selection[index];
-                let radius = atom.element.van_der_waals_radius() * 0.28;
-                let scale = if selected { radius * 1.16 } else { radius };
-                InstanceRaw::new(
-                    Mat4::from_scale_rotation_translation(
-                        Vec3::splat(scale),
-                        Quat::IDENTITY,
-                        atom.position,
-                    ),
-                    display.colors[index],
-                    selected,
-                )
-                .with_semantic_ids(semantic_ids[index])
-            })
-            .collect();
+        self.cartoon_data = prepared.0;
+        self.cartoon_indices
+            .write(&self.device, &self.queue, &self.cartoon_data.indices);
+        self.cartoon_vertices
+            .write(&self.device, &self.queue, &self.cartoon_data.vertices);
+        self.cartoon_index_count = self.cartoon_data.indices.len() as u32;
+        self.update_instance_buffers(molecule, display, true);
+    }
 
-        let bonds: Vec<_> = molecule
-            .bonds
-            .iter()
-            .filter(|bond| {
-                display.visible[bond.a]
-                    && display.visible[bond.b]
-                    && cartoon.standard_atomic[bond.a]
-                    && cartoon.standard_atomic[bond.b]
-                    && display.representations[bond.a].contains(RepresentationMask::STICKS)
-                    && display.representations[bond.b].contains(RepresentationMask::STICKS)
-            })
-            .filter_map(|bond| {
-                let start = molecule.atoms[bond.a].position;
-                let end = molecule.atoms[bond.b].position;
-                let vector = end - start;
-                let length = vector.length();
-                if length <= f32::EPSILON {
-                    return None;
-                }
-                let rotation = Quat::from_rotation_arc(Vec3::Y, vector / length);
-                let model = Mat4::from_scale_rotation_translation(
-                    Vec3::new(0.11, length, 0.11),
-                    rotation,
-                    (start + end) * 0.5,
-                );
-                let color_a = display.colors[bond.a];
-                let color_b = display.colors[bond.b];
-                let color = [
-                    (color_a[0] + color_b[0]) * 0.5,
-                    (color_a[1] + color_b[1]) * 0.5,
-                    (color_a[2] + color_b[2]) * 0.5,
-                    1.0,
-                ];
-                Some(InstanceRaw::new(
-                    model,
-                    color,
-                    display.selection[bond.a] || display.selection[bond.b],
-                ))
-            })
-            .collect();
+    /// Refreshes visibility, color, and selection data without rebuilding ribbon topology or
+    /// recomputing secondary structure.
+    pub fn update_display_attributes(&mut self, molecule: &Molecule, display: &DisplayState) {
+        self.update_instance_buffers(molecule, display, false);
+    }
 
-        let toon_atoms: Vec<_> = molecule
-            .atoms
-            .iter()
-            .enumerate()
-            .filter(|(index, _)| {
-                display.visible[*index]
-                    && display.modes.get(*index) == Some(&DisplayMode::Toon)
-                    && display.representations[*index].contains(RepresentationMask::SPHERES)
-            })
-            .map(|(index, atom)| {
-                let selected = display.selection[index];
-                let radius = atom.element.van_der_waals_radius();
-                ToonInstanceRaw {
-                    center_radius: atom
-                        .position
-                        .extend(if selected { radius * 1.04 } else { radius })
-                        .to_array(),
-                    color: display.colors[index],
-                    semantic_ids: semantic_ids[index],
-                    highlight: [f32::from(selected), 0.0, 0.0, 0.0],
-                }
-            })
-            .collect();
-
-        self.atom_instances = instance_buffer(&self.device, "atom instances", &atoms);
-        self.bond_instances = instance_buffer(&self.device, "bond instances", &bonds);
-        self.cartoon_vertices = cartoon_vertex_buffer(&self.device, &cartoon.vertices);
-        self.cartoon_indices = cartoon_index_buffer(&self.device, &cartoon.indices);
-        self.toon_instances = toon_instance_buffer(&self.device, &toon_atoms);
-        self.atom_instance_count = atoms.len() as u32;
-        self.bond_instance_count = bonds.len() as u32;
-        self.cartoon_index_count = cartoon.indices.len() as u32;
-        self.toon_instance_count = toon_atoms.len() as u32;
+    fn update_instance_buffers(
+        &mut self,
+        molecule: &Molecule,
+        display: &DisplayState,
+        topology_changed: bool,
+    ) {
+        let attributes = display_attributes(molecule, display, &self.cartoon_data.standard_atomic);
+        let cartoon_display = cartoon_display_attributes(&self.cartoon_data.vertices, display);
+        if topology_changed {
+            let topology = display_topology(
+                molecule,
+                display,
+                &self.cartoon_data.standard_atomic,
+                &self.cartoon_data.semantic_ids,
+            );
+            self.atom_topology
+                .write(&self.device, &self.queue, &topology.atom_topology);
+            self.bond_topology
+                .write(&self.device, &self.queue, &topology.bond_topology);
+            self.toon_topology
+                .write(&self.device, &self.queue, &topology.toon_topology);
+        }
+        self.atom_display
+            .write(&self.device, &self.queue, &attributes.atom_display);
+        self.bond_display
+            .write(&self.device, &self.queue, &attributes.bond_display);
+        self.cartoon_display
+            .write(&self.device, &self.queue, &cartoon_display);
+        self.toon_display
+            .write(&self.device, &self.queue, &attributes.toon_display);
+        self.atom_instance_count = attributes.atom_display.len() as u32;
+        self.bond_instance_count = attributes.bond_display.len() as u32;
+        self.toon_instance_count = attributes.toon_display.len() as u32;
     }
 
     pub fn update_measurements(&mut self, lines: &[MeasurementLine]) {
         let instances = measurement_instances(lines);
-        self.measurement_instances =
-            instance_buffer(&self.device, "measurement instances", &instances);
+        self.measurement_instances
+            .write(&self.device, &self.queue, &instances);
         self.measurement_instance_count = instances.len() as u32;
     }
 
@@ -435,10 +494,23 @@ impl Renderer {
         textures_delta: &TexturesDelta,
         pixels_per_point: f32,
     ) -> Result<(), RenderError> {
+        let cpu_start = Instant::now();
+        if let Some(profiler) = &mut self.profiler {
+            profiler.poll(&self.device);
+            profiler.begin_frame();
+        }
         let ambient_occlusion = display
             .map(|display| display.ambient_occlusion)
             .unwrap_or_default();
         let global_mode = display.map_or(DisplayMode::Cartoon, |display| display.global_mode);
+        let quality = ambient_occlusion.quality;
+        self.post_process.set_dof_scale(
+            &self.device,
+            self.config.width,
+            self.config.height,
+            &self.depth.view,
+            quality.dof_resolution_scale(),
+        );
         let view_projection = camera.view_projection();
         let forward = camera.optical_axis();
         let mut camera_right = forward.cross(Vec3::Y).normalize_or_zero();
@@ -471,7 +543,7 @@ impl Renderer {
                 focal_length,
                 camera.depth_of_field.blade_count as f32,
                 camera.depth_of_field.blade_rotation,
-                f32::from(global_mode == DisplayMode::Toon),
+                f32::from(self.toon_instance_count > 0),
             ],
             ao: [
                 ambient_occlusion.strength.clamp(0.0, 3.0),
@@ -482,6 +554,12 @@ impl Renderer {
                 } else {
                     0.0
                 },
+            ],
+            quality: [
+                quality.dof_sample_count() as f32,
+                quality.dof_resolution_scale(),
+                0.0,
+                0.0,
             ],
         };
         self.queue.write_buffer(
@@ -574,7 +652,10 @@ impl Renderer {
                     }),
                     stencil_ops: None,
                 }),
-                timestamp_writes: None,
+                timestamp_writes: self
+                    .profiler
+                    .as_ref()
+                    .map(|profiler| profiler.writes(ProfilePass::Scene)),
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
@@ -603,25 +684,32 @@ impl Renderer {
             pass.set_scissor_rect(scissor_x, scissor_y, scissor_width, scissor_height);
 
             pass.set_pipeline(&self.cartoon_pipeline);
-            pass.set_vertex_buffer(0, self.cartoon_vertices.slice(..));
-            pass.set_index_buffer(self.cartoon_indices.slice(..), wgpu::IndexFormat::Uint32);
+            pass.set_vertex_buffer(0, self.cartoon_vertices.buffer.slice(..));
+            pass.set_vertex_buffer(1, self.cartoon_display.buffer.slice(..));
+            pass.set_index_buffer(
+                self.cartoon_indices.buffer.slice(..),
+                wgpu::IndexFormat::Uint32,
+            );
             pass.draw_indexed(0..self.cartoon_index_count, 0, 0..1);
 
             pass.set_pipeline(&self.pipeline);
 
             pass.set_vertex_buffer(0, self.cylinder.vertices.slice(..));
-            pass.set_vertex_buffer(1, self.bond_instances.slice(..));
+            pass.set_vertex_buffer(1, self.bond_topology.buffer.slice(..));
+            pass.set_vertex_buffer(2, self.bond_display.buffer.slice(..));
             pass.set_index_buffer(self.cylinder.indices.slice(..), wgpu::IndexFormat::Uint32);
             pass.draw_indexed(0..self.cylinder.index_count, 0, 0..self.bond_instance_count);
 
             pass.set_vertex_buffer(0, self.sphere.vertices.slice(..));
-            pass.set_vertex_buffer(1, self.atom_instances.slice(..));
+            pass.set_vertex_buffer(1, self.atom_topology.buffer.slice(..));
+            pass.set_vertex_buffer(2, self.atom_display.buffer.slice(..));
             pass.set_index_buffer(self.sphere.indices.slice(..), wgpu::IndexFormat::Uint32);
             pass.draw_indexed(0..self.sphere.index_count, 0, 0..self.atom_instance_count);
 
             pass.set_pipeline(&self.toon_pipeline);
             pass.set_bind_group(0, &self.camera_bind_group, &[]);
-            pass.set_vertex_buffer(0, self.toon_instances.slice(..));
+            pass.set_vertex_buffer(0, self.toon_topology.buffer.slice(..));
+            pass.set_vertex_buffer(1, self.toon_display.buffer.slice(..));
             pass.draw(0..6, 0..self.toon_instance_count);
         }
         let pick_readback = self.requested_pick.take().map(|(request_id, x, y)| {
@@ -654,7 +742,7 @@ impl Renderer {
             );
             (request_id, buffer)
         });
-        {
+        if ambient_occlusion.enabled {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("raw ambient occlusion pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -667,15 +755,18 @@ impl Renderer {
                     },
                 })],
                 depth_stencil_attachment: None,
-                timestamp_writes: None,
+                timestamp_writes: self
+                    .profiler
+                    .as_ref()
+                    .map(|profiler| profiler.writes(ProfilePass::AoRaw)),
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
             pass.set_pipeline(&self.post_process.ao_raw_pipeline);
             pass.set_bind_group(0, &self.post_process.ao_raw_bind_group, &[]);
             pass.draw(0..3, 0..1);
-        }
-        {
+            drop(pass);
+
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("bilateral ambient occlusion pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -688,12 +779,39 @@ impl Renderer {
                     },
                 })],
                 depth_stencil_attachment: None,
-                timestamp_writes: None,
+                timestamp_writes: self
+                    .profiler
+                    .as_ref()
+                    .map(|profiler| profiler.writes(ProfilePass::AoBlur)),
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
             pass.set_pipeline(&self.post_process.ao_blur_pipeline);
             pass.set_bind_group(0, &self.post_process.ao_blur_bind_group, &[]);
+            pass.draw(0..3, 0..1);
+        }
+        if camera.depth_of_field.enabled && camera.depth_of_field.max_coc_pixels > 0.0 {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("depth of field gather pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.post_process.dof_color.view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: self
+                    .profiler
+                    .as_ref()
+                    .map(|profiler| profiler.writes(ProfilePass::Dof)),
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&self.post_process.dof_pipeline);
+            pass.set_bind_group(0, &self.post_process.dof_source_bind_group, &[]);
             pass.draw(0..3, 0..1);
         }
         {
@@ -709,7 +827,10 @@ impl Renderer {
                     },
                 })],
                 depth_stencil_attachment: None,
-                timestamp_writes: None,
+                timestamp_writes: self
+                    .profiler
+                    .as_ref()
+                    .map(|profiler| profiler.writes(ProfilePass::Compose)),
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
@@ -737,7 +858,10 @@ impl Renderer {
                     }),
                     stencil_ops: None,
                 }),
-                timestamp_writes: None,
+                timestamp_writes: self
+                    .profiler
+                    .as_ref()
+                    .map(|profiler| profiler.writes(ProfilePass::Annotations)),
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
@@ -765,7 +889,7 @@ impl Renderer {
                 as u32;
             pass.set_scissor_rect(scissor_x, scissor_y, scissor_width, scissor_height);
             pass.set_vertex_buffer(0, self.cylinder.vertices.slice(..));
-            pass.set_vertex_buffer(1, self.measurement_instances.slice(..));
+            pass.set_vertex_buffer(1, self.measurement_instances.buffer.slice(..));
             pass.set_index_buffer(self.cylinder.indices.slice(..), wgpu::IndexFormat::Uint32);
             pass.draw_indexed(
                 0..self.cylinder.index_count,
@@ -789,7 +913,10 @@ impl Renderer {
                     // egui's pipeline has no depth-stencil target, so it must not share
                     // the depth-tested annotation pass.
                     depth_stencil_attachment: None,
-                    timestamp_writes: None,
+                    timestamp_writes: self
+                        .profiler
+                        .as_ref()
+                        .map(|profiler| profiler.writes(ProfilePass::Ui)),
                     occlusion_query_set: None,
                     multiview_mask: None,
                 })
@@ -797,8 +924,15 @@ impl Renderer {
             self.egui_renderer.render(&mut pass, paint_jobs, &screen);
         }
 
+        let profile_readback = self
+            .profiler
+            .as_mut()
+            .and_then(|profiler| profiler.encode_readback(&self.device, &mut encoder));
         self.queue
             .submit(callback_buffers.into_iter().chain([encoder.finish()]));
+        if let (Some(profiler), Some(buffer)) = (&mut self.profiler, profile_readback) {
+            profiler.begin_readback(buffer);
+        }
         if let Some((request_id, buffer)) = pick_readback {
             let (sender, receiver) = mpsc::channel();
             buffer.map_async(wgpu::MapMode::Read, 0..16, move |result| {
@@ -814,6 +948,12 @@ impl Renderer {
         for id in &textures_delta.free {
             self.egui_renderer.free_texture(id);
         }
+        let elapsed_ms = cpu_start.elapsed().as_secs_f32() * 1_000.0;
+        self.cpu_frame_ms = if self.cpu_frame_ms == 0.0 {
+            elapsed_ms
+        } else {
+            self.cpu_frame_ms * 0.9 + elapsed_ms * 0.1
+        };
         Ok(())
     }
 }
@@ -896,7 +1036,8 @@ mod tests {
         let mut display = DisplayState::for_molecule(&molecule);
         display.set_global_mode(DisplayMode::Toon);
         let cartoon = cartoon_render_data(&molecule, &display);
-        let ids = toon_semantic_ids(&molecule);
+        let hierarchy = MoleculeHierarchy::from_molecule(&molecule);
+        let ids = semantic_ids_from_hierarchy(molecule.atoms.len(), &hierarchy);
         assert!(cartoon.vertices.is_empty() && cartoon.indices.is_empty());
         assert!(cartoon.standard_atomic.iter().all(|standard| !standard));
         assert_eq!(ids.len(), molecule.atoms.len());
@@ -919,11 +1060,8 @@ mod tests {
         );
         let instances = measurement_instances(std::slice::from_ref(&line));
         assert!(instances.len() >= 8);
-        assert!(
-            instances
-                .iter()
-                .all(|instance| instance.color == line.effective_color())
-        );
+        let expected = crate::SrgbColor(line.effective_color()).to_linear().0;
+        assert!(instances.iter().all(|instance| instance.color == expected));
 
         line.visibility = crate::VisibilityOverride::Hide;
         assert!(measurement_instances(&[line]).is_empty());

@@ -22,9 +22,12 @@ use molview::{
     camera::{OrbitCamera, Viewport},
     command::{Command, Representation, parse_command},
     measurement::{MeasurementEndpoint, MeasurementLine},
-    molecule::{MAX_DECOMPRESSED_STRUCTURE_SIZE, Molecule, MoleculeHierarchy, parse_structure},
+    molecule::{
+        MAX_DECOMPRESSED_STRUCTURE_SIZE, Molecule, MoleculeHierarchy, SecondaryStructure,
+        assign_secondary_structure, parse_structure,
+    },
     picking::AtomBvh,
-    render::{PreparedCartoon, RenderError, Renderer, SurfaceIssue, prepare_cartoon},
+    render::{PreparedCartoon, RenderError, Renderer, SurfaceIssue, prepare_cartoon_cached},
     scene::{
         SCENE_EXTENSION, SCENE_FORMAT_NAME, SceneDocument, SceneHierarchyTarget,
         decode as decode_scene, encode as encode_scene, is_scene_document,
@@ -82,13 +85,13 @@ struct PendingPick {
 impl Runtime {
     fn new(event_loop: &ActiveEventLoop, initial_path: Option<PathBuf>) -> Result<Self> {
         let attributes = WindowAttributes::default()
-            .with_title("molview")
+            .with_title("Astra")
             .with_inner_size(LogicalSize::new(1280.0, 800.0))
             .with_min_inner_size(LogicalSize::new(720.0, 480.0));
         let window = Arc::new(
             event_loop
                 .create_window(attributes)
-                .context("could not create the molview window")?,
+                .context("could not create the Astra window")?,
         );
         let renderer = pollster::block_on(Renderer::new(window.clone()))
             .context("could not initialize wgpu")?;
@@ -115,6 +118,7 @@ impl Runtime {
             egui_state,
             molecule: None,
             hierarchy: None,
+            secondary_structure: None,
             atom_bvh: None,
             display: None,
             named_selections: BTreeMap::new(),
@@ -136,6 +140,7 @@ impl Runtime {
             recovery_path: None,
             autosave_due: None,
             document_version: 0,
+            cartoon_generation: 0,
             needs_cartoon_refresh: false,
             next_pick_request_id: 1,
             pending_pick: None,
@@ -277,11 +282,11 @@ impl Runtime {
                             || (self.left_drag && self.modifiers.shift_key())
                         {
                             self.camera.pan(delta, self.viewport.height);
-                            self.mark_dirty();
+                            self.mark_camera_dirty();
                             self.window.request_redraw();
                         } else if self.left_drag && self.left_drag_distance > 4.0 {
                             self.camera.orbit(delta);
-                            self.mark_dirty();
+                            self.mark_camera_dirty();
                             self.window.request_redraw();
                         }
                     }
@@ -296,7 +301,7 @@ impl Runtime {
                     MouseScrollDelta::PixelDelta(position) => position.y as f32,
                 };
                 self.camera.zoom(amount);
-                self.mark_dirty();
+                self.mark_camera_dirty();
                 self.window.request_redraw();
             }
             WindowEvent::RedrawRequested
@@ -359,6 +364,7 @@ impl Runtime {
             background_job_id: background_job.map(|(id, _)| *id),
             background_stage: background_job.map(|(_, job)| job.stage.as_str()),
             background_progress: background_job.map_or(0.0, |(_, job)| job.progress),
+            render_stats: self.renderer.stats(),
         };
         let context = self.egui_context.clone();
         let mut actions = UiActions::default();
@@ -465,7 +471,7 @@ impl Runtime {
         }
         if actions.fit {
             self.fit();
-            self.mark_dirty();
+            self.mark_camera_dirty();
         }
         if actions.reset_colors {
             let before = self.begin_edit();
@@ -478,7 +484,7 @@ impl Runtime {
                     &self.named_selections,
                     &self.named_selection_styles,
                 ));
-                self.needs_cartoon_refresh = true;
+                self.refresh_display_attributes();
                 self.ui.latest_error = None;
                 self.commit_edit(before);
             }
@@ -505,14 +511,14 @@ impl Runtime {
         }
         if let Some(update) = actions.camera_update {
             self.apply_camera_update(update);
-            self.mark_dirty();
+            self.mark_camera_dirty();
         }
         if let Some(request) = actions.focus_request {
             match self.resolve_focus(request) {
                 Ok((point, description)) => {
                     self.camera.depth_of_field.focus_point = point;
                     self.focus_description = description;
-                    self.mark_dirty();
+                    self.mark_camera_dirty();
                     self.ui.latest_error = None;
                 }
                 Err(error) => self.ui.latest_error = Some(error.to_string()),
@@ -523,7 +529,7 @@ impl Runtime {
                 Ok((point, description)) => {
                     self.camera.set_pivot(point);
                     self.pivot_description = description;
-                    self.mark_dirty();
+                    self.mark_camera_dirty();
                     self.ui.latest_error = None;
                 }
                 Err(error) => self.ui.latest_error = Some(error.to_string()),
@@ -710,6 +716,10 @@ impl Runtime {
     fn swap_active_document(&mut self, session: &mut DocumentSession) {
         std::mem::swap(&mut self.molecule, &mut session.molecule);
         std::mem::swap(&mut self.hierarchy, &mut session.hierarchy);
+        std::mem::swap(
+            &mut self.secondary_structure,
+            &mut session.secondary_structure,
+        );
         std::mem::swap(&mut self.atom_bvh, &mut session.atom_bvh);
         std::mem::swap(&mut self.display, &mut session.display);
         std::mem::swap(&mut self.named_selections, &mut session.named_selections);
@@ -750,6 +760,10 @@ impl Runtime {
         std::mem::swap(&mut self.autosave_due, &mut session.autosave_due);
         std::mem::swap(&mut self.document_version, &mut session.document_version);
         std::mem::swap(
+            &mut self.cartoon_generation,
+            &mut session.cartoon_generation,
+        );
+        std::mem::swap(
             &mut self.needs_cartoon_refresh,
             &mut session.needs_cartoon_refresh,
         );
@@ -781,6 +795,7 @@ impl Runtime {
         self.begin_new_session();
         self.molecule = None;
         self.hierarchy = None;
+        self.secondary_structure = None;
         self.atom_bvh = None;
         self.display = None;
         self.named_selections.clear();
@@ -870,7 +885,7 @@ impl Runtime {
                         }
                         Ok(JobOutput::Cartoon(prepared)) => {
                             if job.session_id == self.active_session_id
-                                && job.version == self.document_version
+                                && job.version == self.cartoon_generation
                                 && let (Some(molecule), Some(display)) =
                                     (&self.molecule, &self.display)
                             {
@@ -896,7 +911,12 @@ impl Runtime {
     }
 
     fn schedule_cartoon_job(&mut self) {
-        let (Some(molecule), Some(display)) = (&self.molecule, &self.display) else {
+        let (Some(molecule), Some(display), Some(hierarchy), Some(secondary_structure)) = (
+            &self.molecule,
+            &self.display,
+            &self.hierarchy,
+            &self.secondary_structure,
+        ) else {
             return;
         };
         for job in self
@@ -908,13 +928,15 @@ impl Runtime {
         }
         let id = self.next_job_id;
         self.next_job_id = self.next_job_id.wrapping_add(1);
+        self.cartoon_generation = self.cartoon_generation.wrapping_add(1);
+        let generation = self.cartoon_generation;
         let cancel = Arc::new(AtomicBool::new(false));
         let request = JobRequest::Cartoon {
             id,
-            session_id: self.active_session_id,
-            version: self.document_version,
             molecule: Box::new(molecule.clone()),
             display: Box::new(display.clone()),
+            hierarchy: Box::new(hierarchy.clone()),
+            secondary_structure: secondary_structure.clone(),
             cancel: cancel.clone(),
         };
         if self.submit_job(request).is_err() {
@@ -926,7 +948,7 @@ impl Runtime {
             id,
             BackgroundJob {
                 session_id: self.active_session_id,
-                version: self.document_version,
+                version: generation,
                 kind: JobKind::Cartoon,
                 stage: "Queued ribbon geometry".into(),
                 progress: 0.0,
@@ -947,6 +969,7 @@ impl Runtime {
                     molecule_id,
                     molecule,
                     hierarchy,
+                    secondary_structure,
                     atom_bvh,
                     display,
                 } => {
@@ -955,6 +978,7 @@ impl Runtime {
                     self.scene_path = None;
                     self.molecule = Some(molecule);
                     self.hierarchy = Some(hierarchy);
+                    self.secondary_structure = Some(secondary_structure);
                     self.atom_bvh = Some(atom_bvh);
                     self.display = Some(*display);
                     self.named_selections.clear();
@@ -979,6 +1003,7 @@ impl Runtime {
                     path,
                     document,
                     hierarchy,
+                    secondary_structure,
                     atom_bvh,
                 } => {
                     let SceneDocument {
@@ -1013,6 +1038,7 @@ impl Runtime {
                     self.scene_path = Some(path);
                     self.molecule = Some(molecule);
                     self.hierarchy = Some(hierarchy);
+                    self.secondary_structure = Some(secondary_structure);
                     self.atom_bvh = Some(atom_bvh);
                     self.display = Some(display);
                     self.named_selections = named_selections;
@@ -1210,6 +1236,7 @@ impl Runtime {
             molecule_id_from_filename(&source_name)
         };
         let hierarchy = MoleculeHierarchy::from_molecule(&molecule);
+        let secondary_structure = assign_secondary_structure(&molecule, &hierarchy);
         let atom_bvh = AtomBvh::build(&molecule);
         camera.set_viewport(self.viewport);
         self.renderer.update_measurements(&measurement_lines);
@@ -1224,6 +1251,7 @@ impl Runtime {
         self.scene_path = scene_path;
         self.molecule = Some(molecule);
         self.hierarchy = Some(hierarchy);
+        self.secondary_structure = Some(secondary_structure);
         self.atom_bvh = Some(atom_bvh);
         self.display = Some(display);
         self.named_selections = named_selections;
@@ -1376,11 +1404,13 @@ impl Runtime {
     fn commit_edit(&mut self, before: EditTransaction) {
         let operation = EditOperation::between(before, self.begin_edit());
         if operation.changes.is_empty() {
+            self.flush_cartoon_refresh();
             return;
         }
         push_history(&mut self.undo_history, operation);
         self.redo_history.clear();
         self.mark_dirty();
+        self.flush_cartoon_refresh();
     }
 
     fn undo(&mut self) -> bool {
@@ -1390,6 +1420,7 @@ impl Runtime {
         self.apply_edit_operation(&operation, HistoryDirection::Undo);
         push_history(&mut self.redo_history, operation);
         self.mark_dirty();
+        self.flush_cartoon_refresh();
         true
     }
 
@@ -1400,6 +1431,7 @@ impl Runtime {
         self.apply_edit_operation(&operation, HistoryDirection::Redo);
         push_history(&mut self.undo_history, operation);
         self.mark_dirty();
+        self.flush_cartoon_refresh();
         true
     }
 
@@ -1478,6 +1510,20 @@ impl Runtime {
         self.dirty = true;
         self.document_version = self.document_version.wrapping_add(1);
         self.autosave_due = Some(Instant::now() + AUTOSAVE_DELAY);
+    }
+
+    /// Camera state is serialized with the scene, but is deliberately outside `EditTransaction`.
+    /// Camera interaction therefore marks the document for saving without touching undo/redo.
+    fn mark_camera_dirty(&mut self) {
+        self.mark_dirty();
+    }
+
+    /// Starts topology work only after an edit has received its final document version.
+    /// This keeps background results from being rejected as stale immediately after enqueueing.
+    fn flush_cartoon_refresh(&mut self) {
+        if self.needs_cartoon_refresh {
+            self.schedule_cartoon_job();
+        }
     }
 
     fn remove_recovery_file(&mut self) {

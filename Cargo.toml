@@ -1,9 +1,15 @@
 [package]
-name = "molview"
+name = "astra"
 version = "0.1.0"
 edition = "2024"
-license = "GPL-3.0-only"
-description = "A lightweight native molecular viewer built with Rust and wgpu"
+authors = ["Thoisoi Three"]
+license = "AGPL-3.0-only"
+readme = "README.md"
+description = "Astra: a native molecular viewer built with Rust and wgpu"
+
+[lib]
+name = "molview"
+path = "src/lib.rs"
 
 [dependencies]
 anyhow = "1"
@@ -26,6 +32,9 @@ zstd = "0.13"
 [build-dependencies]
 prost-build = "0.14"
 protoc-bin-vendored = "3"
+
+[dev-dependencies]
+naga = { version = "30", features = ["wgsl-in"] }
 
 [[bench]]
 name = "display_memory"

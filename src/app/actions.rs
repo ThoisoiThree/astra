@@ -5,7 +5,7 @@ impl Runtime {
         if self.molecule.is_none() || self.display.is_none() {
             anyhow::bail!("load a PDB file before executing commands");
         }
-        match command {
+        let topology_changed = match command {
             Command::Select {
                 name,
                 source,
@@ -32,6 +32,7 @@ impl Runtime {
                 self.inspection = None;
                 self.hierarchy_selection.clear();
                 self.hierarchy_selection_anchor = None;
+                false
             }
             Command::Color { color, selection } => {
                 let indices: Vec<_> = evaluate_with_named(
@@ -44,6 +45,7 @@ impl Runtime {
                 if let Some(display) = &mut self.display {
                     display.set_color_override(&indices, DisplayLevel::Atom, Some(color.0));
                 }
+                false
             }
             Command::Show {
                 representation,
@@ -58,6 +60,7 @@ impl Runtime {
                 if let Some(display) = &mut self.display {
                     display.set_representation(selected.indices(), mask, true);
                 }
+                true
             }
             Command::Hide {
                 representation,
@@ -72,9 +75,14 @@ impl Runtime {
                 if let Some(display) = &mut self.display {
                     display.set_representation(selected.indices(), mask, false);
                 }
+                true
             }
+        };
+        if topology_changed {
+            self.refresh_instances();
+        } else {
+            self.refresh_display_attributes();
         }
-        self.refresh_instances();
         Ok(())
     }
 
@@ -209,7 +217,7 @@ impl Runtime {
                         display.set_color_override(&indices, level, color);
                     }
                 }
-                self.refresh_instances();
+                self.refresh_display_attributes();
             }
             ManagerAction::SetVisibility { targets, state } => {
                 let operations: Vec<_> = targets
@@ -239,7 +247,7 @@ impl Runtime {
             ManagerAction::SetNamedColor { name, color } => {
                 if self.named_selections.contains_key(&name) {
                     self.named_selection_styles.entry(name).or_default().color = color;
-                    self.rebuild_named_display_layers();
+                    self.rebuild_named_display_attributes();
                 }
             }
             ManagerAction::SetNamedVisibility { name, state } => {
@@ -271,7 +279,7 @@ impl Runtime {
                 if let Some(display) = &mut self.display {
                     display.set_color_overrides_forced(&[(indices, DisplayLevel::Atom, color)]);
                 }
-                self.refresh_instances();
+                self.refresh_display_attributes();
             }
             ManagerAction::PropagateNamedVisibility { name, state } => {
                 let indices = self.named_selection_indices(&name);
@@ -299,7 +307,7 @@ impl Runtime {
                 if let (Some(molecule), Some(display)) = (&self.molecule, &mut self.display) {
                     display.set_coloring_mode(molecule, mode);
                 }
-                self.refresh_instances();
+                self.refresh_display_attributes();
             }
             ManagerAction::SetGlobalMode(mode) => {
                 if let Some(display) = &mut self.display {
@@ -314,15 +322,22 @@ impl Runtime {
                 self.rebuild_named_display_layers();
             }
             ManagerAction::SetAmbientOcclusion(settings) => {
+                let quality_changed = self
+                    .display
+                    .as_ref()
+                    .is_some_and(|display| display.ambient_occlusion.quality != settings.quality);
                 if let Some(display) = &mut self.display {
                     display.set_ambient_occlusion(settings);
+                }
+                if quality_changed {
+                    self.refresh_instances();
                 }
             }
             ManagerAction::SetUniformColor(color) => {
                 if let (Some(molecule), Some(display)) = (&self.molecule, &mut self.display) {
                     display.set_uniform_color(molecule, color);
                 }
-                self.refresh_instances();
+                self.refresh_display_attributes();
             }
             ManagerAction::ActivateNamed(name) => {
                 if let Some(selection) = self.named_selections.get(&name) {
@@ -333,7 +348,7 @@ impl Runtime {
                         display.set_selection(flags);
                     }
                     self.inspection = None;
-                    self.refresh_instances();
+                    self.refresh_display_attributes();
                 }
             }
             ManagerAction::UpdateNamedExpression { name, expression } => {
@@ -615,7 +630,15 @@ impl Runtime {
         if let Some(display) = &mut self.display {
             display.set_color_overrides_forced(&operations);
         }
-        self.refresh_instances();
+        self.refresh_display_attributes();
+    }
+
+    pub(super) fn rebuild_named_display_attributes(&mut self) {
+        let layers = named_display_layers(&self.named_selections, &self.named_selection_styles);
+        if let Some(display) = &mut self.display {
+            display.replace_named_layers(&layers);
+        }
+        self.refresh_display_attributes();
     }
 
     pub(super) fn propagate_visibility(&mut self, targets: &[InspectionTarget]) {
@@ -746,7 +769,7 @@ impl Runtime {
         };
         display.set_selection_from_bools(flags);
         self.inspection = inspection;
-        self.refresh_instances();
+        self.refresh_display_attributes();
     }
 
     pub(super) fn display_target(&self, target: InspectionTarget) -> (Vec<usize>, DisplayLevel) {
@@ -782,8 +805,16 @@ impl Runtime {
 
     pub(super) fn refresh_instances(&mut self) {
         self.needs_cartoon_refresh = true;
-        self.schedule_cartoon_job();
         self.renderer.update_measurements(&self.measurement_lines);
+        self.window.request_redraw();
+    }
+
+    pub(super) fn refresh_display_attributes(&mut self) {
+        if let (Some(molecule), Some(display)) = (&self.molecule, &self.display) {
+            self.renderer.update_display_attributes(molecule, display);
+        }
+        self.renderer.update_measurements(&self.measurement_lines);
+        self.window.request_redraw();
     }
 }
 

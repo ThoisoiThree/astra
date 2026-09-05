@@ -1,6 +1,6 @@
-# molview
+# Astra
 
-`molview` is an early, usable native molecular viewer written in Rust. This MVP
+`Astra` is an early, usable native molecular viewer written in Rust. This MVP
 loads PDB, PDBx/mmCIF, BinaryCIF, and PDBML/XML structures, builds renderer-independent molecular topology, evaluates a
 composable selection language, and displays atoms and bonds through batched wgpu
 instancing with a small egui interface.
@@ -322,4 +322,7 @@ cargo clippy --all-targets --all-features -- -D warnings
 
 ## License
 
-GNU General Public License v3.0 only. See `LICENSE`.
+Copyright © 2026 Thoisoi Three.
+
+Astra is licensed under the GNU Affero General Public License v3.0 only
+(`AGPL-3.0-only`). See [LICENSE](LICENSE) and [NOTICE](NOTICE).

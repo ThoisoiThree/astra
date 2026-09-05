@@ -1,5 +1,8 @@
 use super::{
-    instances::{CartoonVertex, InstanceRaw, ToonInstanceRaw},
+    instances::{
+        CartoonDisplayRaw, CartoonVertex, InstanceDisplayRaw, InstanceRaw, InstanceTopologyRaw,
+        ToonDisplayRaw, ToonTopologyRaw,
+    },
     mesh::Vertex,
     renderer::{DEPTH_FORMAT, SCENE_FORMAT, SEMANTIC_FORMAT},
 };
@@ -92,7 +95,11 @@ pub(super) fn create_scene_geometry_pipeline(
     layout: &wgpu::PipelineLayout,
     shader: &wgpu::ShaderModule,
 ) -> wgpu::RenderPipeline {
-    let vertex_layouts = [Some(Vertex::layout()), Some(InstanceRaw::layout())];
+    let vertex_layouts = [
+        Some(Vertex::layout()),
+        Some(InstanceTopologyRaw::layout()),
+        Some(InstanceDisplayRaw::layout()),
+    ];
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("molecule scene pipeline"),
         layout: Some(layout),
@@ -143,7 +150,10 @@ pub(super) fn create_cartoon_pipeline(
     layout: &wgpu::PipelineLayout,
     shader: &wgpu::ShaderModule,
 ) -> wgpu::RenderPipeline {
-    let vertex_layouts = [Some(CartoonVertex::layout())];
+    let vertex_layouts = [
+        Some(CartoonVertex::layout()),
+        Some(CartoonDisplayRaw::layout()),
+    ];
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("continuous cartoon pipeline"),
         layout: Some(layout),
@@ -194,7 +204,10 @@ pub(super) fn create_toon_pipeline(
     layout: &wgpu::PipelineLayout,
     shader: &wgpu::ShaderModule,
 ) -> wgpu::RenderPipeline {
-    let vertex_layouts = [Some(ToonInstanceRaw::layout())];
+    let vertex_layouts = [
+        Some(ToonTopologyRaw::layout()),
+        Some(ToonDisplayRaw::layout()),
+    ];
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("analytic toon sphere pipeline"),
         layout: Some(layout),

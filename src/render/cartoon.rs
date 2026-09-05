@@ -7,7 +7,7 @@ use crate::{
     },
 };
 
-use super::instances::CartoonVertex;
+use super::instances::{CartoonVertex, semantic_ids_from_hierarchy};
 
 #[derive(Clone, Copy)]
 
@@ -20,10 +20,12 @@ struct BackboneAnchor {
     structure: SecondaryStructure,
 }
 
+#[derive(Default)]
 pub(super) struct CartoonRenderData {
     pub(super) vertices: Vec<CartoonVertex>,
     pub(super) indices: Vec<u32>,
     pub(super) standard_atomic: Vec<bool>,
+    pub(super) semantic_ids: Vec<[u32; 4]>,
 }
 
 pub(super) fn cartoon_render_data(
@@ -32,8 +34,22 @@ pub(super) fn cartoon_render_data(
 ) -> CartoonRenderData {
     let hierarchy = MoleculeHierarchy::from_molecule(molecule);
     let assignments = assign_secondary_structure(molecule, &hierarchy);
+    cartoon_render_data_cached(molecule, display, &hierarchy, &assignments)
+}
+
+pub(super) fn cartoon_render_data_cached(
+    molecule: &Molecule,
+    display: &DisplayState,
+    hierarchy: &MoleculeHierarchy,
+    assignments: &[Vec<SecondaryStructure>],
+) -> CartoonRenderData {
     let mut vertices = Vec::new();
     let mut indices = Vec::new();
+    let semantic_ids = semantic_ids_from_hierarchy(molecule.atoms.len(), hierarchy);
+    let quality = display.ambient_occlusion.quality;
+    let samples_per_residue = quality.cartoon_samples_per_residue();
+    let width_segments = quality.cartoon_width_segments();
+    let ring_segments = width_segments.max(6) * 2;
     let mut cartoon_residue_atoms = vec![false; molecule.atoms.len()];
     for (chain_index, chain) in hierarchy.chains.iter().enumerate() {
         let mut anchors = Vec::new();
@@ -88,14 +104,30 @@ pub(super) fn cartoon_render_data(
                         <= if anchor.nucleic { 8.5 } else { 5.0 }
             });
             if !drawable || !continuous {
-                append_ribbon_run(&run, display, &mut vertices, &mut indices);
+                append_ribbon_run(
+                    &run,
+                    display,
+                    samples_per_residue,
+                    width_segments,
+                    ring_segments,
+                    &mut vertices,
+                    &mut indices,
+                );
                 run.clear();
             }
             if drawable {
                 run.push(anchor);
             }
         }
-        append_ribbon_run(&run, display, &mut vertices, &mut indices);
+        append_ribbon_run(
+            &run,
+            display,
+            samples_per_residue,
+            width_segments,
+            ring_segments,
+            &mut vertices,
+            &mut indices,
+        );
     }
 
     let standard_atomic = display
@@ -112,6 +144,7 @@ pub(super) fn cartoon_render_data(
         vertices,
         indices,
         standard_atomic,
+        semantic_ids,
     }
 }
 
@@ -145,6 +178,9 @@ fn backbone_atom(molecule: &Molecule, residue: &ResidueGroup) -> Option<(usize, 
 fn append_ribbon_run(
     run: &[BackboneAnchor],
     display: &DisplayState,
+    samples_per_residue: usize,
+    width_segments: u32,
+    ring_segments: u32,
     vertices: &mut Vec<CartoonVertex>,
     indices: &mut Vec<u32>,
 ) {
@@ -168,15 +204,14 @@ fn append_ribbon_run(
         }
     }
 
-    const SAMPLES_PER_RESIDUE: usize = 10;
-    let sample_count = (run.len() - 1) * SAMPLES_PER_RESIDUE + 1;
+    let sample_count = (run.len() - 1) * samples_per_residue + 1;
     let mut positions = Vec::with_capacity(sample_count);
     for index in 0..sample_count {
-        let segment = (index / SAMPLES_PER_RESIDUE).min(run.len() - 2);
+        let segment = (index / samples_per_residue).min(run.len() - 2);
         let t = if index + 1 == sample_count {
             1.0
         } else {
-            (index % SAMPLES_PER_RESIDUE) as f32 / SAMPLES_PER_RESIDUE as f32
+            (index % samples_per_residue) as f32 / samples_per_residue as f32
         };
         positions.push(centripetal_catmull_rom(run, segment, t));
     }
@@ -186,11 +221,11 @@ fn append_ribbon_run(
         let before = positions[index.saturating_sub(1)];
         let after = positions[(index + 1).min(sample_count - 1)];
         let tangent = (after - before).normalize_or_zero();
-        let segment = (index / SAMPLES_PER_RESIDUE).min(run.len() - 2);
+        let segment = (index / samples_per_residue).min(run.len() - 2);
         let t = if index + 1 == sample_count {
             1.0
         } else {
-            (index % SAMPLES_PER_RESIDUE) as f32 / SAMPLES_PER_RESIDUE as f32
+            (index % samples_per_residue) as f32 / samples_per_residue as f32
         };
         let guide = guides[segment].lerp(guides[segment + 1], t);
         let target = project_side(guide, tangent);
@@ -231,11 +266,11 @@ fn append_ribbon_run(
         }
         let normal = side.cross(tangent).normalize_or_zero();
         side = tangent.cross(normal).normalize_or_zero();
-        let segment = (index / SAMPLES_PER_RESIDUE).min(run.len() - 2);
+        let segment = (index / samples_per_residue).min(run.len() - 2);
         let t = if index + 1 == sample_count {
             1.0
         } else {
-            (index % SAMPLES_PER_RESIDUE) as f32 / SAMPLES_PER_RESIDUE as f32
+            (index % samples_per_residue) as f32 / samples_per_residue as f32
         };
         let structure = if t < 0.5 {
             run[segment].structure
@@ -290,9 +325,9 @@ fn append_ribbon_run(
         }
         let strip = &samples[first_edge..=last_edge + 1];
         if tube {
-            append_tube_strip(strip, vertices, indices);
+            append_tube_strip(strip, ring_segments, vertices, indices);
         } else {
-            append_rectangular_strip(strip, vertices, indices);
+            append_rectangular_strip(strip, width_segments, vertices, indices);
         }
         first_edge = last_edge + 1;
     }
@@ -314,6 +349,7 @@ struct CartoonSample {
 
 fn append_rectangular_strip(
     samples: &[CartoonSample],
+    width_segments: u32,
     vertices: &mut Vec<CartoonVertex>,
     indices: &mut Vec<u32>,
 ) {
@@ -321,14 +357,13 @@ fn append_rectangular_strip(
     // bends. Its implicit diagonal then leaks into both diffuse and specular lighting.
     // A small transverse grid follows the ruled surface closely without changing its
     // silhouette, while analytical surface normals keep the bend visually continuous.
-    const WIDTH_SEGMENTS: u32 = 8;
-    const FACE_ROW: u32 = WIDTH_SEGMENTS + 1;
-    const VERTICES_PER_RING: u32 = FACE_ROW * 2 + 4;
+    let face_row = width_segments + 1;
+    let vertices_per_ring = face_row * 2 + 4;
     let base = vertices.len() as u32;
     for (ring, sample) in samples.iter().copied().enumerate() {
         for top in [true, false] {
-            for width_index in 0..=WIDTH_SEGMENTS {
-                let across = width_index as f32 / WIDTH_SEGMENTS as f32 - 0.5;
+            for width_index in 0..=width_segments {
+                let across = width_index as f32 / width_segments as f32 - 0.5;
                 let position = ribbon_surface_position(sample, across, top);
                 let before = ribbon_surface_position(samples[ring.saturating_sub(1)], across, top);
                 let after = ribbon_surface_position(
@@ -391,24 +426,24 @@ fn append_rectangular_strip(
         ]);
     }
     for ring in 0..samples.len().saturating_sub(1) as u32 {
-        let current = base + ring * VERTICES_PER_RING;
-        let next = current + VERTICES_PER_RING;
-        for width_index in 0..WIDTH_SEGMENTS {
+        let current = base + ring * vertices_per_ring;
+        let next = current + vertices_per_ring;
+        for width_index in 0..width_segments {
             let a = current + width_index;
             let b = a + 1;
             let next_a = next + width_index;
             let next_b = next_a + 1;
             indices.extend_from_slice(&[a, b, next_a, next_a, b, next_b]);
 
-            let a = current + FACE_ROW + width_index;
+            let a = current + face_row + width_index;
             let b = a + 1;
-            let next_a = next + FACE_ROW + width_index;
+            let next_a = next + face_row + width_index;
             let next_b = next_a + 1;
             indices.extend_from_slice(&[a, next_a, b, next_a, next_b, b]);
         }
 
-        let left = current + FACE_ROW * 2;
-        let next_left = next + FACE_ROW * 2;
+        let left = current + face_row * 2;
+        let next_left = next + face_row * 2;
         indices.extend_from_slice(&[
             left,
             left + 1,
@@ -468,15 +503,15 @@ fn append_rectangular_cap(
 
 fn append_tube_strip(
     samples: &[CartoonSample],
+    ring_segments: u32,
     vertices: &mut Vec<CartoonVertex>,
     indices: &mut Vec<u32>,
 ) {
-    const RING_SEGMENTS: u32 = 16;
     let base = vertices.len() as u32;
     for sample in samples {
         let radius = sample.width * 0.5;
-        for segment in 0..RING_SEGMENTS {
-            let angle = segment as f32 / RING_SEGMENTS as f32 * std::f32::consts::TAU;
+        for segment in 0..ring_segments {
+            let angle = segment as f32 / ring_segments as f32 * std::f32::consts::TAU;
             let radial = (sample.side * angle.cos() + sample.normal * angle.sin()).normalize();
             vertices.push(CartoonVertex::new(
                 sample.position + radial * radius,
@@ -488,10 +523,10 @@ fn append_tube_strip(
         }
     }
     for ring in 0..samples.len().saturating_sub(1) as u32 {
-        let current = base + ring * RING_SEGMENTS;
-        let next = current + RING_SEGMENTS;
-        for segment in 0..RING_SEGMENTS {
-            let following = (segment + 1) % RING_SEGMENTS;
+        let current = base + ring * ring_segments;
+        let next = current + ring_segments;
+        for segment in 0..ring_segments {
+            let following = (segment + 1) % ring_segments;
             indices.extend_from_slice(&[
                 current + segment,
                 current + following,

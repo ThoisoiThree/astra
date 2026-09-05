@@ -36,13 +36,17 @@ fn vertex_main(input: VertexInput, @builtin(vertex_index) vertex_index: u32) -> 
         vec2<f32>(1.0, 1.0),
     );
     let corner = corners[vertex_index];
-    let extent = input.center_radius.w * 1.08;
-    let world = input.center_radius.xyz
+    let center_radius = vec4<f32>(
+        input.center_radius.xyz,
+        input.center_radius.w * (1.0 + input.highlight.x * 0.04),
+    );
+    let extent = center_radius.w * 1.08;
+    let world = center_radius.xyz
         + (camera.camera_right.xyz * corner.x + camera.camera_up.xyz * corner.y) * extent;
     var output: VertexOutput;
     output.clip_position = camera.view_projection * vec4<f32>(world, 1.0);
     output.billboard_position = world;
-    output.center_radius = input.center_radius;
+    output.center_radius = center_radius;
     output.color = input.color;
     output.semantic_ids = input.semantic_ids;
     output.highlight = input.highlight.x;
@@ -52,7 +56,7 @@ fn vertex_main(input: VertexInput, @builtin(vertex_index) vertex_index: u32) -> 
 struct FragmentOutput {
     @builtin(frag_depth) depth: f32,
     @location(0) color: vec4<f32>,
-    @location(1) semantic_ids: vec4<u32>,
+    @location(1) semantic_ids: vec2<u32>,
 };
 
 @fragment
@@ -87,6 +91,9 @@ fn fragment_main(input: VertexOutput) -> FragmentOutput {
     var output: FragmentOutput;
     output.depth = clamp(clip.z / clip.w, 0.0, 1.0);
     output.color = vec4<f32>(selected * light_band, input.color.a);
-    output.semantic_ids = input.semantic_ids;
+    output.semantic_ids = vec2<u32>(
+        input.semantic_ids.x,
+        (input.semantic_ids.z << 20u) | (input.semantic_ids.y & 0xFFFFFu),
+    );
     return output;
 }
