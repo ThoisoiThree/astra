@@ -19,6 +19,8 @@ pub(super) struct PostUniform {
     pub(super) aperture: [f32; 4],
     pub(super) ao: [f32; 4],
     pub(super) quality: [f32; 4],
+    pub(super) background: [f32; 4],
+    pub(super) viewport: [f32; 4],
 }
 
 pub(super) struct PostProcess {
@@ -32,9 +34,8 @@ pub(super) struct PostProcess {
     pub(super) sampler: wgpu::Sampler,
     pub(super) bind_group_layout: wgpu::BindGroupLayout,
     pub(super) bind_group: wgpu::BindGroup,
-    pub(super) dof_source_bind_group: wgpu::BindGroup,
     pub(super) pipeline: wgpu::RenderPipeline,
-    pub(super) dof_pipeline: wgpu::RenderPipeline,
+    pub(super) dof_shade_pipeline: wgpu::RenderPipeline,
     pub(super) ao_bind_group_layout: wgpu::BindGroupLayout,
     pub(super) ao_raw_bind_group: wgpu::BindGroup,
     pub(super) ao_blur_bind_group: wgpu::BindGroup,
@@ -61,9 +62,9 @@ impl PostProcess {
             AO_FORMAT,
         );
         let dof_scale = 0.5;
-        let dof_color = ColorTarget::new(
+        let dof_color = ColorTarget::new_storage(
             device,
-            "half-resolution depth of field",
+            "depth of field color",
             scaled_dimension(width, dof_scale),
             scaled_dimension(height, dof_scale),
             SCENE_FORMAT,
@@ -163,20 +164,15 @@ impl PostProcess {
             &semantic.view,
             &dof_color.view,
         );
-        let dof_source_bind_group = create_post_bind_group(
-            device,
-            &bind_group_layout,
-            &scene.view,
-            &sampler,
-            depth_view,
-            &uniform,
-            &ao_filtered.view,
-            &semantic.view,
-            &scene.view,
-        );
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("DOF postprocess shader"),
-            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("postprocess.wgsl"))),
+            source: wgpu::ShaderSource::Wgsl(Cow::Owned(
+                [
+                    include_str!("optics.wgsl"),
+                    include_str!("postprocess.wgsl"),
+                ]
+                .concat(),
+            )),
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("DOF postprocess pipeline layout"),
@@ -208,15 +204,14 @@ impl PostProcess {
             multiview_mask: None,
             cache: None,
         });
-        let dof_pipeline = create_fullscreen_pipeline(
+        let dof_shade_pipeline = create_fullscreen_pipeline(
             device,
-            "depth of field gather pipeline",
+            "DOF visible-layer shading",
             &pipeline_layout,
             &shader,
-            "dof_main",
+            "dof_shade",
             SCENE_FORMAT,
         );
-
         let ao_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("ambient occlusion bind group layout"),
@@ -269,7 +264,13 @@ impl PostProcess {
         );
         let ao_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("ambient occlusion shader"),
-            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("ambient_occlusion.wgsl"))),
+            source: wgpu::ShaderSource::Wgsl(Cow::Owned(
+                [
+                    include_str!("optics.wgsl"),
+                    include_str!("ambient_occlusion.wgsl"),
+                ]
+                .concat(),
+            )),
         });
         let ao_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("ambient occlusion pipeline layout"),
@@ -303,9 +304,8 @@ impl PostProcess {
             sampler,
             bind_group_layout,
             bind_group,
-            dof_source_bind_group,
             pipeline,
-            dof_pipeline,
+            dof_shade_pipeline,
             ao_bind_group_layout,
             ao_raw_bind_group,
             ao_blur_bind_group,
@@ -331,7 +331,7 @@ impl PostProcess {
             height,
             AO_FORMAT,
         );
-        self.dof_color = ColorTarget::new(
+        self.dof_color = ColorTarget::new_storage(
             device,
             "depth of field color",
             scaled_dimension(width, self.dof_scale),
@@ -348,17 +348,6 @@ impl PostProcess {
             &self.ao_filtered.view,
             &self.semantic.view,
             &self.dof_color.view,
-        );
-        self.dof_source_bind_group = create_post_bind_group(
-            device,
-            &self.bind_group_layout,
-            &self.scene.view,
-            &self.sampler,
-            depth_view,
-            &self.uniform,
-            &self.ao_filtered.view,
-            &self.semantic.view,
-            &self.scene.view,
         );
         self.ao_raw_bind_group = create_ao_bind_group(
             device,
@@ -389,7 +378,7 @@ impl PostProcess {
             return;
         }
         self.dof_scale = scale;
-        self.dof_color = ColorTarget::new(
+        self.dof_color = ColorTarget::new_storage(
             device,
             "depth of field color",
             scaled_dimension(width, scale),
@@ -415,7 +404,7 @@ fn scaled_dimension(value: u32, scale: f32) -> u32 {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn create_post_bind_group(
+pub(super) fn create_post_bind_group(
     device: &wgpu::Device,
     layout: &wgpu::BindGroupLayout,
     scene_view: &wgpu::TextureView,

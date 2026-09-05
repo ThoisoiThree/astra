@@ -1,17 +1,3 @@
-struct PostUniform {
-    inverse_view_projection: mat4x4<f32>,
-    eye_position: vec4<f32>,
-    optical_axis: vec4<f32>,
-    // focus distance, f-number, maximum CoC radius in pixels, enabled
-    lens: vec4<f32>,
-    // focal length for a unit-height sensor, diaphragm blades, rotation, reserved
-    aperture: vec4<f32>,
-    // AO strength, world-space radius, normal bias, sample count (zero disables)
-    ao: vec4<f32>,
-    // DOF samples, DOF resolution scale, reserved, reserved
-    quality: vec4<f32>,
-};
-
 @group(0) @binding(0)
 var scene_color: texture_2d<f32>;
 @group(0) @binding(1)
@@ -43,86 +29,39 @@ fn vertex_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
     return output;
 }
 
-fn optical_depth(uv: vec2<f32>, depth: f32) -> f32 {
-    if depth >= 0.999999 {
-        return 1e20;
-    }
-    let clip = vec4<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, depth, 1.0);
-    let world_h = post.inverse_view_projection * clip;
-    let world = world_h.xyz / world_h.w;
-    return max(dot(world - post.eye_position.xyz, post.optical_axis.xyz), 1e-4);
-}
-
-// Signed thin-lens circle of confusion. Scene and focal length use the same
-// virtual unit-height sensor scale, so the result is a sensor-height fraction.
-fn circle_of_confusion(distance: f32, image_height: f32) -> f32 {
-    if distance >= 1e19 {
-        return post.lens.z;
-    }
-    let focus = max(post.lens.x, post.aperture.x + 1e-4);
-    let object_distance = max(distance, post.aperture.x + 1e-4);
-    let focal_length = post.aperture.x;
-    let f_number = max(post.lens.y, 0.1);
-    let sensor_coc = focal_length * focal_length * (object_distance - focus)
-        / (f_number * object_distance * (focus - focal_length));
-    return clamp(sensor_coc * image_height, -post.lens.z, post.lens.z);
-}
-
-fn aperture_boundary(angle: f32) -> f32 {
-    let blades = floor(post.aperture.y + 0.5);
-    if blades < 3.0 {
-        return 1.0;
-    }
-    let sector = 6.28318530718 / blades;
-    let local_angle = (angle + 3.14159265359) % sector - sector * 0.5;
-    return cos(3.14159265359 / blades) / max(cos(local_angle), 1e-4);
-}
-
-fn aperture_sample(index: f32, count: f32) -> vec2<f32> {
-    let angle = index * 2.39996322973 + post.aperture.z;
-    let disk_radius = sqrt((index + 0.5) / count);
-    let radius = disk_radius * aperture_boundary(angle);
-    return vec2<f32>(cos(angle), sin(angle)) * radius;
-}
-
-fn aperture_metric(point: vec2<f32>) -> f32 {
-    let angle = atan2(point.y, point.x) - post.aperture.z;
-    return length(point) / max(aperture_boundary(angle), 1e-4);
-}
-
 fn luminance(color: vec3<f32>) -> f32 {
     return dot(color, vec3<f32>(0.299, 0.587, 0.114));
 }
 
 // FXAA is applied only to the molecular scene. UI and measurement labels are
 // composited later, so their glyphs remain pixel-sharp.
-fn antialiased_scene(uv: vec2<f32>, dimensions: vec2<f32>) -> vec4<f32> {
+fn antialiased_scene(source: texture_2d<f32>, uv: vec2<f32>, dimensions: vec2<f32>) -> vec4<f32> {
     let inverse_dimensions = 1.0 / dimensions;
     let northwest = textureSampleLevel(
-        scene_color,
+        source,
         scene_sampler,
         uv + vec2<f32>(-1.0, -1.0) * inverse_dimensions,
         0.0,
     ).rgb;
     let northeast = textureSampleLevel(
-        scene_color,
+        source,
         scene_sampler,
         uv + vec2<f32>(1.0, -1.0) * inverse_dimensions,
         0.0,
     ).rgb;
     let southwest = textureSampleLevel(
-        scene_color,
+        source,
         scene_sampler,
         uv + vec2<f32>(-1.0, 1.0) * inverse_dimensions,
         0.0,
     ).rgb;
     let southeast = textureSampleLevel(
-        scene_color,
+        source,
         scene_sampler,
         uv + vec2<f32>(1.0, 1.0) * inverse_dimensions,
         0.0,
     ).rgb;
-    let center = textureSampleLevel(scene_color, scene_sampler, uv, 0.0);
+    let center = textureSampleLevel(source, scene_sampler, uv, 0.0);
 
     let luma_northwest = luminance(northwest);
     let luma_northeast = luminance(northeast);
@@ -154,12 +93,12 @@ fn antialiased_scene(uv: vec2<f32>, dimensions: vec2<f32>) -> vec4<f32> {
         * inverse_dimensions;
 
     let first = 0.5 * (
-        textureSampleLevel(scene_color, scene_sampler, uv + direction * (-1.0 / 6.0), 0.0).rgb
-        + textureSampleLevel(scene_color, scene_sampler, uv + direction * (1.0 / 6.0), 0.0).rgb
+        textureSampleLevel(source, scene_sampler, uv + direction * (-1.0 / 6.0), 0.0).rgb
+        + textureSampleLevel(source, scene_sampler, uv + direction * (1.0 / 6.0), 0.0).rgb
     );
     let second = first * 0.5 + 0.25 * (
-        textureSampleLevel(scene_color, scene_sampler, uv + direction * -0.5, 0.0).rgb
-        + textureSampleLevel(scene_color, scene_sampler, uv + direction * 0.5, 0.0).rgb
+        textureSampleLevel(source, scene_sampler, uv + direction * -0.5, 0.0).rgb
+        + textureSampleLevel(source, scene_sampler, uv + direction * 0.5, 0.0).rgb
     );
     let second_luminance = luminance(second);
     let resolved = select(second, first, second_luminance < luma_minimum || second_luminance > luma_maximum);
@@ -258,74 +197,16 @@ fn compose_toon(
     return vec4<f32>(mix(color.rgb * ao, ink, outline), color.a);
 }
 
-fn gathered_dof(uv: vec2<f32>, dimensions: vec2<f32>) -> vec4<f32> {
-    let pixel = vec2<i32>(clamp(uv * dimensions, vec2<f32>(0.0), dimensions - 1.0));
-    let center = antialiased_scene(uv, dimensions);
-    let center_depth = textureLoad(scene_depth, pixel, 0);
-    let center_coc = circle_of_confusion(optical_depth(uv, center_depth), dimensions.y);
-
-    // Classify an 8x8 source tile from its center and corners. Sharp tiles bypass the
-    // aperture gather completely, which is the common case for focused molecules.
-    let tile_origin = (pixel / 8) * 8;
-    var maximum_coc = abs(center_coc);
-    for (var corner = 0u; corner < 4u; corner += 1u) {
-        let corner_offset = vec2<i32>(i32((corner & 1u) * 7u), i32((corner >> 1u) * 7u));
-        let sample_pixel = clamp(
-            tile_origin + corner_offset,
-            vec2<i32>(0),
-            vec2<i32>(dimensions) - 1,
-        );
-        let sample_uv = (vec2<f32>(sample_pixel) + 0.5) / dimensions;
-        let sample_depth = textureLoad(scene_depth, sample_pixel, 0);
-        maximum_coc = max(
-            maximum_coc,
-            abs(circle_of_confusion(optical_depth(sample_uv, sample_depth), dimensions.y)),
-        );
-    }
-    if maximum_coc < 0.55 {
-        return center;
-    }
-
-    let sample_count = max(u32(round(post.quality.x)), 1u);
-    var accumulated = center;
-    var accumulated_weight = 1.0;
-    for (var index = 0u; index < 64u; index += 1u) {
-        if index >= sample_count {
-            break;
-        }
-        let aperture_point = aperture_sample(f32(index), f32(sample_count));
-        let offset_pixels = aperture_point * post.lens.z;
-        let sample_uv = clamp(uv + offset_pixels / dimensions, vec2<f32>(0.0), vec2<f32>(1.0));
-        let sample_pixel = vec2<i32>(clamp(sample_uv * dimensions, vec2<f32>(0.0), dimensions - 1.0));
-        let sample_depth = textureLoad(scene_depth, sample_pixel, 0);
-        let sample_coc = circle_of_confusion(optical_depth(sample_uv, sample_depth), dimensions.y);
-        let required_radius = aperture_metric(aperture_point) * post.lens.z;
-        let coc_radius = abs(sample_coc);
-        let coverage = 1.0 - smoothstep(
-            max(coc_radius - 1.25, 0.0),
-            coc_radius + 1.25,
-            required_radius,
-        );
-        let near_strength = smoothstep(0.0, 1.5, -sample_coc);
-        let far_source_strength = smoothstep(0.0, 1.5, sample_coc);
-        let far_receiver_strength = smoothstep(0.0, 1.5, center_coc);
-        let layer_strength = near_strength
-            + (1.0 - near_strength) * far_source_strength * far_receiver_strength;
-        let rim_weight = 0.8 + 0.4 * aperture_metric(aperture_point);
-        let weight = coverage * layer_strength * rim_weight;
-        accumulated += textureSampleLevel(scene_color, scene_sampler, sample_uv, 0.0) * weight;
-        accumulated_weight += weight;
-    }
-    return accumulated / accumulated_weight;
-}
-
 @fragment
-fn dof_main(input: VertexOutput) -> @location(0) vec4<f32> {
-    let dimensions_u = textureDimensions(scene_color);
-    let dimensions = vec2<f32>(dimensions_u);
-    let target_dimensions = dimensions * post.quality.y;
-    let uv = input.position.xy / target_dimensions;
-    return gathered_dof(uv, dimensions);
+fn dof_shade(input: VertexOutput) -> @location(0) vec4<f32> {
+    // Color comes from the exact rasterized DOF pixel, not a filtered pinhole
+    // image. Only screen-space shading is mapped from the visible scene.
+    let uv = input.position.xy / post.quality.zw;
+    let dimensions = textureDimensions(semantic_ids);
+    let pixel = clamp(vec2<i32>(uv * vec2<f32>(dimensions)), vec2<i32>(0), vec2<i32>(dimensions) - 1);
+    let color = textureLoad(scene_color, vec2<i32>(input.position.xy), 0);
+    let ao = select(1.0, textureLoad(filtered_ao, pixel, 0).r, post.ao.w > 0.5);
+    return compose_toon(color, ao, pixel, dimensions);
 }
 
 @fragment
@@ -334,12 +215,12 @@ fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let dimensions = vec2<f32>(dimensions_u);
     let pixel = vec2<i32>(clamp(input.position.xy, vec2<f32>(0.0), dimensions - 1.0));
     let uv = input.position.xy / dimensions;
-    var resolved = antialiased_scene(uv, dimensions);
     if post.lens.w >= 0.5 && post.lens.z > 0.0 {
-        // Linear upsampling is the full-resolution resolve for Preview/Medium. High binds a
-        // full-resolution gather target through the same path.
-        resolved = textureSampleLevel(dof_color, scene_sampler, uv, 0.0);
+        // Rasterized in-focus splats still need edge antialiasing. Apply it to
+        // the accumulated image, so color filtering cannot corrupt peel depths.
+        return antialiased_scene(dof_color, uv, vec2<f32>(textureDimensions(dof_color)));
     }
+    let resolved = antialiased_scene(scene_color, uv, dimensions);
     let ao = select(1.0, textureLoad(filtered_ao, pixel, 0).r, post.ao.w > 0.5);
     return compose_toon(resolved, ao, pixel, dimensions_u);
 }

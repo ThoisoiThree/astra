@@ -94,6 +94,8 @@ pub(super) fn create_scene_geometry_pipeline(
     device: &wgpu::Device,
     layout: &wgpu::PipelineLayout,
     shader: &wgpu::ShaderModule,
+    peel: bool,
+    color_only: bool,
 ) -> wgpu::RenderPipeline {
     let vertex_layouts = [
         Some(Vertex::layout()),
@@ -125,7 +127,13 @@ pub(super) fn create_scene_geometry_pipeline(
         multisample: Default::default(),
         fragment: Some(wgpu::FragmentState {
             module: shader,
-            entry_point: Some("fragment_scene"),
+            entry_point: Some(if peel {
+                "fragment_peel"
+            } else if color_only {
+                "fragment_main"
+            } else {
+                "fragment_scene"
+            }),
             compilation_options: Default::default(),
             targets: &[
                 Some(wgpu::ColorTargetState {
@@ -133,7 +141,7 @@ pub(super) fn create_scene_geometry_pipeline(
                     blend: Some(wgpu::BlendState::REPLACE),
                     write_mask: wgpu::ColorWrites::ALL,
                 }),
-                Some(wgpu::ColorTargetState {
+                (!peel && !color_only).then_some(wgpu::ColorTargetState {
                     format: SEMANTIC_FORMAT,
                     blend: None,
                     write_mask: wgpu::ColorWrites::ALL,
@@ -149,6 +157,8 @@ pub(super) fn create_cartoon_pipeline(
     device: &wgpu::Device,
     layout: &wgpu::PipelineLayout,
     shader: &wgpu::ShaderModule,
+    peel: bool,
+    color_only: bool,
 ) -> wgpu::RenderPipeline {
     let vertex_layouts = [
         Some(CartoonVertex::layout()),
@@ -179,7 +189,13 @@ pub(super) fn create_cartoon_pipeline(
         multisample: Default::default(),
         fragment: Some(wgpu::FragmentState {
             module: shader,
-            entry_point: Some("fragment_scene"),
+            entry_point: Some(if peel {
+                "fragment_peel"
+            } else if color_only {
+                "fragment_main"
+            } else {
+                "fragment_scene"
+            }),
             compilation_options: Default::default(),
             targets: &[
                 Some(wgpu::ColorTargetState {
@@ -187,7 +203,7 @@ pub(super) fn create_cartoon_pipeline(
                     blend: Some(wgpu::BlendState::REPLACE),
                     write_mask: wgpu::ColorWrites::ALL,
                 }),
-                Some(wgpu::ColorTargetState {
+                (!peel && !color_only).then_some(wgpu::ColorTargetState {
                     format: SEMANTIC_FORMAT,
                     blend: None,
                     write_mask: wgpu::ColorWrites::ALL,
@@ -203,6 +219,8 @@ pub(super) fn create_toon_pipeline(
     device: &wgpu::Device,
     layout: &wgpu::PipelineLayout,
     shader: &wgpu::ShaderModule,
+    peel: bool,
+    color_only: bool,
 ) -> wgpu::RenderPipeline {
     let vertex_layouts = [
         Some(ToonTopologyRaw::layout()),
@@ -232,7 +250,13 @@ pub(super) fn create_toon_pipeline(
         multisample: Default::default(),
         fragment: Some(wgpu::FragmentState {
             module: shader,
-            entry_point: Some("fragment_main"),
+            entry_point: Some(if peel {
+                "fragment_peel"
+            } else if color_only {
+                "fragment_dof"
+            } else {
+                "fragment_main"
+            }),
             compilation_options: Default::default(),
             targets: &[
                 Some(wgpu::ColorTargetState {
@@ -240,7 +264,7 @@ pub(super) fn create_toon_pipeline(
                     blend: Some(wgpu::BlendState::REPLACE),
                     write_mask: wgpu::ColorWrites::ALL,
                 }),
-                Some(wgpu::ColorTargetState {
+                (!peel && !color_only).then_some(wgpu::ColorTargetState {
                     format: SEMANTIC_FORMAT,
                     blend: None,
                     write_mask: wgpu::ColorWrites::ALL,

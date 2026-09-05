@@ -1,5 +1,4 @@
 use std::{
-    borrow::Cow,
     sync::{Arc, mpsc},
     time::Instant,
 };
@@ -24,6 +23,7 @@ use super::instances::semantic_ids_from_hierarchy;
 
 use super::{
     cartoon::{CartoonRenderData, cartoon_render_data, cartoon_render_data_cached},
+    dof::{DepthOfField, scene_shader},
     instances::{
         GpuMesh, ReusableBuffer, cartoon_display_attributes, display_attributes, display_topology,
         measurement_instances,
@@ -36,6 +36,7 @@ use super::{
     postprocess::{PostProcess, PostUniform},
     profiling::{GpuProfiler, PASS_COUNT, ProfilePass},
     targets::{DepthTarget, PendingPickReadback},
+    viewport_cache::ViewportCache,
 };
 
 pub(super) const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
@@ -108,6 +109,8 @@ pub struct Renderer {
     annotation_pipeline: wgpu::RenderPipeline,
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
+    camera_layout: wgpu::BindGroupLayout,
+    dof: Option<DepthOfField>,
     sphere: GpuMesh,
     cylinder: GpuMesh,
     atom_topology: ReusableBuffer,
@@ -128,6 +131,7 @@ pub struct Renderer {
     cartoon_data: CartoonRenderData,
     depth: DepthTarget,
     post_process: PostProcess,
+    viewport_cache: ViewportCache,
     egui_renderer: egui_wgpu::Renderer,
     requested_pick: Option<(u64, u32, u32)>,
     pending_pick: Option<PendingPickReadback>,
@@ -211,22 +215,19 @@ impl Renderer {
                 resource: camera_buffer.as_entire_binding(),
             }],
         });
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("molecule shader"),
-            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("shader.wgsl"))),
-        });
+        let shader = scene_shader(&device, include_str!("shader.wgsl"));
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("molecule pipeline layout"),
             bind_group_layouts: &[Some(&camera_layout)],
             immediate_size: 0,
         });
-        let pipeline = create_scene_geometry_pipeline(&device, &pipeline_layout, &shader);
-        let cartoon_pipeline = create_cartoon_pipeline(&device, &pipeline_layout, &shader);
-        let toon_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("analytic toon sphere shader"),
-            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("toon_sphere.wgsl"))),
-        });
-        let toon_pipeline = create_toon_pipeline(&device, &pipeline_layout, &toon_shader);
+        let pipeline =
+            create_scene_geometry_pipeline(&device, &pipeline_layout, &shader, false, false);
+        let cartoon_pipeline =
+            create_cartoon_pipeline(&device, &pipeline_layout, &shader, false, false);
+        let toon_shader = scene_shader(&device, include_str!("toon_sphere.wgsl"));
+        let toon_pipeline =
+            create_toon_pipeline(&device, &pipeline_layout, &toon_shader, false, false);
         let annotation_pipeline = create_geometry_pipeline(
             &device,
             "annotation pipeline",
@@ -287,6 +288,8 @@ impl Renderer {
         let egui_renderer =
             egui_wgpu::Renderer::new(&device, config.format, RendererOptions::default());
         let profiler = GpuProfiler::new(&device, &queue);
+        let viewport_cache =
+            ViewportCache::new(&device, config.width, config.height, config.format);
 
         Ok(Self {
             instance,
@@ -301,6 +304,8 @@ impl Renderer {
             annotation_pipeline,
             camera_buffer,
             camera_bind_group,
+            camera_layout,
+            dof: None,
             sphere,
             cylinder,
             atom_topology,
@@ -321,6 +326,7 @@ impl Renderer {
             cartoon_data: CartoonRenderData::default(),
             depth,
             post_process,
+            viewport_cache,
             egui_renderer,
             requested_pick: None,
             pending_pick: None,
@@ -345,10 +351,12 @@ impl Renderer {
             + self.toon_display.estimated_bytes()
             + self.measurement_instances.estimated_bytes();
         let pixel_count = self.config.width as u64 * self.config.height as u64;
-        let dof_width = (self.config.width as f32 * self.post_process.dof_scale).round() as u64;
-        let dof_height = (self.config.height as f32 * self.post_process.dof_scale).round() as u64;
+        let dof_width = u64::from(self.post_process.dof_color._texture.width());
+        let dof_height = u64::from(self.post_process.dof_color._texture.height());
         // scene RGBA16F + semantic RG32U + depth32F + two R16F AO targets + DOF RGBA16F.
-        let target_bytes = pixel_count * (8 + 8 + 4 + 2 + 2) + dof_width * dof_height * 8;
+        let target_bytes = pixel_count * (8 + 8 + 4 + 2 + 2 + 4)
+            + dof_width * dof_height * 8
+            + self.dof.as_ref().map_or(0, DepthOfField::estimated_bytes);
         RenderStats {
             cpu_frame_ms: self.cpu_frame_ms,
             gpu_pass_ms: self
@@ -375,6 +383,9 @@ impl Renderer {
         self.config.height = size.height;
         self.surface.configure(&self.device, &self.config);
         self.depth = DepthTarget::new(&self.device, size.width, size.height);
+        self.dof = None;
+        self.viewport_cache =
+            ViewportCache::new(&self.device, size.width, size.height, self.config.format);
         self.post_process
             .resize(&self.device, size.width, size.height, &self.depth.view);
     }
@@ -449,6 +460,7 @@ impl Renderer {
         display: &DisplayState,
         topology_changed: bool,
     ) {
+        self.viewport_cache.revision.invalidate();
         let attributes = display_attributes(molecule, display, &self.cartoon_data.standard_atomic);
         let cartoon_display = cartoon_display_attributes(&self.cartoon_data.vertices, display);
         if topology_changed {
@@ -479,10 +491,48 @@ impl Renderer {
     }
 
     pub fn update_measurements(&mut self, lines: &[MeasurementLine]) {
+        self.viewport_cache.revision.invalidate();
         let instances = measurement_instances(lines);
         self.measurement_instances
             .write(&self.device, &self.queue, &instances);
         self.measurement_instance_count = instances.len() as u32;
+    }
+
+    fn draw_molecules(
+        &self,
+        pass: &mut wgpu::RenderPass<'_>,
+        geometry_pipeline: &wgpu::RenderPipeline,
+        cartoon_pipeline: &wgpu::RenderPipeline,
+        toon_pipeline: &wgpu::RenderPipeline,
+    ) {
+        pass.set_pipeline(cartoon_pipeline);
+        pass.set_vertex_buffer(0, self.cartoon_vertices.buffer.slice(..));
+        pass.set_vertex_buffer(1, self.cartoon_display.buffer.slice(..));
+        pass.set_index_buffer(
+            self.cartoon_indices.buffer.slice(..),
+            wgpu::IndexFormat::Uint32,
+        );
+        pass.draw_indexed(0..self.cartoon_index_count, 0, 0..1);
+
+        pass.set_pipeline(geometry_pipeline);
+
+        pass.set_vertex_buffer(0, self.cylinder.vertices.slice(..));
+        pass.set_vertex_buffer(1, self.bond_topology.buffer.slice(..));
+        pass.set_vertex_buffer(2, self.bond_display.buffer.slice(..));
+        pass.set_index_buffer(self.cylinder.indices.slice(..), wgpu::IndexFormat::Uint32);
+        pass.draw_indexed(0..self.cylinder.index_count, 0, 0..self.bond_instance_count);
+
+        pass.set_vertex_buffer(0, self.sphere.vertices.slice(..));
+        pass.set_vertex_buffer(1, self.atom_topology.buffer.slice(..));
+        pass.set_vertex_buffer(2, self.atom_display.buffer.slice(..));
+        pass.set_index_buffer(self.sphere.indices.slice(..), wgpu::IndexFormat::Uint32);
+        pass.draw_indexed(0..self.sphere.index_count, 0, 0..self.atom_instance_count);
+
+        pass.set_pipeline(toon_pipeline);
+        pass.set_bind_group(0, &self.camera_bind_group, &[]);
+        pass.set_vertex_buffer(0, self.toon_topology.buffer.slice(..));
+        pass.set_vertex_buffer(1, self.toon_display.buffer.slice(..));
+        pass.draw(0..6, 0..self.toon_instance_count);
     }
 
     pub fn render(
@@ -504,6 +554,7 @@ impl Renderer {
             .unwrap_or_default();
         let global_mode = display.map_or(DisplayMode::Cartoon, |display| display.global_mode);
         let quality = ambient_occlusion.quality;
+        let previous_dof_scale = self.post_process.dof_scale;
         self.post_process.set_dof_scale(
             &self.device,
             self.config.width,
@@ -511,6 +562,26 @@ impl Renderer {
             &self.depth.view,
             quality.dof_resolution_scale(),
         );
+        let dof_enabled =
+            camera.depth_of_field.enabled && camera.depth_of_field.max_coc_pixels > 0.0;
+        let dof_size = [
+            self.post_process.dof_color._texture.width(),
+            self.post_process.dof_color._texture.height(),
+        ];
+        if dof_enabled
+            && (previous_dof_scale != self.post_process.dof_scale
+                || self.dof.as_ref().is_none_or(|dof| dof.size != dof_size))
+        {
+            self.dof = None;
+            self.dof = Some(DepthOfField::new(
+                &self.device,
+                &self.camera_layout,
+                &self.post_process,
+                &self.depth.view,
+            ));
+        } else if !dof_enabled {
+            self.dof = None;
+        }
         let view_projection = camera.view_projection();
         let forward = camera.optical_axis();
         let mut camera_right = forward.cross(Vec3::Y).normalize_or_zero();
@@ -529,10 +600,27 @@ impl Renderer {
             .write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&camera_uniform));
         let focal_length = camera.depth_of_field.focal_length_mm
             / camera.depth_of_field.sensor_height_mm.max(0.001);
+        let scene_background = if global_mode == DisplayMode::Toon {
+            // Linear RGB corresponding approximately to warm paper #F7F6F1.
+            wgpu::Color {
+                r: 0.930,
+                g: 0.922,
+                b: 0.880,
+                a: 1.0,
+            }
+        } else {
+            wgpu::Color {
+                // sRGB #1D2123 converted to linear RGB for Rgba16Float.
+                r: 0.012_286,
+                g: 0.015_209,
+                b: 0.016_807,
+                a: 1.0,
+            }
+        };
         let post_uniform = PostUniform {
             inverse_view_projection: view_projection.inverse().to_cols_array(),
             eye_position: camera.eye().extend(1.0).to_array(),
-            optical_axis: camera.optical_axis().extend(0.0).to_array(),
+            optical_axis: camera.optical_axis().extend(viewport.height).to_array(),
             lens: [
                 camera.focus_depth(),
                 camera.depth_of_field.f_stop,
@@ -555,11 +643,23 @@ impl Renderer {
                     0.0
                 },
             ],
+            viewport: [
+                viewport.x / self.config.width as f32,
+                viewport.y / self.config.height as f32,
+                viewport.width / self.config.width as f32,
+                viewport.height / self.config.height as f32,
+            ],
+            background: [
+                scene_background.r as f32,
+                scene_background.g as f32,
+                scene_background.b as f32,
+                1.0,
+            ],
             quality: [
-                quality.dof_sample_count() as f32,
-                quality.dof_resolution_scale(),
-                0.0,
-                0.0,
+                quality.dof_layer_count() as f32,
+                dof_size[1] as f32 / self.config.height as f32,
+                dof_size[0] as f32,
+                dof_size[1] as f32,
             ],
         };
         self.queue.write_buffer(
@@ -567,6 +667,12 @@ impl Renderer {
             0,
             bytemuck::bytes_of(&post_uniform),
         );
+        let scene_key = [
+            bytemuck::bytes_of(&camera_uniform),
+            bytemuck::bytes_of(&post_uniform),
+        ]
+        .concat();
+        let scene_changed = self.viewport_cache.revision.changed(&scene_key);
         for (id, deltas) in &textures_delta.set {
             for delta in deltas {
                 self.egui_renderer
@@ -604,24 +710,7 @@ impl Renderer {
             paint_jobs,
             &screen,
         );
-        let scene_background = if global_mode == DisplayMode::Toon {
-            // Linear RGB corresponding approximately to warm paper #F7F6F1.
-            wgpu::Color {
-                r: 0.930,
-                g: 0.922,
-                b: 0.880,
-                a: 1.0,
-            }
-        } else {
-            wgpu::Color {
-                // sRGB #1D2123 converted to linear RGB for Rgba16Float.
-                r: 0.012_286,
-                g: 0.015_209,
-                b: 0.016_807,
-                a: 1.0,
-            }
-        };
-        {
+        if scene_changed {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("molecule scene pass"),
                 color_attachments: &[
@@ -683,34 +772,12 @@ impl Renderer {
                 as u32;
             pass.set_scissor_rect(scissor_x, scissor_y, scissor_width, scissor_height);
 
-            pass.set_pipeline(&self.cartoon_pipeline);
-            pass.set_vertex_buffer(0, self.cartoon_vertices.buffer.slice(..));
-            pass.set_vertex_buffer(1, self.cartoon_display.buffer.slice(..));
-            pass.set_index_buffer(
-                self.cartoon_indices.buffer.slice(..),
-                wgpu::IndexFormat::Uint32,
+            self.draw_molecules(
+                &mut pass,
+                &self.pipeline,
+                &self.cartoon_pipeline,
+                &self.toon_pipeline,
             );
-            pass.draw_indexed(0..self.cartoon_index_count, 0, 0..1);
-
-            pass.set_pipeline(&self.pipeline);
-
-            pass.set_vertex_buffer(0, self.cylinder.vertices.slice(..));
-            pass.set_vertex_buffer(1, self.bond_topology.buffer.slice(..));
-            pass.set_vertex_buffer(2, self.bond_display.buffer.slice(..));
-            pass.set_index_buffer(self.cylinder.indices.slice(..), wgpu::IndexFormat::Uint32);
-            pass.draw_indexed(0..self.cylinder.index_count, 0, 0..self.bond_instance_count);
-
-            pass.set_vertex_buffer(0, self.sphere.vertices.slice(..));
-            pass.set_vertex_buffer(1, self.atom_topology.buffer.slice(..));
-            pass.set_vertex_buffer(2, self.atom_display.buffer.slice(..));
-            pass.set_index_buffer(self.sphere.indices.slice(..), wgpu::IndexFormat::Uint32);
-            pass.draw_indexed(0..self.sphere.index_count, 0, 0..self.atom_instance_count);
-
-            pass.set_pipeline(&self.toon_pipeline);
-            pass.set_bind_group(0, &self.camera_bind_group, &[]);
-            pass.set_vertex_buffer(0, self.toon_topology.buffer.slice(..));
-            pass.set_vertex_buffer(1, self.toon_display.buffer.slice(..));
-            pass.draw(0..6, 0..self.toon_instance_count);
         }
         let pick_readback = self.requested_pick.take().map(|(request_id, x, y)| {
             let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
@@ -742,7 +809,7 @@ impl Renderer {
             );
             (request_id, buffer)
         });
-        if ambient_occlusion.enabled {
+        if scene_changed && ambient_occlusion.enabled {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("raw ambient occlusion pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -790,35 +857,120 @@ impl Renderer {
             pass.set_bind_group(0, &self.post_process.ao_blur_bind_group, &[]);
             pass.draw(0..3, 0..1);
         }
-        if camera.depth_of_field.enabled && camera.depth_of_field.max_coc_pixels > 0.0 {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("depth of field gather pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &self.post_process.dof_color.view,
-                    resolve_target: None,
-                    depth_slice: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: self
-                    .profiler
-                    .as_ref()
-                    .map(|profiler| profiler.writes(ProfilePass::Dof)),
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            pass.set_pipeline(&self.post_process.dof_pipeline);
-            pass.set_bind_group(0, &self.post_process.dof_source_bind_group, &[]);
-            pass.draw(0..3, 0..1);
-        }
+        if scene_changed
+            && dof_enabled
+            && let Some(dof) = &self.dof
         {
+            let mut timestamps = self.profiler.as_ref().map(|p| p.writes(ProfilePass::Dof));
+            let end_timestamps = timestamps
+                .as_ref()
+                .map(|t| wgpu::ComputePassTimestampWrites {
+                    query_set: t.query_set,
+                    beginning_of_pass_write_index: None,
+                    end_of_pass_write_index: t.end_of_pass_write_index,
+                });
+            if let Some(t) = &mut timestamps {
+                t.end_of_pass_write_index = None;
+            }
+            {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("DOF first geometry layer"),
+                    color_attachments: &[
+                        Some(wgpu::RenderPassColorAttachment {
+                            view: dof.layer_color(0),
+                            resolve_target: None,
+                            depth_slice: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(scene_background),
+                                store: wgpu::StoreOp::Store,
+                            },
+                        }),
+                        None,
+                    ],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: dof.layer_depth(0),
+                        depth_ops: Some(wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(1.0),
+                            store: wgpu::StoreOp::Store,
+                        }),
+                        stencil_ops: None,
+                    }),
+                    timestamp_writes: timestamps,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                let sx = dof.size[0] as f32 / self.config.width as f32;
+                let sy = dof.size[1] as f32 / self.config.height as f32;
+                pass.set_viewport(
+                    viewport.x * sx,
+                    viewport.y * sy,
+                    viewport.width * sx,
+                    viewport.height * sy,
+                    0.0,
+                    1.0,
+                );
+                pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                self.draw_molecules(
+                    &mut pass,
+                    &dof.first_geometry_pipeline,
+                    &dof.first_cartoon_pipeline,
+                    &dof.first_toon_pipeline,
+                );
+            }
+            dof.encode_mask(&mut encoder);
+            for layer in 1..quality.dof_layer_count() {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("DOF partial depth peeling"),
+                    color_attachments: &[
+                        Some(wgpu::RenderPassColorAttachment {
+                            view: dof.layer_color(layer),
+                            resolve_target: None,
+                            depth_slice: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(scene_background),
+                                store: wgpu::StoreOp::Store,
+                            },
+                        }),
+                        None,
+                    ],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: dof.layer_depth(layer),
+                        depth_ops: Some(wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(1.0),
+                            store: wgpu::StoreOp::Store,
+                        }),
+                        stencil_ops: None,
+                    }),
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                let sx = dof.size[0] as f32 / self.config.width as f32;
+                let sy = dof.size[1] as f32 / self.config.height as f32;
+                pass.set_viewport(
+                    viewport.x * sx,
+                    viewport.y * sy,
+                    viewport.width * sx,
+                    viewport.height * sy,
+                    0.0,
+                    1.0,
+                );
+                pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                pass.set_bind_group(1, dof.peel_binding(layer), &[]);
+                self.draw_molecules(
+                    &mut pass,
+                    &dof.geometry_pipeline,
+                    &dof.cartoon_pipeline,
+                    &dof.toon_pipeline,
+                );
+            }
+            dof.encode_splat(&mut encoder, end_timestamps);
+        }
+        if scene_changed {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("AO and DOF composition pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
+                    view: &self.viewport_cache.color.view,
                     resolve_target: None,
                     depth_slice: None,
                     ops: wgpu::Operations {
@@ -838,11 +990,11 @@ impl Renderer {
             pass.set_bind_group(0, &self.post_process.bind_group, &[]);
             pass.draw(0..3, 0..1);
         }
-        {
+        if scene_changed {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("annotation pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
+                    view: &self.viewport_cache.color.view,
                     resolve_target: None,
                     depth_slice: None,
                     ops: wgpu::Operations {
@@ -897,6 +1049,7 @@ impl Renderer {
                 0..self.measurement_instance_count,
             );
         }
+        self.viewport_cache.blit(&mut encoder, &view);
         {
             let mut pass = encoder
                 .begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -945,6 +1098,7 @@ impl Renderer {
             });
         }
         self.queue.present(output);
+        self.viewport_cache.revision.commit(scene_key);
         for id in &textures_delta.free {
             self.egui_renderer.free_texture(id);
         }

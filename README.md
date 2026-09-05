@@ -133,13 +133,22 @@ bilateral filter. It applies to Cartoon, Ball & stick, and Toon.
 
 Open **Camera** in the top toolbar to edit the near and far clipping planes,
 which default to 1 and 1000. The
-DOF renderer uses a thin-lens circle-of-confusion equation and a 64-sample
-source-aware aperture gather instead of a generic radial blur. Focal length,
-sensor height, f-stop, maximum CoC, iris blade count, and iris rotation are
-editable. Zero blades produces a circular iris; 3–12 blades produce the matching
-polygonal optical bokeh shape. Near and far samples are depth-aware, so foreground
-bokeh can cross a background edge while far blur does not bleed over focused
-foreground geometry.
+DOF renderer uses **Franke et al. (2018), Multi-Layer Depth of Field Rendering
+with Tiled Splatting** as its main algorithm. It builds partial depth layers near
+discontinuities and sorts and composites one-pixel splats front to back in 16×16
+tiles. Hidden geometry can become visible through out-of-focus foreground
+silhouettes. Preview uses 3 layers at half resolution; Medium/High use 4/5 layers
+at full resolution. Overfull tiles are partitioned and processed in order without
+dropping fragments. The optional lossy fragment-reduction optimization is
+disabled to avoid square block artifacts and incorrect depth ordering.
+
+Focal length, sensor height, f-stop, maximum CoC **radius**, iris blade count,
+and iris rotation are editable. Zero blades selects a circular iris; 3–12 blades
+select polygonal bokeh. AO and visible-surface toon contours enter the source
+layer before DOF; the accumulated image is antialiased afterwards. Annotations
+and UI remain sharp. See [algorithm notes](docs/depth-of-field.md)
+for the paper analysis, implementation choices, and limitations.
+
 The focus point can be resolved from:
 
 - a chain ID (focuses its atom centroid);

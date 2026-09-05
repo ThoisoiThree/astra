@@ -1,14 +1,3 @@
-struct PostUniform {
-    inverse_view_projection: mat4x4<f32>,
-    eye_position: vec4<f32>,
-    optical_axis: vec4<f32>,
-    lens: vec4<f32>,
-    aperture: vec4<f32>,
-    // strength, world-space radius, normal bias, sample count (zero disables)
-    ao: vec4<f32>,
-    quality: vec4<f32>,
-};
-
 @group(0) @binding(0)
 var scene_depth: texture_depth_2d;
 @group(0) @binding(1)
@@ -33,7 +22,8 @@ fn vertex_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
 }
 
 fn world_position(uv: vec2<f32>, depth: f32) -> vec3<f32> {
-    let clip = vec4<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, depth, 1.0);
+    let local_uv = (uv - post.viewport.xy) / post.viewport.zw;
+    let clip = vec4<f32>(local_uv.x * 2.0 - 1.0, 1.0 - local_uv.y * 2.0, depth, 1.0);
     let world_h = post.inverse_view_projection * clip;
     return world_h.xyz / world_h.w;
 }
@@ -41,14 +31,6 @@ fn world_position(uv: vec2<f32>, depth: f32) -> vec3<f32> {
 fn depth_at(pixel: vec2<i32>, dimensions: vec2<u32>) -> f32 {
     let maximum = vec2<i32>(dimensions) - 1;
     return textureLoad(scene_depth, clamp(pixel, vec2<i32>(0), maximum), 0);
-}
-
-fn optical_depth(uv: vec2<f32>, depth: f32) -> f32 {
-    if depth >= 0.999999 {
-        return 1e20;
-    }
-    let world = world_position(uv, depth);
-    return max(dot(world - post.eye_position.xyz, post.optical_axis.xyz), 1e-4);
 }
 
 fn reconstructed_normal(

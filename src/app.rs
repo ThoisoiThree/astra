@@ -168,6 +168,7 @@ impl Runtime {
             occluded: false,
             undo_history: VecDeque::new(),
             redo_history: VecDeque::new(),
+            repaint_due: None,
         };
         if let Some(path) = initial_path
             && let Err(error) = runtime.start_load_path(&path)
@@ -184,7 +185,9 @@ impl Runtime {
         self.poll_fetch_result();
         self.poll_pick_result();
         let egui_response = self.egui_state.on_window_event(&self.window, &event);
-        if egui_response.repaint {
+        // egui-winit returns repaint=true for RedrawRequested itself. Echoing
+        // that response creates a self-sustaining loop even with ControlFlow::Wait.
+        if egui_response.repaint && !matches!(event, WindowEvent::RedrawRequested) {
             self.window.request_redraw();
         }
         match event {
@@ -371,6 +374,10 @@ impl Runtime {
         let full_output = context.run_ui(raw_input, |root| {
             actions = self.ui.show(root, info);
         });
+        self.repaint_due = full_output
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .and_then(|output| Instant::now().checked_add(output.repaint_delay));
         self.egui_state.handle_platform_output_with_event_loop(
             &self.window,
             event_loop,

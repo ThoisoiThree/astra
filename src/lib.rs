@@ -93,18 +93,18 @@ impl AmbientOcclusionQuality {
         }
     }
 
-    pub const fn dof_sample_count(self) -> u32 {
+    pub const fn dof_layer_count(self) -> u32 {
         match self {
-            Self::Preview => 16,
-            Self::Medium => 32,
-            Self::High => 64,
+            Self::Preview => 3,
+            Self::Medium => 4,
+            Self::High => 5,
         }
     }
 
     pub const fn dof_resolution_scale(self) -> f32 {
         match self {
-            Self::Preview | Self::Medium => 0.5,
-            Self::High => 1.0,
+            Self::Preview => 0.5,
+            Self::Medium | Self::High => 1.0,
         }
     }
 

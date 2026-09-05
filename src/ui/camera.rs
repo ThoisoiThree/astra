@@ -108,7 +108,7 @@ impl UiState {
                     .add(egui::Slider::new(&mut f_stop, 0.7..=22.0).text("F-stop"))
                     .changed();
                 changed |= ui
-                    .add(egui::Slider::new(&mut max_coc, 1.0..=64.0).text("Max CoC, px"))
+                    .add(egui::Slider::new(&mut max_coc, 1.0..=64.0).text("Max CoC radius, px"))
                     .changed();
                 changed |= ui
                     .add(egui::Slider::new(&mut blade_count, 0..=12).text("Iris blades"))

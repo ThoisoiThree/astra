@@ -102,7 +102,7 @@ impl UiState {
                                 .changed();
                         }
                     });
-                ui.small("Controls AO samples, DOF resolution/samples, and cartoon tessellation");
+                ui.small("Controls AO samples, DOF resolution/layers, and cartoon tessellation");
                 ui.checkbox(&mut self.performance_overlay, "Performance overlay");
                 ui.separator();
                 ui.heading("Ambient occlusion");

@@ -53,8 +53,25 @@ impl ApplicationHandler for AstraApplication {
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         if let Some(runtime) = &mut self.runtime {
             runtime.poll_background_jobs();
+            runtime.poll_pick_result();
             runtime.autosave_due_documents();
-            if let Some(deadline) = runtime.next_autosave_deadline() {
+            let now = Instant::now();
+            let visible = runtime.focused && !runtime.occluded;
+            if visible && runtime.repaint_due.is_some_and(|due| due <= now) {
+                runtime.repaint_due = None;
+                runtime.window.request_redraw();
+            }
+            let repaint = visible.then_some(runtime.repaint_due).flatten();
+            // Readback needs device polling even when the pointer no longer moves.
+            let pick = runtime
+                .pending_pick
+                .as_ref()
+                .map(|_| now + Duration::from_millis(8));
+            let deadline = [runtime.next_autosave_deadline(), repaint, pick]
+                .into_iter()
+                .flatten()
+                .min();
+            if let Some(deadline) = deadline {
                 event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
             } else {
                 event_loop.set_control_flow(ControlFlow::Wait);
@@ -120,4 +137,5 @@ pub(super) struct Runtime {
     pub(super) occluded: bool,
     pub(super) undo_history: VecDeque<EditOperation>,
     pub(super) redo_history: VecDeque<EditOperation>,
+    pub(super) repaint_due: Option<Instant>,
 }

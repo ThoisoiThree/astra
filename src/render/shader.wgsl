@@ -99,3 +99,9 @@ fn fragment_scene(input: VertexOutput) -> SceneFragmentOutput {
 fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
     return shaded_color(input);
 }
+
+@fragment
+fn fragment_peel(input: VertexOutput) -> @location(0) vec4<f32> {
+    reject_peeled_fragment(input.clip_position.xy, input.clip_position.z);
+    return shaded_color(input);
+}

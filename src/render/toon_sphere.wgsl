@@ -59,8 +59,7 @@ struct FragmentOutput {
     @location(1) semantic_ids: vec2<u32>,
 };
 
-@fragment
-fn fragment_main(input: VertexOutput) -> FragmentOutput {
+fn shade_sphere(input: VertexOutput) -> FragmentOutput {
     let ray_direction = normalize(input.billboard_position - camera.eye_position.xyz);
     let eye_to_center = camera.eye_position.xyz - input.center_radius.xyz;
     let projected = dot(eye_to_center, ray_direction);
@@ -95,5 +94,34 @@ fn fragment_main(input: VertexOutput) -> FragmentOutput {
         input.semantic_ids.x,
         (input.semantic_ids.z << 20u) | (input.semantic_ids.y & 0xFFFFFu),
     );
+    return output;
+}
+
+@fragment
+fn fragment_main(input: VertexOutput) -> FragmentOutput {
+    return shade_sphere(input);
+}
+
+struct PeelOutput {
+    @location(0) color: vec4<f32>,
+    @builtin(frag_depth) depth: f32,
+};
+
+@fragment
+fn fragment_dof(input: VertexOutput) -> PeelOutput {
+    let surface = shade_sphere(input);
+    var output: PeelOutput;
+    output.color = surface.color;
+    output.depth = surface.depth;
+    return output;
+}
+
+@fragment
+fn fragment_peel(input: VertexOutput) -> PeelOutput {
+    let surface = shade_sphere(input);
+    reject_peeled_fragment(input.clip_position.xy, surface.depth);
+    var output: PeelOutput;
+    output.color = surface.color;
+    output.depth = surface.depth;
     return output;
 }

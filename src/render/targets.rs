@@ -44,6 +44,27 @@ impl ColorTarget {
         height: u32,
         format: wgpu::TextureFormat,
     ) -> Self {
+        Self::with_storage(device, label, width, height, format, false)
+    }
+
+    pub(super) fn new_storage(
+        device: &wgpu::Device,
+        label: &str,
+        width: u32,
+        height: u32,
+        format: wgpu::TextureFormat,
+    ) -> Self {
+        Self::with_storage(device, label, width, height, format, true)
+    }
+
+    fn with_storage(
+        device: &wgpu::Device,
+        label: &str,
+        width: u32,
+        height: u32,
+        format: wgpu::TextureFormat,
+        storage: bool,
+    ) -> Self {
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some(label),
             size: wgpu::Extent3d {
@@ -55,7 +76,13 @@ impl ColorTarget {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | if storage {
+                    wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::COPY_SRC
+                } else {
+                    wgpu::TextureUsages::empty()
+                },
             view_formats: &[],
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());

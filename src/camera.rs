@@ -176,15 +176,15 @@ impl OrbitCamera {
                 .atan();
     }
 
-    /// Signed thin-lens circle of confusion in physical output pixels.
+    /// Signed thin-lens circle-of-confusion radius in physical output pixels.
     /// Negative values are in front of the focal plane, positive values behind it.
     pub fn circle_of_confusion_pixels(&self, object_distance: f32, image_height: f32) -> f32 {
         let focal_length =
             self.depth_of_field.focal_length_mm / self.depth_of_field.sensor_height_mm;
         let focus = self.focus_depth().max(focal_length + 1e-4);
         let object_distance = object_distance.max(focal_length + 1e-4);
-        let sensor_coc = focal_length * focal_length * (object_distance - focus)
-            / (self.depth_of_field.f_stop.max(0.1) * object_distance * (focus - focal_length));
+        let sensor_coc = 0.5 * focal_length * focal_length * (1.0 - focus / object_distance)
+            / (self.depth_of_field.f_stop.max(0.1) * (focus - focal_length));
         (sensor_coc * image_height).clamp(
             -self.depth_of_field.max_coc_pixels,
             self.depth_of_field.max_coc_pixels,
@@ -263,6 +263,22 @@ mod tests {
         assert!(camera.circle_of_confusion_pixels(focus, 800.0).abs() < 1e-4);
         assert!(camera.circle_of_confusion_pixels(focus * 0.8, 800.0) < 0.0);
         assert!(camera.circle_of_confusion_pixels(focus * 1.2, 800.0) > 0.0);
+    }
+
+    #[test]
+    fn coc_radius_matches_thin_lens_image_plane_geometry() {
+        let mut camera = OrbitCamera::new(1.0);
+        camera.set_lens(24.0, 24.0);
+        camera.depth_of_field.f_stop = 2.0;
+        camera.depth_of_field.max_coc_pixels = 1000.0;
+        camera.depth_of_field.focus_point = camera.eye() + camera.optical_axis() * 10.0;
+        // f = 1, aperture diameter = 1/2, image planes at 10/9 and 5/4:
+        // the radius is (1/4) * (5/4 - 10/9) / (5/4) = 1/36 sensor heights.
+        assert!((camera.circle_of_confusion_pixels(5.0, 900.0) + 25.0).abs() < 1e-3);
+        assert!((camera.circle_of_confusion_pixels(20.0, 900.0) - 12.5).abs() < 1e-3);
+        assert!((camera.circle_of_confusion_pixels(f32::INFINITY, 900.0) - 25.0).abs() < 1e-3);
+        camera.depth_of_field.max_coc_pixels = 10.0;
+        assert_eq!(camera.circle_of_confusion_pixels(5.0, 900.0), -10.0);
     }
 
     #[test]
