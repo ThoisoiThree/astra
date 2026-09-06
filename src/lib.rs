@@ -1,6 +1,7 @@
 pub mod bitset;
 pub mod camera;
 pub mod command;
+pub mod diagnostics;
 pub mod measurement;
 pub mod molecule;
 pub mod picking;

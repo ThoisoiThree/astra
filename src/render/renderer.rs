@@ -14,6 +14,7 @@ use winit::{dpi::PhysicalSize, window::Window};
 use crate::{
     DisplayMode, DisplayState,
     camera::{OrbitCamera, Viewport},
+    diagnostics::StartupTrace,
     measurement::MeasurementLine,
     molecule::{Molecule, MoleculeHierarchy, SecondaryStructure},
 };
@@ -161,9 +162,17 @@ pub fn prepare_cartoon_cached(
 
 impl Renderer {
     pub async fn new(window: Arc<Window>) -> Result<Self, RenderError> {
+        let trace = StartupTrace::new("gpu-init");
         let size = window.inner_size();
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let descriptor = wgpu::InstanceDescriptor::new_without_display_handle_from_env();
+        trace.mark(format_args!(
+            "BEGIN instance: backends={:?}, dx12_compiler={:?}",
+            descriptor.backends, descriptor.backend_options.dx12.shader_compiler
+        ));
+        let instance = wgpu::Instance::new(descriptor);
+        trace.mark("END instance; BEGIN surface creation");
         let surface = instance.create_surface(window.clone())?;
+        trace.mark("END surface creation; BEGIN adapter selection");
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,
@@ -172,6 +181,10 @@ impl Renderer {
                 apply_limit_buckets: false,
             })
             .await?;
+        trace.mark(format_args!(
+            "END adapter selection: {:?}; BEGIN device creation",
+            adapter.get_info()
+        ));
         let optional_features = adapter.features() & wgpu::Features::TIMESTAMP_QUERY;
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
@@ -183,10 +196,14 @@ impl Renderer {
                 trace: wgpu::Trace::Off,
             })
             .await?;
+        trace.mark("END device creation; BEGIN surface configuration");
         let config = surface
             .get_default_config(&adapter, size.width.max(1), size.height.max(1))
             .ok_or(RenderError::SurfaceConfiguration)?;
         surface.configure(&device, &config);
+        trace.mark(format_args!(
+            "END surface configuration: {config:?}; BEGIN scene pipelines"
+        ));
 
         let camera_uniform = CameraUniform::zeroed();
         let camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -236,6 +253,7 @@ impl Renderer {
             config.format,
             false,
         );
+        trace.mark("END scene pipelines; BEGIN meshes and frame targets");
 
         let sphere = GpuMesh::new(&device, "sphere", mesh::uv_sphere(14, 22));
         let cylinder = GpuMesh::new(&device, "cylinder", mesh::cylinder(16));
@@ -278,6 +296,7 @@ impl Renderer {
         let measurement_instances =
             ReusableBuffer::new(&device, "measurement instances", wgpu::BufferUsages::VERTEX);
         let depth = DepthTarget::new(&device, config.width, config.height);
+        trace.mark("END meshes and frame targets; BEGIN postprocess pipelines");
         let post_process = PostProcess::new(
             &device,
             config.format,
@@ -285,11 +304,14 @@ impl Renderer {
             config.height,
             &depth.view,
         );
+        trace.mark("END postprocess pipelines; BEGIN egui renderer");
         let egui_renderer =
             egui_wgpu::Renderer::new(&device, config.format, RendererOptions::default());
+        trace.mark("END egui renderer; BEGIN profiler and viewport cache");
         let profiler = GpuProfiler::new(&device, &queue);
         let viewport_cache =
             ViewportCache::new(&device, config.width, config.height, config.format);
+        trace.mark("END profiler and viewport cache; renderer ready");
 
         Ok(Self {
             instance,
@@ -545,6 +567,8 @@ impl Renderer {
         pixels_per_point: f32,
     ) -> Result<(), RenderError> {
         let cpu_start = Instant::now();
+        let trace = StartupTrace::new("gpu-frame");
+        trace.mark("BEGIN frame preparation");
         if let Some(profiler) = &mut self.profiler {
             profiler.poll(&self.device);
             profiler.begin_frame();
@@ -680,6 +704,7 @@ impl Renderer {
             }
         }
 
+        trace.mark("END frame preparation; BEGIN surface acquisition");
         let output = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(output)
             | wgpu::CurrentSurfaceTexture::Suboptimal(output) => output,
@@ -691,6 +716,7 @@ impl Renderer {
                 return Err(SurfaceIssue::Validation.into());
             }
         };
+        trace.mark("END surface acquisition; BEGIN command encoding");
         let view = output
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
@@ -1081,8 +1107,10 @@ impl Renderer {
             .profiler
             .as_mut()
             .and_then(|profiler| profiler.encode_readback(&self.device, &mut encoder));
+        trace.mark("END command encoding; BEGIN queue submission");
         self.queue
             .submit(callback_buffers.into_iter().chain([encoder.finish()]));
+        trace.mark("END queue submission");
         if let (Some(profiler), Some(buffer)) = (&mut self.profiler, profile_readback) {
             profiler.begin_readback(buffer);
         }
@@ -1097,7 +1125,9 @@ impl Renderer {
                 receiver,
             });
         }
+        trace.mark("BEGIN presentation");
         self.queue.present(output);
+        trace.mark("END presentation");
         self.viewport_cache.revision.commit(scene_key);
         for id in &textures_delta.free {
             self.egui_renderer.free_texture(id);

@@ -20,6 +20,7 @@ use astra::{
     NamedSelectionStyle, RepresentationMask, VisibilityOverride,
     camera::{OrbitCamera, Viewport},
     command::{Command, Representation, parse_command},
+    diagnostics::StartupTrace,
     measurement::{MeasurementEndpoint, MeasurementLine},
     molecule::{
         MAX_DECOMPRESSED_STRUCTURE_SIZE, Molecule, MoleculeHierarchy, SecondaryStructure,
@@ -84,6 +85,8 @@ struct PendingPick {
 
 impl Runtime {
     fn new(event_loop: &ActiveEventLoop, initial_path: Option<PathBuf>) -> Result<Self> {
+        let trace = StartupTrace::new("startup");
+        trace.mark("BEGIN window creation");
         let attributes = WindowAttributes::default()
             .with_title("Astra")
             .with_inner_size(LogicalSize::new(1280.0, 800.0))
@@ -93,8 +96,10 @@ impl Runtime {
                 .create_window(attributes)
                 .context("could not create the Astra window")?,
         );
+        trace.mark("END window creation; BEGIN renderer initialization");
         let renderer = pollster::block_on(Renderer::new(window.clone()))
             .context("could not initialize wgpu")?;
+        trace.mark("END renderer initialization; BEGIN UI initialization");
         let size = renderer.size();
         let viewport = Viewport::full(size.width, size.height);
         let camera = OrbitCamera::new(size.width as f32 / size.height.max(1) as f32);
@@ -175,7 +180,9 @@ impl Runtime {
         {
             runtime.ui.latest_error = Some(error.to_string());
         }
+        trace.mark("END UI initialization; BEGIN recovery scan/dialogs");
         runtime.offer_recovery_files();
+        trace.mark("END recovery scan/dialogs; requesting first redraw");
         runtime.window.request_redraw();
         Ok(runtime)
     }
@@ -320,6 +327,8 @@ impl Runtime {
     }
 
     fn redraw(&mut self, event_loop: &ActiveEventLoop) {
+        let trace = StartupTrace::new("redraw");
+        trace.mark("BEGIN UI frame");
         let raw_input = self.egui_state.take_egui_input(&self.window);
         let session_tabs = self.session_tabs();
         let background_job = self
@@ -389,6 +398,7 @@ impl Runtime {
         let pixels_per_point = full_output.pixels_per_point;
         let paint_jobs = context.tessellate(full_output.shapes, pixels_per_point);
         let mut textures_delta = full_output.textures_delta;
+        trace.mark("END UI frame; BEGIN GPU frame");
         let render_result = self.renderer.render(
             &self.camera,
             self.display.as_ref(),
@@ -398,6 +408,7 @@ impl Runtime {
             pixels_per_point,
         );
         textures_delta.clear();
+        trace.mark(format_args!("END GPU frame: {render_result:?}"));
         match render_result {
             Ok(()) => {}
             Err(RenderError::Surface(SurfaceIssue::Outdated)) => {
