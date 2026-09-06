@@ -127,22 +127,10 @@ fn hierarchy_open(ui: &egui::Ui, id: egui::Id, force_open: bool) -> bool {
     state.is_open()
 }
 
-fn disclosure_button(ui: &mut egui::Ui, id: egui::Id, open: bool) {
-    let symbol = if open { "▾" } else { "▸" };
-    let response = ui
-        .push_id(id.with("toggle"), |ui| {
-            ui.add_sized(
-                [ui.spacing().indent, ui.spacing().interact_size.y],
-                egui::Button::new(symbol).frame(false),
-            )
-        })
-        .inner;
-    if response.clicked() {
-        let mut state =
-            egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, false);
-        state.toggle(ui);
-        state.store(ui.ctx());
-    }
+fn disclosure_button(ui: &mut egui::Ui, id: egui::Id) {
+    let mut state =
+        egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, false);
+    state.show_toggle_button(ui, egui::collapsing_header::paint_default_icon);
 }
 
 fn visible_hierarchy_rows(
@@ -233,7 +221,8 @@ pub(super) fn hierarchy_tree(
                         let on_path = inspected_atom_path
                             .is_some_and(|(inspected_chain, _, _)| inspected_chain == chain_index);
                         let id = ui.make_persistent_id(("chain", chain_index));
-                        disclosure_button(ui, id, hierarchy_open(ui, id, on_path));
+                        hierarchy_open(ui, id, on_path);
+                        disclosure_button(ui, id);
                         hierarchy_row(
                             ui,
                             display,
@@ -271,7 +260,8 @@ pub(super) fn hierarchy_tree(
                             },
                         );
                         let id = ui.make_persistent_id(("residue", chain_index, residue_index));
-                        disclosure_button(ui, id, hierarchy_open(ui, id, on_path));
+                        hierarchy_open(ui, id, on_path);
+                        disclosure_button(ui, id);
                         hierarchy_row(
                             ui,
                             display,

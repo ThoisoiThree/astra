@@ -68,8 +68,8 @@ const DEFAULT_UNIFORM_COLOR: DisplayColor = [0.55, 0.67, 0.82, 1.0];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AmbientOcclusionQuality {
-    Preview,
     #[default]
+    Preview,
     Medium,
     High,
 }
@@ -141,7 +141,7 @@ impl Default for AmbientOcclusionSettings {
             strength: 1.0,
             radius: 2.0,
             bias: 0.05,
-            quality: AmbientOcclusionQuality::Medium,
+            quality: AmbientOcclusionQuality::Preview,
         }
     }
 }
@@ -153,7 +153,7 @@ impl AmbientOcclusionSettings {
             strength: 1.4,
             radius: 2.3,
             bias: 0.05,
-            quality: AmbientOcclusionQuality::Medium,
+            quality: AmbientOcclusionQuality::Preview,
         }
     }
 
@@ -163,7 +163,7 @@ impl AmbientOcclusionSettings {
             strength: 0.15,
             radius: 2.0,
             bias: 0.05,
-            quality: AmbientOcclusionQuality::Medium,
+            quality: AmbientOcclusionQuality::Preview,
         }
     }
 }
@@ -1267,7 +1267,7 @@ mod display_tests {
         assert_eq!(display.coloring_mode, ColoringMode::Chain);
         assert_eq!(display.colors, chain_colors);
         assert!(display.ambient_occlusion.enabled);
-        assert_eq!(display.ambient_occlusion.quality.sample_count(), 32);
+        assert_eq!(display.ambient_occlusion.quality.sample_count(), 12);
 
         display.set_coloring_mode(&molecule, ColoringMode::Uniform);
         display.set_uniform_color(&molecule, [1.0, 0.0, 0.0, 1.0]);
@@ -1332,16 +1332,29 @@ mod display_tests {
         let molecule = molecule();
         let mut display = DisplayState::for_molecule(&molecule);
 
+        assert_eq!(
+            display.ambient_occlusion.quality,
+            AmbientOcclusionQuality::Preview
+        );
+
         display.set_global_mode(DisplayMode::BallAndStick);
         assert_eq!(
             display.ambient_occlusion,
             AmbientOcclusionSettings::ball_and_stick_default()
+        );
+        assert_eq!(
+            display.ambient_occlusion.quality,
+            AmbientOcclusionQuality::Preview
         );
 
         display.set_global_mode(DisplayMode::Toon);
         assert_eq!(
             display.ambient_occlusion,
             AmbientOcclusionSettings::toon_default()
+        );
+        assert_eq!(
+            display.ambient_occlusion.quality,
+            AmbientOcclusionQuality::Preview
         );
 
         let custom = AmbientOcclusionSettings {

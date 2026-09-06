@@ -135,12 +135,13 @@ Open **Camera** in the top toolbar to edit the near and far clipping planes,
 which default to 1 and 1000. The
 DOF renderer uses **Franke et al. (2018), Multi-Layer Depth of Field Rendering
 with Tiled Splatting** as its main algorithm. It builds partial depth layers near
-discontinuities and sorts and composites one-pixel splats front to back in 16×16
+discontinuities and sorts and composites splats front to back in 16×16
 tiles. Hidden geometry can become visible through out-of-focus foreground
 silhouettes. Preview uses 3 layers at half resolution; Medium/High use 4/5 layers
 at full resolution. Overfull tiles are partitioned and processed in order without
-dropping fragments. The optional lossy fragment-reduction optimization is
-disabled to avoid square block artifacts and incorrect depth ordering.
+dropping fragments. Section 6 reduction merges similar defocused fragments in
+two stages (2×2 and 4×4), preserving unmerged list entries and trimming fragments
+inside the merged footprint's umbra. Unchanged viewports reuse the cached image.
 
 Focal length, sensor height, f-stop, maximum CoC **radius**, iris blade count,
 and iris rotation are editable. Zero blades selects a circular iris; 3–12 blades

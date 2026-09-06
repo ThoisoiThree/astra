@@ -22,6 +22,10 @@ mod shader_tests {
     fn bundled_wgsl_modules_parse_and_validate() {
         let optics = include_str!("optics.wgsl");
         let peel = include_str!("peel.wgsl");
+        let dof_constants = format!(
+            "const HOST_MAX_DOF_LAYERS: u32 = {}u;\n",
+            super::dof::MAX_DOF_LAYERS
+        );
         for (name, source) in [
             (
                 "geometry",
@@ -38,6 +42,7 @@ mod shader_tests {
             (
                 "tiled DOF",
                 [
+                    &dof_constants,
                     optics,
                     include_str!("dof.wgsl"),
                     include_str!("dof_reduce.wgsl"),

@@ -8,8 +8,7 @@ use super::{
     targets::ColorTarget,
 };
 
-pub(super) const MAX_DOF_LAYERS: u32 = 5;
-const ORACLE_MAX_DIMENSION: u32 = 128;
+const MAX_LAYERS: u32 = 5;
 
 struct ArrayTarget {
     _texture: wgpu::Texture,
@@ -24,7 +23,7 @@ impl ArrayTarget {
             size: wgpu::Extent3d {
                 width: size[0],
                 height: size[1],
-                depth_or_array_layers: MAX_DOF_LAYERS,
+                depth_or_array_layers: MAX_LAYERS,
             },
             mip_level_count: 1,
             sample_count: 1,
@@ -37,7 +36,7 @@ impl ArrayTarget {
             dimension: Some(wgpu::TextureViewDimension::D2Array),
             ..Default::default()
         });
-        let layers = (0..MAX_DOF_LAYERS)
+        let layers = (0..MAX_LAYERS)
             .map(|layer| {
                 texture.create_view(&wgpu::TextureViewDescriptor {
                     dimension: Some(wgpu::TextureViewDimension::D2),
@@ -97,7 +96,7 @@ impl DepthOfField {
             size: wgpu::Extent3d {
                 width: size[0],
                 height: size[1],
-                depth_or_array_layers: MAX_DOF_LAYERS,
+                depth_or_array_layers: MAX_LAYERS,
             },
             mip_level_count: 1,
             sample_count: 1,
@@ -164,7 +163,7 @@ impl DepthOfField {
                 },
             ],
         });
-        let peel_bindings = (1..MAX_DOF_LAYERS)
+        let peel_bindings = (1..MAX_LAYERS)
             .map(|layer| {
                 device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("DOF previous layer and disocclusion"),
@@ -208,21 +207,16 @@ impl DepthOfField {
         let cartoon_pipeline =
             create_cartoon_pipeline(device, &layout, &geometry_shader, true, true);
         let toon_pipeline = create_toon_pipeline(device, &layout, &toon_shader, true, true);
-        // Inject the host-side layer bound into WGSL so texture allocation and shader
-        // traversal cannot silently diverge. post.quality.x may request fewer layers,
-        // but the shader clamps it to this allocation bound.
-        let compute_source = format!(
-            "const HOST_MAX_DOF_LAYERS: u32 = {MAX_DOF_LAYERS}u;\n{}",
-            [
-                include_str!("optics.wgsl"),
-                include_str!("dof.wgsl"),
-                include_str!("dof_reduce.wgsl"),
-            ]
-            .concat(),
-        );
         let compute_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Franke tiled splatting"),
-            source: wgpu::ShaderSource::Wgsl(Cow::Owned(compute_source)),
+            source: wgpu::ShaderSource::Wgsl(Cow::Owned(
+                [
+                    include_str!("optics.wgsl"),
+                    include_str!("dof.wgsl"),
+                    include_str!("dof_reduce.wgsl"),
+                ]
+                .concat(),
+            )),
         });
         let mut stages = Vec::new();
         for (entry, inputs) in [
@@ -259,16 +253,6 @@ impl DepthOfField {
                     (5, &post.dof_color.view),
                     (6, &shaded_first.view),
                     (8, &reduced_view),
-                ],
-            ),
-            (
-                "splat_oracle",
-                vec![
-                    (1, &color.view),
-                    (2, &depth.view),
-                    (3, &mask_views[0]),
-                    (5, &post.dof_color.view),
-                    (6, &shaded_first.view),
                 ],
             ),
         ] {
@@ -317,25 +301,12 @@ impl DepthOfField {
     }
 
     pub(super) fn layer_color(&self, layer: u32) -> &wgpu::TextureView {
-        assert!(
-            layer < MAX_DOF_LAYERS,
-            "DOF color layer {layer} exceeds allocation"
-        );
         &self.color.layers[layer as usize]
     }
     pub(super) fn layer_depth(&self, layer: u32) -> &wgpu::TextureView {
-        assert!(
-            layer < MAX_DOF_LAYERS,
-            "DOF depth layer {layer} exceeds allocation"
-        );
         &self.depth.layers[layer as usize]
     }
     pub(super) fn peel_binding(&self, layer: u32) -> &wgpu::BindGroup {
-        assert!(
-            (1..MAX_DOF_LAYERS).contains(&layer),
-            "DOF peel binding is only valid for layers 1..{}",
-            MAX_DOF_LAYERS - 1
-        );
         &self.peel_bindings[layer as usize - 1]
     }
 
@@ -359,52 +330,10 @@ impl DepthOfField {
         self.encode_accumulation(encoder, timestamps, true);
     }
 
-    // No-reduction comparison path. This is useful for validating fragment reduction,
-    // but it is not an independent accumulation oracle because it shares sorting/compositing.
+    // Kept for numerical/visual comparisons; the application uses reduction.
     #[allow(dead_code)]
     pub(super) fn encode_reference(&self, encoder: &mut wgpu::CommandEncoder) {
         self.encode_accumulation(encoder, None, false);
-    }
-
-    /// Extremely slow but ordering-independent validation path. It deliberately
-    /// bypasses reduction, tile candidate partitioning and bitonic sorting.
-    /// Returns false rather than accidentally dispatching the O(N^2) oracle on
-    /// a production-sized render target.
-    #[allow(dead_code)]
-    pub(super) fn encode_ordering_oracle(&self, encoder: &mut wgpu::CommandEncoder) -> bool {
-        if self.size[0] > ORACLE_MAX_DIMENSION || self.size[1] > ORACLE_MAX_DIMENSION {
-            return false;
-        }
-
-        self.encode_visible_shading(encoder);
-        let stage = &self.stages[6];
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("DOF independent ordering oracle"),
-            timestamp_writes: None,
-        });
-        pass.set_pipeline(&stage.pipeline);
-        pass.set_bind_group(0, &stage.bindings, &[]);
-        pass.dispatch_workgroups(self.size[0].div_ceil(8), self.size[1].div_ceil(8), 1);
-        true
-    }
-
-    fn encode_visible_shading(&self, encoder: &mut wgpu::CommandEncoder) {
-        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("DOF shade visible fragments"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &self.shaded_first.view,
-                resolve_target: None,
-                depth_slice: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                    store: wgpu::StoreOp::Store,
-                },
-            })],
-            ..Default::default()
-        });
-        pass.set_pipeline(&self.shade_pipeline);
-        pass.set_bind_group(0, &self.shade_bindings, &[]);
-        pass.draw(0..3, 0..1);
     }
 
     fn encode_accumulation(
@@ -413,11 +342,28 @@ impl DepthOfField {
         timestamps: Option<wgpu::ComputePassTimestampWrites<'_>>,
         reduced: bool,
     ) {
-        self.encode_visible_shading(encoder);
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("DOF shade visible fragments"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.shaded_first.view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                ..Default::default()
+            });
+            pass.set_pipeline(&self.shade_pipeline);
+            pass.set_bind_group(0, &self.shade_bindings, &[]);
+            pass.draw(0..3, 0..1);
+        }
         if reduced {
             let stage = &self.stages[3];
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("DOF hierarchical fragment merging"),
+                label: Some("DOF list merging and umbra trimming"),
                 timestamp_writes: None,
             });
             pass.set_pipeline(&stage.pipeline);
@@ -435,12 +381,10 @@ impl DepthOfField {
     }
 
     pub(super) fn estimated_bytes(&self) -> u64 {
-        u64::from(self.size[0])
-            * u64::from(self.size[1])
-            * (u64::from(MAX_DOF_LAYERS) * (8 + 4) + 16)
+        u64::from(self.size[0]) * u64::from(self.size[1]) * (u64::from(MAX_LAYERS) * (8 + 4) + 16)
             + u64::from(self.reduced.width())
                 * u64::from(self.reduced.height())
-                * u64::from(MAX_DOF_LAYERS)
+                * u64::from(MAX_LAYERS)
                 * 16
     }
 }
@@ -476,20 +420,5 @@ fn view_entry(binding: u32, view: &wgpu::TextureView) -> wgpu::BindGroupEntry<'_
     wgpu::BindGroupEntry {
         binding,
         resource: wgpu::BindingResource::TextureView(view),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn merged_opacity_matches_supplemental_geometric_sum() {
-        for radius in [1.0_f32, 2.0, 4.0, 8.0, 16.0] {
-            let alpha = (1.0 / (radius * radius)).min(1.0);
-            for mass in [1, 4, 16] {
-                let sum: f32 = (0..mass).map(|k| alpha * (1.0 - alpha).powi(k)).sum();
-                let closed = 1.0 - (1.0 - alpha).powi(mass);
-                assert!((sum - closed).abs() < 1e-6);
-            }
-        }
     }
 }

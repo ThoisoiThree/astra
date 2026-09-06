@@ -44,17 +44,29 @@ Every layer, including the visible first layer, is rasterized by the molecular
 geometry pipelines at the DOF target resolution. This keeps color, depth, rays,
 viewport coordinates and pixel centers aligned. A relative eye-space
 discontinuity test creates a radius field; two separable dilation passes create
-a conservative square disocclusion mask. Successive geometry passes collect the
+a conservative circular disocclusion mask. Successive geometry passes collect the
 next visible surface only in this mask.
 The umbra endpoint for preceding depth `z`, projected pixel width `s` and aperture
 diameter `A` is `z*A/(A-s)`. When `s >= A`, no further layer is retained.
 
-Each source pixel remains an individual fragment. The optional 2×2/4×4
-reduction from section 6 is currently disabled because a fixed-grid merge can
-replace a smooth surface with visible square footprints and can change occlusion
-order unless it uses the paper's complete list-wise merge rules. This path is
-the paper's unreduced reference algorithm from sections 4 and 5 and favors a
-correct image over that optimization.
+Section 6 reduction runs before splatting. Each invocation merges the heads of
+four depth-ordered lists, first over 2×2 pixels and then over 4×4. A merge requires
+all four heads to have the same footprint, similar depth and shaded RGB, and a
+sufficiently large CoC. Unmerged fragments remain in the lists and cannot merge
+at the next level. The output averages color, moves the center to the footprint
+center, places depth just behind the deepest child, and conservatively encloses
+the children's CoCs. Intermediate lists are sorted again before the second step.
+After each merge, fragments inside its umbra are discarded; a footprint wider
+than the aperture casts an infinite shadow. The inset footprint is 1.5 pixels
+at 2×2 and 3.5 at 4×4. Both steps run in one compute dispatch.
+
+Merge thresholds are conservative implementation parameters: 0.1% relative depth,
+0.01 maximum RGB difference, and minimum CoC of 4/8 pixels for the two steps.
+They adapt the paper's qualitative criteria to molecular scene units, rather
+than copying the supplemental scene-dependent numeric thresholds. RGB comparison
+preserves boundaries between differently colored chains of similar luminance.
+Artificial environment samples are not merged: they close exposed lists but do
+not represent physical occluders with a mergeable footprint.
 
 Each 16×16 compute workgroup constructs its tile list from the source fragments
 in the surrounding CoC extent, then bitonic-sorts exact `(f32 depth, source ID)`
@@ -65,7 +77,9 @@ consumed before far partitions. Common key bits are skipped. Thus large radii,
 equal-depth surfaces and dense occlusion retain all relevant fragments with
 bounded workgroup storage. Dense tiles may require additional traversal work.
 
-Each fragment uses opacity proportional to inverse squared CoC radius.
+Each fragment uses `alpha = min(1, 1/r²)`. For a merged fragment representing
+`n` samples, opacity is `1-(1-alpha)^n`, the closed form of the supplemental
+geometric sum.
 Iris-shaped coverage modulates opacity. Front-to-back accumulation is normalized
 by total coverage; one clear-color layer represents environment exposed by
 peeling. Stable source IDs resolve equal-depth ties. Subpixel in-focus fragments
@@ -103,8 +117,8 @@ first-layer generation, mask construction, peeling, visible-layer shading and sp
 - The portable WGSL implementation uses bounded radix partitions instead of
   CUDA list-size scheduling and global-memory overflow sorting. No subgroup
   extensions or additional device features are required.
-- Umbra rejection is applied during peeling. The optional, more aggressive
-  post-merge umbra trimming in section 6.2 is not applied.
+- Umbra rejection is applied during peeling and after both merge levels. The
+  4×4 footprint scales the supplemental 2×2 inset heuristic with fragment size.
 - Hidden layers use their normal material shading; they do not have independent
   AO or semantic Toon contours. Those effects come from the visible layer.
 - Preview can lose subpixel geometry and soften transitions.
@@ -113,8 +127,9 @@ first-layer generation, mask construction, peeling, visible-layer shading and sp
   half-pixel soft rim instead of the circular support in the paper.
 - Layer textures are allocated lazily while DOF is enabled and released when it
   is disabled. The five color/depth layers, two masks and shaded visible-layer
-  target cost 76 bytes per DOF pixel (about 38 MiB at half-resolution 1080p or
-  150 MiB at full-resolution 1080p), in addition to existing scene/output targets. The memory counter
+  target cost 76 bytes per DOF pixel; packed reduction records add 80 bytes.
+  Total DOF storage is 156 bytes per pixel (about 77 MiB at half-resolution 1080p
+  or 309 MiB at full-resolution 1080p), in addition to scene/output targets. The memory counter
   includes them. No frame-rate equivalence with the paper's CUDA implementation
   is claimed.
 
@@ -131,6 +146,16 @@ HDR radiance, equal-depth checkerboards exceeding tile capacity, exact focus,
 a peeled background behind a defocused foreground stripe, and a smooth sloped
 surface with depth ordering opposite to source order and CoC crossing the focal
 plane. Odd sizes, half resolution and 1×1 images are included.
+An independent GPU ordering oracle scans raw lists without tiling, bitonic sort,
+or reduction on small fixtures. Structural GPU readbacks verify 4×4 collapse,
+matching surfaces across different layer numbers, finite and infinite umbra
+trimming, and preservation of focused pixels. Molecular images are additionally
+compared with the unreduced path to bound reduction error.
+
+The renderer caches the composed viewport. Camera, lens, display, geometry,
+annotations, and target-size changes invalidate it; UI-only frames reuse it.
+The event loop honors egui repaint deadlines and does not request another frame
+merely because it received `RedrawRequested`.
 
 The same example also rasterizes actual `4R8P` cartoon geometry, atomic meshes
 and analytic Toon spheres through the scene, first-layer, peeling, source-shading

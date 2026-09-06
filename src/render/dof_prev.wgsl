@@ -7,20 +7,6 @@
 @group(0) @binding(5) var result: texture_storage_2d<rgba16float, write>;
 @group(0) @binding(6) var shaded_first: texture_2d<f32>;
 
-// Injected by dof.rs so Rust and WGSL share the same bounded layer count.
-// HOST_MAX_DOF_LAYERS is declared before this source at shader-module creation.
-const INVALID_DOF_DEPTH: f32 = 1e19;
-
-fn active_layer_count() -> u32 {
-    return min(max(u32(max(post.quality.x, 1.0)), 1u), HOST_MAX_DOF_LAYERS);
-}
-
-fn valid_dof_depth(z: f32) -> bool {
-    // optical_depth is expected to be positive and monotonic with camera distance.
-    // NaN also fails these ordered comparisons.
-    return z > 0.0 && z < INVALID_DOF_DEPTH;
-}
-
 fn layer_depth(p: vec2<i32>, layer: i32) -> f32 {
     let pixel = clamp(p, vec2<i32>(0), vec2<i32>(post.quality.zw) - 1);
     return optical_depth((vec2<f32>(pixel) + 0.5) / post.quality.zw,
@@ -36,30 +22,13 @@ fn edges(@builtin(global_invocation_id) id: vec3<u32>) {
     if any(id.xy >= vec2<u32>(post.quality.zw)) { return; }
     let p = vec2<i32>(id.xy);
     let z = layer_depth(p, 0);
-    let z_valid = valid_dof_depth(z);
     var edge_radius = 0.0;
     for (var y = -1; y <= 1; y++) {
         for (var x = -1; x <= 1; x++) {
-            if x == 0 && y == 0 { continue; }
             let neighbor = layer_depth(p + vec2<i32>(x, y), 0);
-            let neighbor_valid = valid_dof_depth(neighbor);
-            let silhouette = z_valid != neighbor_valid;
-            let depth_edge = z_valid && neighbor_valid
-                && abs(z - neighbor) > max(0.02 * min(z, neighbor), 0.01);
-            if silhouette || depth_edge {
-                // Partial occlusion is caused by the front-most surface at a depth
-                // discontinuity. Do not dilate by a far-background CoC.
-                var foreground_radius = 0.0;
-                if z_valid && neighbor_valid {
-                    foreground_radius = radius(min(z, neighbor));
-                } else if z_valid {
-                    foreground_radius = radius(z);
-                } else if neighbor_valid {
-                    foreground_radius = radius(neighbor);
-                }
-                if foreground_radius > 0.5 {
-                    edge_radius = max(edge_radius, ceil(foreground_radius) + 1.0);
-                }
+            // Relative eye-space threshold works across molecule sizes and zoom levels.
+            if abs(z - neighbor) > max(0.02 * min(z, neighbor), 0.01) {
+                edge_radius = max(edge_radius, ceil(max(radius(z), radius(neighbor))) + 1.0);
             }
         }
     }
@@ -71,19 +40,13 @@ fn dilate_x(@builtin(global_invocation_id) id: vec3<u32>) {
     if any(id.xy >= vec2<u32>(post.quality.zw)) { return; }
     let p = vec2<i32>(id.xy);
     let extent = i32(ceil(post.lens.z * post.quality.y)) + 1;
-    var vertical_reach = 0.0;
+    var r = 0.0;
     for (var x = -extent; x <= extent; x++) {
         let q = clamp(p + vec2<i32>(x, 0), vec2<i32>(0), vec2<i32>(post.quality.zw) - 1);
-        let seed_radius = textureLoad(mask_source, q, 0).r;
-        let dx = f32(abs(x));
-        if seed_radius > 0.0 && dx <= seed_radius {
-            // Store the remaining vertical radius of a circular CoC. The following
-            // Y pass therefore produces a circle rather than a conservative square.
-            vertical_reach = max(vertical_reach,
-                sqrt(max(seed_radius * seed_radius - dx * dx, 0.0)));
-        }
+        let sample_radius = textureLoad(mask_source, q, 0).r;
+        if f32(abs(x)) <= sample_radius { r = max(r, sample_radius); }
     }
-    textureStore(mask_target, p, vec4<f32>(vertical_reach));
+    textureStore(mask_target, p, vec4<f32>(r));
 }
 
 @compute @workgroup_size(8, 8)
@@ -94,11 +57,8 @@ fn dilate_y(@builtin(global_invocation_id) id: vec3<u32>) {
     var marked = 0.0;
     for (var y = -extent; y <= extent; y++) {
         let q = clamp(p + vec2<i32>(0, y), vec2<i32>(0), vec2<i32>(post.quality.zw) - 1);
-        let remaining_radius = textureLoad(mask_source, q, 0).r;
-        if remaining_radius > 0.0 && f32(abs(y)) <= remaining_radius {
-            marked = 1.0;
-            break;
-        }
+        let r = textureLoad(mask_source, q, 0).r;
+        if r > 0.0 && f32(abs(y)) <= r { marked = 1.0; }
     }
     textureStore(mask_target, p, vec4<f32>(marked));
 }
@@ -108,40 +68,6 @@ struct Fragment {
     // Eye-space depth, conservative CoC radius and represented source-pixel count.
     shape: vec4<f32>,
 };
-
-// Supplemental material, precompute_for_blur and Apply.
-const DOF_SATURATION_TRANSMISSION: f32 = 0.01;
-
-fn fragment_coverage(offset: vec2<f32>, coc_radius: f32) -> f32 {
-    if coc_radius <= 0.5 {
-        return select(0.0, 1.0, all(abs(offset) < vec2<f32>(0.5)));
-    }
-    return 1.0 - smoothstep(max(coc_radius - 0.5, 0.0), coc_radius + 0.5,
-        aperture_metric(offset));
-}
-
-fn fragment_alpha(coc_radius: f32, mass: f32, coverage: f32) -> f32 {
-    if coverage <= 0.0 { return 0.0; }
-    if coc_radius <= 0.5 { return coverage; }
-
-    let single_alpha = min(1.0, 1.0 / (coc_radius * coc_radius));
-    let merged_alpha = 1.0 - pow(1.0 - single_alpha, max(mass, 1.0));
-    return clamp(merged_alpha * coverage, 0.0, 1.0);
-}
-
-fn raw_layer_valid(p: vec2<i32>, layer: u32, z: f32) -> bool {
-    if layer >= active_layer_count() { return false; }
-    if layer > 0u && textureLoad(mask_source, p, 0).r < 0.5 { return false; }
-    // One environment fragment closes each exposed list. Further empty layers
-    // must not count as additional radiance samples.
-    if valid_dof_depth(z) { return true; }
-    return layer == 0u || valid_dof_depth(layer_depth(p, i32(layer) - 1));
-}
-
-fn raw_layer_color(p: vec2<i32>, layer: i32) -> vec4<f32> {
-    if layer == 0 { return textureLoad(shaded_first, p, 0); }
-    return textureLoad(layers_color, p, layer, 0);
-}
 
 // A tile's list lives in workgroup memory. Overfull lists are partitioned by the
 // exact (32-bit depth, source ID) radix key and traversed in front-to-back order.
@@ -190,75 +116,6 @@ fn splat_reference(@builtin(workgroup_id) tile: vec3<u32>, @builtin(local_invoca
     accumulate_tile(tile, lane, id, false);
 }
 
-// Independent ordering oracle for small validation images. It performs no tile
-// list construction, radix partitioning, bitonic sorting, or fragment reduction.
-// Instead, every output pixel repeatedly scans all potentially contributing raw
-// fragments and selects the next exact (depth, source-id) key. This is deliberately
-// O(N^2) and must only be dispatched by the guarded Rust debug path.
-@compute @workgroup_size(8, 8)
-fn splat_oracle(@builtin(global_invocation_id) id: vec3<u32>) {
-    let size = vec2<i32>(post.quality.zw);
-    if any(id.xy >= vec2<u32>(size)) { return; }
-
-    let pixel = vec2<f32>(id.xy) + 0.5;
-    let margin = i32(ceil(post.lens.z * post.quality.y)) + 1;
-    let begin = max(vec2<i32>(id.xy) - margin, vec2<i32>(0));
-    let end = min(vec2<i32>(id.xy) + margin + 1, size);
-
-    var rgb = vec3<f32>(0.0);
-    var transmission = 1.0;
-    var last_key = vec2<u32>(0u);
-    var have_last = false;
-
-    loop {
-        var found = false;
-        var best_key = vec2<u32>(0xffffffffu);
-        var best_p = vec2<i32>(0);
-        var best_layer = 0i;
-        var best_z = 0.0;
-        var best_radius = 0.0;
-
-        for (var y = begin.y; y < end.y; y++) {
-            for (var x = begin.x; x < end.x; x++) {
-                let p = vec2<i32>(x, y);
-                for (var layer = 0u; layer < active_layer_count(); layer++) {
-                    if layer > 0u && textureLoad(mask_source, p, 0).r < 0.5 { break; }
-                    let z = layer_depth(p, i32(layer));
-                    // The depth-peeling list is ordered, so later entries are absent too.
-                    if !raw_layer_valid(p, layer, z) { break; }
-                    let coc_radius = radius(z);
-                    let coverage = fragment_coverage(pixel - (vec2<f32>(p) + 0.5), coc_radius);
-                    if coverage <= 0.0 { continue; }
-                    let source_id = (layer * u32(size.y) + u32(p.y)) * u32(size.x) + u32(p.x);
-                    let key = vec2<u32>(bitcast<u32>(z), source_id);
-                    if have_last && !less(last_key, key) { continue; }
-                    if !found || less(key, best_key) {
-                        found = true;
-                        best_key = key;
-                        best_p = p;
-                        best_layer = i32(layer);
-                        best_z = z;
-                        best_radius = coc_radius;
-                    }
-                }
-            }
-        }
-
-        if !found { break; }
-        let coverage = fragment_coverage(pixel - (vec2<f32>(best_p) + 0.5), best_radius);
-        let alpha = fragment_alpha(best_radius, 1.0, coverage);
-        let weight = transmission * alpha;
-        rgb += weight * raw_layer_color(best_p, best_layer).rgb;
-        transmission -= weight;
-        last_key = best_key;
-        have_last = true;
-        if transmission <= DOF_SATURATION_TRANSMISSION { break; }
-    }
-
-    let resolved = resolve_splats(rgb, transmission);
-    textureStore(result, vec2<i32>(id.xy), vec4<f32>(resolved, 1.0));
-}
-
 fn accumulate_tile(tile: vec3<u32>, lane: u32, id: vec3<u32>, reduced: bool) {
     let size = vec2<i32>(post.quality.zw);
     let valid_pixel = all(id.xy < vec2<u32>(size));
@@ -291,12 +148,16 @@ fn accumulate_tile(tile: vec3<u32>, lane: u32, id: vec3<u32>, reduced: bool) {
         }
         for (var i = lane; i < CAPACITY; i += 256u) { keys[i] = vec2<u32>(0xffffffffu); }
         workgroupBarrier();
-        for (var i = lane; i < area * active_layer_count(); i += 256u) {
+        for (var i = lane; i < area * u32(post.quality.x); i += 256u) {
             let layer = i / area;
             let offset = i % area;
             let p = begin + vec2<i32>(i32(offset % u32(extent.x)), i32(offset / u32(extent.x)));
             var z = layer_depth(p, i32(layer));
-            if !reduced && !raw_layer_valid(p, layer, z) { continue; }
+            if !reduced && layer > 0u && z >= 1e19
+                && (textureLoad(mask_source, p, 0).r < 0.5
+                    || layer_depth(p, i32(layer) - 1) >= 1e19) {
+                continue;
+            }
             var fragment_radius = radius(z);
             var center = vec2<f32>(p) + 0.5;
             if reduced {
@@ -307,7 +168,6 @@ fn accumulate_tile(tile: vec3<u32>, lane: u32, id: vec3<u32>, reduced: bool) {
                 center = fragment_center(fragment);
             }
             let delta = center - clamp(center, tile_min, tile_max);
-            // The circumscribed circle is conservative for every iris rotation.
             if length(delta) > max(fragment_radius, 0.5) + 0.5 { continue; }
             let source_id = (layer * u32(size.y) + u32(p.y)) * u32(size.x) + u32(p.x);
             let key = vec2<u32>(bitcast<u32>(z), source_id);
@@ -365,7 +225,8 @@ fn accumulate_tile(tile: vec3<u32>, lane: u32, id: vec3<u32>, reduced: bool) {
                 let p = fragment_pixel(index);
                 let layer = i32(index / u32(size.x * size.y));
                 let z = layer_depth(p, layer);
-                chunk[lane].color = raw_layer_color(p, layer);
+                chunk[lane].color = textureLoad(layers_color, p, layer, 0);
+                if layer == 0 { chunk[lane].color = textureLoad(shaded_first, p, 0); }
                 chunk[lane].shape = vec4<f32>(z, radius(z), 1.0, 0.0);
                 centers[lane] = vec2<f32>(p) + 0.5;
                 if reduced {
@@ -376,12 +237,17 @@ fn accumulate_tile(tile: vec3<u32>, lane: u32, id: vec3<u32>, reduced: bool) {
                 }
             }
             workgroupBarrier();
-            if valid_pixel && transmission > DOF_SATURATION_TRANSMISSION {
+            if valid_pixel && transmission > 0.01 {
                 for (var i = 0u; i < min(32u, length - base); i++) {
                     let f = chunk[i];
                     let offset = pixel - centers[i];
-                    let coverage = fragment_coverage(offset, f.shape.y);
-                    let alpha = fragment_alpha(f.shape.y, f.shape.z, coverage);
+                    let r = max(f.shape.y, 0.5);
+                    var coverage = 1.0 - smoothstep(max(r - 0.5, 0.0), r + 0.5, aperture_metric(offset));
+                    if f.shape.y < 0.5 {
+                        coverage = select(0.0, 1.0, all(abs(offset) < vec2<f32>(0.5)));
+                    }
+                    let single_alpha = min(1.0, 1.0 / (r * r));
+                    let alpha = (1.0 - pow(1.0 - single_alpha, f.shape.z)) * coverage;
                     let weight = transmission * alpha;
                     rgb += weight * f.color.rgb;
                     transmission -= weight;
@@ -391,7 +257,7 @@ fn accumulate_tile(tile: vec3<u32>, lane: u32, id: vec3<u32>, reduced: bool) {
         }
         if lane == 0u { atomicStore(&unsaturated, 0u); }
         workgroupBarrier();
-        if valid_pixel && transmission > DOF_SATURATION_TRANSMISSION { atomicAdd(&unsaturated, 1u); }
+        if valid_pixel && transmission > 0.01 { atomicAdd(&unsaturated, 1u); }
         workgroupBarrier();
         if lane == 0u {
             if stack_size == 0u || atomicLoad(&unsaturated) == 0u { done = 1u; }
@@ -405,12 +271,10 @@ fn accumulate_tile(tile: vec3<u32>, lane: u32, id: vec3<u32>, reduced: bool) {
         if done != 0u { break; }
     }
     if valid_pixel {
-        let resolved = resolve_splats(rgb, transmission);
+        // Normalize the finite splat coverage as in section 5.3. This preserves a
+        // constant radiance field instead of darkening it by residual transmittance.
+        let opacity = 1.0 - transmission;
+        let resolved = select(post.background.rgb, rgb / max(opacity, 1e-6), opacity > 1e-6);
         textureStore(result, vec2<i32>(id.xy), vec4<f32>(resolved, 1.0));
     }
-}
-
-fn resolve_splats(rgb: vec3<f32>, transmission: f32) -> vec3<f32> {
-    let opacity = 1.0 - transmission;
-    return select(post.background.rgb, rgb / max(opacity, 1e-6), opacity > 1e-6);
 }

@@ -135,7 +135,13 @@ pub(super) fn validate(
             a: 1.0,
         };
         let mut sharp = Vec::new();
-        for (label, f_stop) in [("sharp", 1e6), ("ao", 1e6), ("dof", 0.7)] {
+        let mut reduced: Vec<Vec3> = Vec::new();
+        for (label, f_stop) in [
+            ("sharp", 1e6),
+            ("ao", 1e6),
+            ("dof", 0.7),
+            ("reference", 0.7),
+        ] {
             let uniform = PostUniform {
                 inverse_view_projection: projection.inverse().to_cols_array(),
                 eye_position: camera.eye().extend(1.0).to_array(),
@@ -297,7 +303,11 @@ pub(super) fn validate(
                     dof.encode_mask(&mut encoder);
                 }
             }
-            dof.encode_splat(&mut encoder, None);
+            if label == "reference" {
+                dof.encode_reference(&mut encoder);
+            } else {
+                dof.encode_splat(&mut encoder, None);
+            }
             {
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("molecular regression final composition"),
@@ -336,7 +346,29 @@ pub(super) fn validate(
                     "AO must apply exactly once: {name}, energy ratio {ratio}"
                 );
                 println!("{name}: AO energy ratio {ratio:.4}");
+            } else if label == "reference" {
+                let errors: Vec<f32> = pixels
+                    .iter()
+                    .zip(&reduced)
+                    .map(|(a, b)| (*a - *b).abs().max_element())
+                    .collect();
+                let mean = errors.iter().sum::<f32>() / errors.len() as f32;
+                let max = errors.iter().copied().fold(0.0_f32, f32::max);
+                let large = errors.iter().filter(|e| **e > 0.05).count();
+                println!(
+                    "{name}: {large} pixels differ by more than 0.05, max at {:?}",
+                    errors
+                        .iter()
+                        .position(|e| *e == max)
+                        .map(|i| (i % width as usize, i / width as usize))
+                );
+                ensure!(
+                    mean < 0.002 && max < 0.05,
+                    "excessive reduction error: {name}, mean {mean}, max {max}"
+                );
+                println!("{name}: reduction error mean {mean:.6}, max {max:.6}");
             } else {
+                reduced.clone_from(&pixels);
                 let changed = pixels
                     .iter()
                     .zip(&sharp)

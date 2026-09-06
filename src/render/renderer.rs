@@ -1167,8 +1167,8 @@ mod tests {
         let molecule = backbone_molecule();
         let display = DisplayState::for_molecule(&molecule);
         let cartoon = cartoon_render_data(&molecule, &display);
-        assert_eq!(cartoon.vertices.len(), 21 * 16);
-        assert_eq!(cartoon.indices.len(), 20 * 16 * 6);
+        assert_eq!(cartoon.vertices.len(), 11 * 12);
+        assert_eq!(cartoon.indices.len(), 10 * 12 * 6);
         assert_eq!(&cartoon.standard_atomic[..6], &[false; 6]);
         assert!(cartoon.standard_atomic[6]);
     }

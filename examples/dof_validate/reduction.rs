@@ -13,12 +13,17 @@ pub(super) fn validate(
     let dof = dof::DepthOfField::new(device, camera, &post, &depth.view);
     let projection =
         glam::camera::rh::proj::directx::orthographic(-1.0, 1.0, -1.0, 1.0, 1.0, 101.0);
-    for case in 0..3 {
+    for case in 0..5 {
         let uniform = PostUniform {
             inverse_view_projection: projection.inverse().to_cols_array(),
             eye_position: [0.0; 4],
             optical_axis: [0.0, 0.0, -1.0, size as f32],
-            lens: [if case == 2 { 20.0 } else { 5.0 }, 0.7, 64.0, 1.0],
+            lens: [
+                if case == 2 { 20.0 } else { 5.0 },
+                if case == 3 { 0.8 } else { 0.7 },
+                64.0,
+                1.0,
+            ],
             aperture: [2.5, 0.0, 0.0, 0.0],
             ao: [0.0; 4],
             quality: [5.0, 1.0, size as f32, size as f32],
@@ -41,7 +46,15 @@ struct Out {{ @location(0) color: vec4<f32>, @builtin(frag_depth) depth: f32 }};
 @fragment fn fragment_main(@builtin(position) p: vec4<f32>) -> Out {{
     var o: Out;
     o.color = vec4<f32>(0,0,0,1); o.depth = 1.0;
-    if {case}u != 1u {{
+    if {case}u == 4u {{
+        // Environment has radiance but no physical footprint to merge.
+        o.color = vec4<f32>(0.2,0.4,0.6,1);
+    }} else if {case}u == 3u {{
+        if p.x < 4.0 && p.y < 4.0 {{
+            if {layer}u == 0u {{ o.color = vec4<f32>(0,0,1,1); o.depth = 0.19; }}
+            if {layer}u == 1u {{ o.color = vec4<f32>(0,1,0,1); o.depth = 0.79; }}
+        }} else if {layer}u == 0u {{ o.color = vec4<f32>(1,0,0,1); o.depth = 0.09; }}
+    }} else if {case}u != 1u {{
         if {layer}u == 0u {{ o.color = vec4<f32>(0,0,1,1); o.depth = 0.19; }}
     }} else if p.x < 2.0 && p.y < 2.0 {{
         // The same blue surface is in layer 0 or 1 depending on the pixel.
@@ -178,7 +191,7 @@ struct Out {{ @location(0) color: vec4<f32>, @builtin(frag_depth) depth: f32 }};
                 let blue: Vec<_> = depths
                     .iter()
                     .zip(&masses)
-                    .filter(|(z, _)| (20.0..20.01).contains(z))
+                    .filter(|(z, _)| (20.0..20.01).contains(*z))
                     .collect();
                 ensure!(
                     blue.len() == 1 && *blue[0].1 == 4.0,
@@ -193,9 +206,26 @@ struct Out {{ @location(0) color: vec4<f32>, @builtin(frag_depth) depth: f32 }};
                     "umbra must preserve the distant surface"
                 );
             }
-            _ => ensure!(
+            2 => ensure!(
                 masses == vec![1.0; 64],
                 "focused fragments must remain individual pixels"
+            ),
+            3 => {
+                ensure!(
+                    depths
+                        .iter()
+                        .zip(&masses)
+                        .any(|(z, m)| (20.0..20.01).contains(z) && *m == 16.0),
+                    "4x4 blue surface must merge"
+                );
+                ensure!(
+                    !depths.iter().any(|z| (79.99..80.01).contains(z)),
+                    "4x4 footprint larger than aperture must cast infinite shadow"
+                );
+            }
+            _ => ensure!(
+                masses == vec![1.0; 64],
+                "environment samples must not merge"
             ),
         }
         println!("section 6 case {case}: {} surviving records", masses.len());

@@ -58,11 +58,15 @@ async fn run() -> Result<()> {
             count: None,
         }],
     });
-    for (width, height, scale, blades, rotation, layers) in [
-        (65, 49, 1.0, 7.0, 0.37, 5),
-        (65, 49, 0.5, 0.0, 0.0, 4),
-        (65, 49, 1.0, 3.0, 1.2, 3),
-        (1, 1, 0.5, 12.0, -0.8, 5),
+    if std::env::var_os("ASTRA_DOF_MOLECULAR_ONLY").is_some() {
+        return molecular::validate(&device, &queue, &camera_layout);
+    }
+    for (width, height, scale, blades, rotation, layers, oracle) in [
+        (65, 49, 1.0, 7.0, 0.37, 5, false),
+        (65, 49, 0.5, 0.0, 0.0, 4, false),
+        (65, 49, 1.0, 3.0, 1.2, 3, false),
+        (1, 1, 0.5, 12.0, -0.8, 5, false),
+        (17, 13, 1.0, 0.0, 0.0, 5, true),
     ] {
         let depth = targets::DepthTarget::new(&device, width, height);
         let mut post = PostProcess::new(
@@ -176,7 +180,14 @@ async fn run() -> Result<()> {
                 pass.set_bind_group(1, dof.peel_binding(1), &[]);
                 pass.draw(0..3, 0..1);
             }
-            dof.encode_splat(&mut encoder, None);
+            if oracle {
+                ensure!(
+                    dof.encode_ordering_oracle(&mut encoder),
+                    "oracle target too large"
+                );
+            } else {
+                dof.encode_splat(&mut encoder, None);
+            }
             let bytes_per_row = (dof.size[0] * 8).div_ceil(256) * 256;
             let buffer = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("DOF regression readback"),
