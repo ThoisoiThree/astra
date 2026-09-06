@@ -296,6 +296,8 @@ pub(super) fn named_selections(
         return;
     };
     let rows = visible_selection_rows(ui, info.named_selections, hierarchy);
+    // Nested scroll/row UIs have different IDs; retain the row-list scope.
+    let tree_id = ui.id();
     let row_height = ui.spacing().interact_size.y;
     let max_height = (ui.available_height() * 0.34).clamp(row_height * 3.0, 260.0);
     egui::ScrollArea::vertical()
@@ -312,7 +314,7 @@ pub(super) fn named_selections(
                         if selection.count() == 0 {
                             ui.add_space(ui.spacing().indent);
                         } else {
-                            let id = ui.make_persistent_id(("named selection", name));
+                            let id = tree_id.with(("named selection", name));
                             selection_disclosure_button(ui, id, selection_tree_open(ui, id));
                         }
                         named_selection_header(
@@ -338,8 +340,7 @@ pub(super) fn named_selections(
                             return;
                         };
                         ui.add_space(ui.spacing().indent);
-                        let id =
-                            ui.make_persistent_id(("named chain", selection_name, chain_index));
+                        let id = tree_id.with(("named chain", selection_name, chain_index));
                         selection_disclosure_button(ui, id, selection_tree_open(ui, id));
                         let target = InspectionTarget::Chain(chain_index);
                         let chain_name = info
@@ -378,7 +379,7 @@ pub(super) fn named_selections(
                             return;
                         };
                         ui.add_space(ui.spacing().indent * 2.0);
-                        let id = ui.make_persistent_id((
+                        let id = tree_id.with((
                             "named residue",
                             selection_name,
                             chain_index,

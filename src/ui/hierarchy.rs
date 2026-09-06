@@ -131,6 +131,7 @@ fn disclosure_button(ui: &mut egui::Ui, id: egui::Id) {
     let mut state =
         egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, false);
     state.show_toggle_button(ui, egui::collapsing_header::paint_default_icon);
+    state.store(ui.ctx());
 }
 
 fn visible_hierarchy_rows(
@@ -193,7 +194,17 @@ pub(super) fn hierarchy_tree(
             .atom_path(atom_index)
             .map(|path| (path.chain_index, path.residue_index, atom_index))
     });
-    let rows = visible_hierarchy_rows(ui, hierarchy, inspected_atom_path);
+    // Use the same scope for the row list and buttons inside nested layout UIs.
+    let tree_id = ui.id();
+    let inspection_id = tree_id.with("last revealed atom");
+    let inspection_changed = ui.ctx().data_mut(|data| {
+        let previous = data.get_temp::<Option<(usize, usize, usize)>>(inspection_id);
+        data.insert_temp(inspection_id, inspected_atom_path);
+        previous != Some(inspected_atom_path)
+    });
+    // Reveal a newly inspected atom once, so a later manual collapse stays closed.
+    let reveal_path = inspected_atom_path.filter(|_| inspection_changed);
+    let rows = visible_hierarchy_rows(ui, hierarchy, reveal_path);
     let row_height = ui.spacing().interact_size.y;
     egui::ScrollArea::vertical()
         .id_salt("virtual molecule hierarchy")
@@ -220,8 +231,7 @@ pub(super) fn hierarchy_tree(
                             .find_map(|residue| residue.atom_indices.first().copied());
                         let on_path = inspected_atom_path
                             .is_some_and(|(inspected_chain, _, _)| inspected_chain == chain_index);
-                        let id = ui.make_persistent_id(("chain", chain_index));
-                        hierarchy_open(ui, id, on_path);
+                        let id = tree_id.with(("chain", chain_index));
                         disclosure_button(ui, id);
                         hierarchy_row(
                             ui,
@@ -259,8 +269,7 @@ pub(super) fn hierarchy_tree(
                                 inspected_chain == chain_index && inspected_residue == residue_index
                             },
                         );
-                        let id = ui.make_persistent_id(("residue", chain_index, residue_index));
-                        hierarchy_open(ui, id, on_path);
+                        let id = tree_id.with(("residue", chain_index, residue_index));
                         disclosure_button(ui, id);
                         hierarchy_row(
                             ui,
