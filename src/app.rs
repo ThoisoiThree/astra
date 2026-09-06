@@ -50,6 +50,7 @@ use winit::{
 mod actions;
 mod history;
 mod io_jobs;
+mod recovery;
 mod runtime;
 mod session;
 use actions::*;
@@ -72,7 +73,7 @@ static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 use crate::ui::{
     CameraUpdate, FocusRequest, HierarchySelectionGesture, InspectionTarget, ManagerAction,
-    PivotRequest, SessionTab, UiActions, UiInfo, UiState,
+    PivotRequest, RecoveryAction, SessionTab, UiActions, UiInfo, UiState,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -174,15 +175,15 @@ impl Runtime {
             undo_history: VecDeque::new(),
             redo_history: VecDeque::new(),
             repaint_due: None,
+            recovery_scan_pending: true,
+            recovery_candidates: VecDeque::new(),
         };
         if let Some(path) = initial_path
             && let Err(error) = runtime.start_load_path(&path)
         {
             runtime.ui.latest_error = Some(error.to_string());
         }
-        trace.mark("END UI initialization; BEGIN recovery scan/dialogs");
-        runtime.offer_recovery_files();
-        trace.mark("END recovery scan/dialogs; requesting first redraw");
+        trace.mark("END UI initialization; requesting first redraw (recovery deferred)");
         runtime.window.request_redraw();
         Ok(runtime)
     }
@@ -377,6 +378,7 @@ impl Runtime {
             background_stage: background_job.map(|(_, job)| job.stage.as_str()),
             background_progress: background_job.map_or(0.0, |(_, job)| job.progress),
             render_stats: self.renderer.stats(),
+            recovery_file: self.recovery_candidates.front().map(PathBuf::as_path),
         };
         let context = self.egui_context.clone();
         let mut actions = UiActions::default();
@@ -410,7 +412,7 @@ impl Runtime {
         textures_delta.clear();
         trace.mark(format_args!("END GPU frame: {render_result:?}"));
         match render_result {
-            Ok(()) => {}
+            Ok(()) => self.start_recovery_scan_after_frame(),
             Err(RenderError::Surface(SurfaceIssue::Outdated)) => {
                 self.renderer.resize(self.window.inner_size());
                 self.window.request_redraw();
@@ -434,6 +436,10 @@ impl Runtime {
     }
 
     fn handle_ui_actions(&mut self, actions: UiActions) {
+        if let Some(action) = actions.recovery {
+            self.handle_recovery_action(action);
+            return;
+        }
         if let Some(id) = actions.close_session {
             self.request_close_session(id);
             return;
@@ -806,6 +812,10 @@ impl Runtime {
     }
 
     fn start_load_path(&mut self, path: &Path) -> Result<()> {
+        self.start_load_path_with_kind(path, JobKind::Load)
+    }
+
+    fn start_load_path_with_kind(&mut self, path: &Path, kind: JobKind) -> Result<()> {
         let filename = path.file_name().map_or_else(
             || path.display().to_string(),
             |name| name.to_string_lossy().into_owned(),
@@ -848,7 +858,7 @@ impl Runtime {
             BackgroundJob {
                 session_id: self.active_session_id,
                 version: self.document_version,
-                kind: JobKind::Load,
+                kind,
                 stage: "Queued for loading".into(),
                 progress: 0.0,
                 cancel,
@@ -880,6 +890,15 @@ impl Runtime {
     fn poll_background_jobs(&mut self) {
         while let Ok(event) = self.job_receiver.try_recv() {
             match event {
+                JobEvent::RecoveryScanned(result) => match result {
+                    Ok(paths) => self.recovery_candidates = paths.into(),
+                    Err(error) => self.ui.latest_error = Some(error),
+                },
+                JobEvent::RecoveryDiscarded(result) => {
+                    if let Err(error) = result {
+                        self.ui.latest_error = Some(error);
+                    }
+                }
                 JobEvent::Progress {
                     id,
                     stage,
@@ -896,7 +915,12 @@ impl Runtime {
                     };
                     match *result {
                         Ok(JobOutput::Loaded(payload)) => {
-                            self.apply_loaded_job(job.session_id, job.version, *payload);
+                            self.apply_loaded_job(
+                                job.session_id,
+                                job.version,
+                                *payload,
+                                job.kind == JobKind::Recover,
+                            );
                         }
                         Ok(JobOutput::Saved(path)) => {
                             self.apply_saved_job(job.session_id, job.version, path);
@@ -975,12 +999,22 @@ impl Runtime {
         );
     }
 
-    fn apply_loaded_job(&mut self, session_id: u64, version: u64, payload: LoadedPayload) {
+    fn apply_loaded_job(
+        &mut self,
+        session_id: u64,
+        version: u64,
+        payload: LoadedPayload,
+        recovering: bool,
+    ) {
         let original_session = self.active_session_id;
         if session_id != original_session {
             self.activate_session(session_id);
         }
         if self.active_session_id == session_id && self.document_version == version {
+            let recovered_path = match &payload {
+                LoadedPayload::Scene { path, .. } if recovering => Some(path.clone()),
+                _ => None,
+            };
             match payload {
                 LoadedPayload::Structure {
                     filename,
@@ -1052,8 +1086,17 @@ impl Runtime {
                         .max()
                         .unwrap_or(0)
                         .saturating_add(1);
-                    self.loaded_filename = Some(filename);
-                    self.scene_path = Some(path);
+                    self.loaded_filename = Some(if recovering {
+                        let label = if source_name.trim().is_empty() {
+                            &filename
+                        } else {
+                            &source_name
+                        };
+                        format!("{label} (Recovered)")
+                    } else {
+                        filename
+                    });
+                    self.scene_path = (!recovering).then_some(path);
                     self.molecule = Some(molecule);
                     self.hierarchy = Some(hierarchy);
                     self.secondary_structure = Some(secondary_structure);
@@ -1082,8 +1125,8 @@ impl Runtime {
                     self.recalculate_named_selections();
                 }
             }
-            self.dirty = false;
-            self.recovery_path = None;
+            self.dirty = recovered_path.is_some();
+            self.recovery_path = recovered_path;
             self.autosave_due = None;
             self.needs_cartoon_refresh = true;
             self.renderer.update_measurements(&self.measurement_lines);
@@ -1217,86 +1260,6 @@ impl Runtime {
                 cancel,
             },
         );
-        self.ui.latest_error = None;
-        Ok(())
-    }
-
-    fn load_scene_document(
-        &mut self,
-        document: SceneDocument,
-        filename: String,
-        scene_path: Option<PathBuf>,
-        dirty: bool,
-        recovery_path: Option<PathBuf>,
-    ) -> Result<()> {
-        self.begin_new_session();
-        self.ui.document_changed();
-        let SceneDocument {
-            source_name,
-            molecule,
-            display,
-            named_selections,
-            named_selection_expressions,
-            named_selection_styles,
-            measurement_lines,
-            hierarchy_names,
-            inspection,
-            hierarchy_selection,
-            hierarchy_selection_anchor,
-            focus_description,
-            pivot_description,
-            mut camera,
-            ..
-        } = document;
-        let molecule_id = if source_name.trim().is_empty() {
-            molecule_id_from_filename(&filename)
-        } else {
-            molecule_id_from_filename(&source_name)
-        };
-        let hierarchy = MoleculeHierarchy::from_molecule(&molecule);
-        let secondary_structure = assign_secondary_structure(&molecule, &hierarchy);
-        let atom_bvh = AtomBvh::build(&molecule);
-        camera.set_viewport(self.viewport);
-        self.renderer.update_measurements(&measurement_lines);
-        self.next_measurement_id = measurement_lines
-            .iter()
-            .map(|line| line.id)
-            .max()
-            .unwrap_or(0)
-            .saturating_add(1);
-        self.loaded_filename = Some(filename);
-        self.molecule_id = Some(molecule_id);
-        self.scene_path = scene_path;
-        self.molecule = Some(molecule);
-        self.hierarchy = Some(hierarchy);
-        self.secondary_structure = Some(secondary_structure);
-        self.atom_bvh = Some(atom_bvh);
-        self.display = Some(display);
-        self.named_selections = named_selections;
-        self.named_selection_expressions = named_selection_expressions;
-        self.named_selection_styles = named_selection_styles;
-        self.recalculate_named_selections();
-        self.measurement_lines = measurement_lines;
-        self.hierarchy_names = hierarchy_names
-            .into_iter()
-            .map(|(target, name)| (inspection_target(target), name))
-            .collect();
-        self.inspection = inspection.map(inspection_target);
-        self.hierarchy_selection = hierarchy_selection
-            .into_iter()
-            .map(inspection_target)
-            .collect();
-        self.hierarchy_selection_anchor = hierarchy_selection_anchor.map(inspection_target);
-        self.focus_description = focus_description;
-        self.pivot_description = pivot_description;
-        self.camera = camera;
-        self.undo_history.clear();
-        self.redo_history.clear();
-        self.dirty = dirty;
-        self.recovery_path = recovery_path;
-        self.autosave_due = None;
-        self.needs_cartoon_refresh = true;
-        self.schedule_cartoon_job();
         self.ui.latest_error = None;
         Ok(())
     }
@@ -1609,89 +1572,6 @@ impl Runtime {
         }
         if !errors.is_empty() {
             self.ui.latest_error = Some(format!("autosave failed: {}", errors.join("; ")));
-        }
-    }
-
-    fn offer_recovery_files(&mut self) {
-        let Ok(directory) = recovery_directory() else {
-            return;
-        };
-        let Ok(entries) = fs::read_dir(directory) else {
-            return;
-        };
-        let mut paths: Vec<_> = entries
-            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-            .filter(|path| {
-                path.file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.ends_with(".recovery.mol"))
-            })
-            .collect();
-        paths.sort();
-        for path in paths {
-            let contents = match read_local_file_limited(&path) {
-                Ok(contents) => contents,
-                Err(error) => {
-                    self.ui.latest_error = Some(format!(
-                        "could not inspect recovery {}: {error:#}",
-                        path.display()
-                    ));
-                    continue;
-                }
-            };
-            let document = match decode_scene(&contents) {
-                Ok(document) => document,
-                Err(error) => {
-                    self.ui.latest_error = Some(format!(
-                        "invalid recovery document {}: {error}",
-                        path.display()
-                    ));
-                    continue;
-                }
-            };
-            let label = if document.source_name.trim().is_empty() {
-                "untitled molecule".to_owned()
-            } else {
-                document.source_name.clone()
-            };
-            let answer = rfd::MessageDialog::new()
-                .set_parent(self.window.as_ref())
-                .set_level(rfd::MessageLevel::Warning)
-                .set_title("Recovered Molecule scene")
-                .set_description(format!(
-                    "An autosaved scene for “{label}” was found. Restore it?"
-                ))
-                .set_buttons(rfd::MessageButtons::YesNoCancelCustom(
-                    "Restore".into(),
-                    "Discard".into(),
-                    "Later".into(),
-                ))
-                .show();
-            match answer {
-                rfd::MessageDialogResult::Custom(value) if value == "Restore" => {
-                    let filename = format!("{label} (Recovered)");
-                    if let Err(error) =
-                        self.load_scene_document(document, filename, None, true, Some(path.clone()))
-                    {
-                        self.ui.latest_error = Some(error.to_string());
-                    }
-                }
-                rfd::MessageDialogResult::Yes => {
-                    let filename = format!("{label} (Recovered)");
-                    if let Err(error) =
-                        self.load_scene_document(document, filename, None, true, Some(path.clone()))
-                    {
-                        self.ui.latest_error = Some(error.to_string());
-                    }
-                }
-                rfd::MessageDialogResult::Custom(value) if value == "Discard" => {
-                    let _ = fs::remove_file(path);
-                }
-                rfd::MessageDialogResult::No => {
-                    let _ = fs::remove_file(path);
-                }
-                _ => {}
-            }
         }
     }
 

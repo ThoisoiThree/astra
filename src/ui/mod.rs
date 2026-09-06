@@ -248,6 +248,7 @@ pub enum ManagerAction {
 
 #[derive(Debug)]
 pub struct UiActions {
+    pub recovery: Option<RecoveryAction>,
     pub open: bool,
     pub fetch: Option<String>,
     pub cancel_fetch: bool,
@@ -269,6 +270,7 @@ pub struct UiActions {
 impl Default for UiActions {
     fn default() -> Self {
         Self {
+            recovery: None,
             open: false,
             fetch: None,
             cancel_fetch: false,
@@ -298,6 +300,7 @@ pub struct SessionTab {
 
 #[derive(Clone, Copy)]
 pub struct UiInfo<'a> {
+    pub recovery_file: Option<&'a std::path::Path>,
     pub filename: Option<&'a str>,
     pub molecule_id: Option<&'a str>,
     pub session_tabs: &'a [SessionTab],
@@ -472,9 +475,17 @@ impl UiState {
         self.named_expression_editor_window(root.ctx(), &mut actions);
         self.rename_window(root.ctx(), &mut actions);
         self.fetch_window(root.ctx(), info, &mut actions);
+        self.recovery_window(root.ctx(), info.recovery_file, &mut actions);
         actions.viewport = viewport;
         actions
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveryAction {
+    Restore,
+    Discard,
+    Later,
 }
 
 fn target_has_children(target: InspectionTarget) -> bool {

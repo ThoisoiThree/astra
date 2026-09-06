@@ -138,4 +138,6 @@ pub(super) struct Runtime {
     pub(super) undo_history: VecDeque<EditOperation>,
     pub(super) redo_history: VecDeque<EditOperation>,
     pub(super) repaint_due: Option<Instant>,
+    pub(super) recovery_scan_pending: bool,
+    pub(super) recovery_candidates: VecDeque<PathBuf>,
 }

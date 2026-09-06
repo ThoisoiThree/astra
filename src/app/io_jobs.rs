@@ -19,11 +19,16 @@ pub(super) struct BackgroundJob {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum JobKind {
     Load,
+    Recover,
     Save,
     Cartoon,
 }
 
 pub(super) enum JobRequest {
+    ScanRecovery,
+    DiscardRecovery {
+        path: PathBuf,
+    },
     Load {
         id: u64,
         session_id: u64,
@@ -50,6 +55,8 @@ pub(super) enum JobRequest {
 }
 
 pub(super) enum JobEvent {
+    RecoveryScanned(std::result::Result<Vec<PathBuf>, String>),
+    RecoveryDiscarded(std::result::Result<(), String>),
     Progress {
         id: u64,
         stage: &'static str,
@@ -538,6 +545,26 @@ pub(super) fn background_worker(
 ) {
     while let Ok(request) = requests.recv() {
         let (id, result) = match request {
+            JobRequest::ScanRecovery => {
+                let trace = StartupTrace::new("recovery");
+                trace.mark("BEGIN background recovery scan");
+                let result =
+                    recovery_directory().and_then(|directory| recovery::scan_files(&directory));
+                trace.mark("END background recovery scan");
+                let _ = events.send(JobEvent::RecoveryScanned(
+                    result.map_err(|error| format!("{error:#}")),
+                ));
+                window.request_redraw();
+                continue;
+            }
+            JobRequest::DiscardRecovery { path } => {
+                let result = fs::remove_file(&path)
+                    .with_context(|| format!("could not discard recovery {}", path.display()))
+                    .map_err(|error| format!("{error:#}"));
+                let _ = events.send(JobEvent::RecoveryDiscarded(result));
+                window.request_redraw();
+                continue;
+            }
             JobRequest::Load {
                 id,
                 session_id,

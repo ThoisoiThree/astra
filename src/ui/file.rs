@@ -1,6 +1,54 @@
 use super::*;
 
 impl UiState {
+    pub(super) fn recovery_window(
+        &self,
+        context: &egui::Context,
+        path: Option<&std::path::Path>,
+        actions: &mut UiActions,
+    ) {
+        let Some(path) = path else {
+            return;
+        };
+        let mut open = true;
+        egui::Window::new("Recover autosaved scene")
+            .id(egui::Id::new("scene recovery"))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .show(context, |ui| {
+                ui.label("An autosaved scene is available.");
+                let name = path
+                    .file_name()
+                    .unwrap_or(path.as_os_str())
+                    .to_string_lossy();
+                ui.label(name).on_hover_text(path.display().to_string());
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Restore").clicked() {
+                        actions.recovery = Some(RecoveryAction::Restore);
+                    }
+                    if ui
+                        .button("Discard")
+                        .on_hover_text("Delete this autosave")
+                        .clicked()
+                    {
+                        actions.recovery = Some(RecoveryAction::Discard);
+                    }
+                    if ui
+                        .button("Later")
+                        .on_hover_text("Keep autosaves for the next launch")
+                        .clicked()
+                    {
+                        actions.recovery = Some(RecoveryAction::Later);
+                    }
+                });
+            });
+        if !open {
+            actions.recovery = Some(RecoveryAction::Later);
+        }
+    }
+
     pub(super) fn file_panel(
         &mut self,
         button: &egui::Response,

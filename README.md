@@ -80,7 +80,11 @@ to avoid connection overhead. Downloads are stored under `~/downloads/pdb/` and 
 without blocking the UI. Save as
 creates a Molecule 1.0 `.mol` project; subsequent Save operations update that file atomically.
 Unsaved tabs carry a dot indicator, prompt before closing, and are autosaved to a separate recovery
-area after an idle delay. Molecule `.mol` projects are identified by their `MOLECULE` magic; MDL
+area after an idle delay. Recovery discovery runs in the background after the first frame.
+The recovery window offers **Restore**, **Discard**, or **Later**; scene contents are read
+and decoded in the background only after Restore. Later keeps the autosaves for the next
+launch. Recovered scenes remain unsaved until saved to a project file.
+Molecule `.mol` projects are identified by their `MOLECULE` magic; MDL
 Molfile uses the same extension but is reported as unsupported rather than misdecoded.
 
 Open can select one or several files. Every structure or `.mol` scene opens in its own tab
