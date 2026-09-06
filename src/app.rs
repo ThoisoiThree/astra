@@ -48,6 +48,7 @@ use winit::{
 };
 
 mod actions;
+mod closing;
 mod history;
 mod io_jobs;
 mod recovery;
@@ -72,8 +73,8 @@ const AUTOSAVE_DELAY: Duration = Duration::from_secs(10);
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 use crate::ui::{
-    CameraUpdate, FocusRequest, HierarchySelectionGesture, InspectionTarget, ManagerAction,
-    PivotRequest, RecoveryAction, SessionTab, UiActions, UiInfo, UiState,
+    CameraUpdate, CloseAction, FocusRequest, HierarchySelectionGesture, InspectionTarget,
+    ManagerAction, PivotRequest, RecoveryAction, SessionTab, UiActions, UiInfo, UiState,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -175,6 +176,8 @@ impl Runtime {
             undo_history: VecDeque::new(),
             redo_history: VecDeque::new(),
             repaint_due: None,
+            pending_close: None,
+            exit_ready: false,
             recovery_scan_pending: true,
             recovery_candidates: VecDeque::new(),
         };
@@ -190,6 +193,10 @@ impl Runtime {
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, event: WindowEvent) {
         self.poll_background_jobs();
+        if self.exit_ready {
+            event_loop.exit();
+            return;
+        }
         self.poll_fetch_result();
         self.poll_pick_result();
         let egui_response = self.egui_state.on_window_event(&self.window, &event);
@@ -197,6 +204,18 @@ impl Runtime {
         // that response creates a self-sustaining loop even with ControlFlow::Wait.
         if egui_response.repaint && !matches!(event, WindowEvent::RedrawRequested) {
             self.window.request_redraw();
+        }
+        if self.pending_close.is_some()
+            && matches!(
+                event,
+                WindowEvent::KeyboardInput { .. }
+                    | WindowEvent::MouseInput { .. }
+                    | WindowEvent::MouseWheel { .. }
+                    | WindowEvent::CursorMoved { .. }
+                    | WindowEvent::DroppedFile(_)
+            )
+        {
+            return;
         }
         match event {
             WindowEvent::CloseRequested => {
@@ -316,7 +335,7 @@ impl Runtime {
                 self.window.request_redraw();
             }
             WindowEvent::RedrawRequested
-                if self.focused
+                if (self.focused || self.pending_close.is_some())
                     && !self.occluded
                     && self.window.inner_size().width > 0
                     && self.window.inner_size().height > 0 =>
@@ -378,6 +397,11 @@ impl Runtime {
             background_stage: background_job.map(|(_, job)| job.stage.as_str()),
             background_progress: background_job.map_or(0.0, |(_, job)| job.progress),
             render_stats: self.renderer.stats(),
+            close_pending: self.pending_close.is_some(),
+            close_busy: self
+                .pending_close
+                .as_ref()
+                .is_some_and(closing::ClosePlan::is_busy),
             recovery_file: self.recovery_candidates.front().map(PathBuf::as_path),
         };
         let context = self.egui_context.clone();
@@ -436,6 +460,13 @@ impl Runtime {
     }
 
     fn handle_ui_actions(&mut self, actions: UiActions) {
+        if let Some(action) = actions.close_confirmation {
+            self.handle_close_action(action);
+            return;
+        }
+        if self.pending_close.is_some() {
+            return;
+        }
         if let Some(action) = actions.recovery {
             self.handle_recovery_action(action);
             return;
@@ -617,81 +648,6 @@ impl Runtime {
         self.active_session_id = id;
         self.swap_active_document(&mut target);
         self.sync_active_document();
-    }
-
-    fn request_close_session(&mut self, id: u64) {
-        if id != self.active_session_id {
-            self.activate_session(id);
-        }
-        if id == self.active_session_id && self.confirm_active_document_close() {
-            self.close_session(id);
-        }
-    }
-
-    fn request_exit(&mut self) -> bool {
-        let ids = self.session_order.clone();
-        for id in ids {
-            if id != self.active_session_id {
-                self.activate_session(id);
-            }
-            if self.molecule.is_some() && !self.confirm_active_document_close() {
-                return false;
-            }
-        }
-        true
-    }
-
-    fn confirm_active_document_close(&mut self) -> bool {
-        if !self.dirty {
-            return true;
-        }
-        let label = session_label(self.molecule_id.as_deref(), self.loaded_filename.as_deref());
-        let answer = rfd::MessageDialog::new()
-            .set_parent(self.window.as_ref())
-            .set_level(rfd::MessageLevel::Warning)
-            .set_title("Unsaved Molecule scene")
-            .set_description(format!("Save changes to “{label}”?"))
-            .set_buttons(rfd::MessageButtons::YesNoCancelCustom(
-                "Save".into(),
-                "Discard".into(),
-                "Cancel".into(),
-            ))
-            .show();
-        match answer {
-            rfd::MessageDialogResult::Custom(value) if value == "Save" => {
-                let result = if let Some(path) = self.scene_path.clone() {
-                    self.save_scene_to(path)
-                } else {
-                    self.save_scene_as()
-                };
-                if let Err(error) = result {
-                    self.ui.latest_error = Some(error.to_string());
-                    return false;
-                }
-                !self.dirty
-            }
-            rfd::MessageDialogResult::Yes => {
-                let result = if let Some(path) = self.scene_path.clone() {
-                    self.save_scene_to(path)
-                } else {
-                    self.save_scene_as()
-                };
-                if let Err(error) = result {
-                    self.ui.latest_error = Some(error.to_string());
-                    return false;
-                }
-                !self.dirty
-            }
-            rfd::MessageDialogResult::Custom(value) if value == "Discard" => {
-                self.remove_recovery_file();
-                true
-            }
-            rfd::MessageDialogResult::No => {
-                self.remove_recovery_file();
-                true
-            }
-            _ => false,
-        }
     }
 
     fn close_session(&mut self, id: u64) {
@@ -950,6 +906,7 @@ impl Runtime {
         {
             self.schedule_cartoon_job();
         }
+        self.advance_close();
     }
 
     fn schedule_cartoon_job(&mut self) {

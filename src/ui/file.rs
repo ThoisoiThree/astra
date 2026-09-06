@@ -1,6 +1,50 @@
 use super::*;
 
 impl UiState {
+    pub(super) fn close_window(
+        &self,
+        context: &egui::Context,
+        info: UiInfo<'_>,
+        actions: &mut UiActions,
+    ) {
+        let response = egui::Modal::new(egui::Id::new("confirm scene close")).show(context, |ui| {
+            ui.set_min_width(320.0);
+            ui.heading("Unsaved scene");
+            let label = info.filename.or(info.molecule_id).unwrap_or("Untitled");
+            ui.label(format!("Save changes to “{label}”?"));
+            if info.close_busy {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("Waiting for save…");
+                });
+            }
+            if let Some(error) = &self.latest_error {
+                ui.colored_label(ui.visuals().error_fg_color, error);
+            }
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(!info.close_busy, egui::Button::new("Save"))
+                    .clicked()
+                {
+                    actions.close_confirmation = Some(CloseAction::Save);
+                }
+                if ui
+                    .add_enabled(!info.close_busy, egui::Button::new("Discard"))
+                    .clicked()
+                {
+                    actions.close_confirmation = Some(CloseAction::Discard);
+                }
+                if ui.button("Cancel").clicked() {
+                    actions.close_confirmation = Some(CloseAction::Cancel);
+                }
+            });
+        });
+        if response.should_close() {
+            actions.close_confirmation = Some(CloseAction::Cancel);
+        }
+    }
+
     pub(super) fn recovery_window(
         &self,
         context: &egui::Context,

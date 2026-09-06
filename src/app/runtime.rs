@@ -54,9 +54,13 @@ impl ApplicationHandler for AstraApplication {
         if let Some(runtime) = &mut self.runtime {
             runtime.poll_background_jobs();
             runtime.poll_pick_result();
+            if runtime.exit_ready {
+                event_loop.exit();
+                return;
+            }
             runtime.autosave_due_documents();
             let now = Instant::now();
-            let visible = runtime.focused && !runtime.occluded;
+            let visible = (runtime.focused || runtime.pending_close.is_some()) && !runtime.occluded;
             if visible && runtime.repaint_due.is_some_and(|due| due <= now) {
                 runtime.repaint_due = None;
                 runtime.window.request_redraw();
@@ -138,6 +142,8 @@ pub(super) struct Runtime {
     pub(super) undo_history: VecDeque<EditOperation>,
     pub(super) redo_history: VecDeque<EditOperation>,
     pub(super) repaint_due: Option<Instant>,
+    pub(super) pending_close: Option<closing::ClosePlan>,
+    pub(super) exit_ready: bool,
     pub(super) recovery_scan_pending: bool,
     pub(super) recovery_candidates: VecDeque<PathBuf>,
 }

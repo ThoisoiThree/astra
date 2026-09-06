@@ -248,6 +248,7 @@ pub enum ManagerAction {
 
 #[derive(Debug)]
 pub struct UiActions {
+    pub close_confirmation: Option<CloseAction>,
     pub recovery: Option<RecoveryAction>,
     pub open: bool,
     pub fetch: Option<String>,
@@ -270,6 +271,7 @@ pub struct UiActions {
 impl Default for UiActions {
     fn default() -> Self {
         Self {
+            close_confirmation: None,
             recovery: None,
             open: false,
             fetch: None,
@@ -300,6 +302,8 @@ pub struct SessionTab {
 
 #[derive(Clone, Copy)]
 pub struct UiInfo<'a> {
+    pub close_pending: bool,
+    pub close_busy: bool,
     pub recovery_file: Option<&'a std::path::Path>,
     pub filename: Option<&'a str>,
     pub molecule_id: Option<&'a str>,
@@ -474,11 +478,22 @@ impl UiState {
         self.measurement_color_editor_window(root.ctx(), &mut actions);
         self.named_expression_editor_window(root.ctx(), &mut actions);
         self.rename_window(root.ctx(), &mut actions);
-        self.fetch_window(root.ctx(), info, &mut actions);
-        self.recovery_window(root.ctx(), info.recovery_file, &mut actions);
+        if info.close_pending {
+            self.close_window(root.ctx(), info, &mut actions);
+        } else {
+            self.fetch_window(root.ctx(), info, &mut actions);
+            self.recovery_window(root.ctx(), info.recovery_file, &mut actions);
+        }
         actions.viewport = viewport;
         actions
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloseAction {
+    Save,
+    Discard,
+    Cancel,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
