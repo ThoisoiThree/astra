@@ -66,6 +66,11 @@ impl UiState {
                     .show(ui, |ui| {
                         detail(ui, "wgpu version", env!("ASTRA_WGPU_VERSION"));
                         detail(ui, "Active backend", &format!("{:?}", adapter.backend));
+                        detail(
+                            ui,
+                            "Presentation",
+                            &format!("{:?}", info.render_stats.present_mode),
+                        );
                         detail(ui, "GPU", &adapter.name);
                         detail(ui, "Device type", &format!("{:?}", adapter.device_type));
                         detail(ui, "Driver", &adapter.driver);

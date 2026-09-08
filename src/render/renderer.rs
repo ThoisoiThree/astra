@@ -79,6 +79,7 @@ pub enum SurfaceIssue {
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RenderStats {
+    pub present_mode: wgpu::PresentMode,
     pub fps: f32,
     pub cpu_frame_ms: f32,
     pub gpu_pass_ms: [f32; PASS_COUNT],
@@ -223,6 +224,22 @@ impl Renderer {
         let config = surface
             .get_default_config(&adapter, size.width.max(1), size.height.max(1))
             .ok_or(RenderError::SurfaceConfiguration)?;
+        #[cfg(target_os = "windows")]
+        let config = {
+            let mut config = config;
+            let modes = surface.get_capabilities(&adapter).present_modes;
+            // Mailbox accepts newer frames without waiting for the FIFO queue
+            // to drain at vblank, while avoiding Immediate's tearing.
+            config.present_mode = [wgpu::PresentMode::Mailbox, wgpu::PresentMode::Immediate]
+                .into_iter()
+                .find(|mode| modes.contains(mode))
+                .unwrap_or(config.present_mode);
+            crate::diagnostics::write_graphics_log(format_args!(
+                "Presentation: {:?}; supported={modes:?}",
+                config.present_mode
+            ));
+            config
+        };
         surface.configure(&device, &config);
         trace.mark(format_args!(
             "END surface configuration: {config:?}; BEGIN scene pipelines"
@@ -409,6 +426,7 @@ impl Renderer {
             + dof_width * dof_height * 8
             + self.dof.as_ref().map_or(0, DepthOfField::estimated_bytes);
         RenderStats {
+            present_mode: self.config.present_mode,
             fps: self
                 .presented_frames
                 .iter()
