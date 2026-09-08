@@ -105,7 +105,12 @@ impl UiState {
                     .add(egui::Slider::new(&mut sensor_height, 4.0..=70.0).text("Sensor, mm"))
                     .changed();
                 changed |= ui
-                    .add(egui::Slider::new(&mut f_stop, 0.7..=22.0).text("F-stop"))
+                    .add(
+                        egui::Slider::new(&mut f_stop, 0.1..=22.0)
+                            .logarithmic(true)
+                            .max_decimals(2)
+                            .text("F-stop"),
+                    )
                     .changed();
                 changed |= ui
                     .add(egui::Slider::new(&mut max_coc, 1.0..=64.0).text("Max CoC radius, px"))

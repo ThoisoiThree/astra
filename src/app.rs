@@ -1537,7 +1537,7 @@ impl Runtime {
         self.camera
             .set_lens(update.focal_length_mm, update.sensor_height_mm);
         self.camera.depth_of_field.enabled = update.dof_enabled;
-        self.camera.depth_of_field.f_stop = update.f_stop.clamp(0.7, 22.0);
+        self.camera.depth_of_field.f_stop = update.f_stop.clamp(0.1, 22.0);
         self.camera.depth_of_field.blade_count = if update.blade_count < 3 {
             0
         } else {

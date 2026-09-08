@@ -93,45 +93,6 @@ impl UiState {
         }
     }
 
-    pub(super) fn file_panel(
-        &mut self,
-        button: &egui::Response,
-        info: UiInfo<'_>,
-        actions: &mut UiActions,
-    ) {
-        let mut open = self.file_open;
-        let mut close = false;
-        egui::Popup::from_response(button)
-            .open_bool(&mut open)
-            .width(180.0)
-            .show(|ui| {
-                if ui.button("Open").clicked() {
-                    actions.open = true;
-                    close = true;
-                }
-                if ui.button("Fetch").clicked() {
-                    self.fetch_open = true;
-                    close = true;
-                }
-                let has_structure = info.molecule.is_some();
-                if ui
-                    .add_enabled(has_structure, egui::Button::new("Save as…"))
-                    .clicked()
-                {
-                    actions.save_as = true;
-                    close = true;
-                }
-                if ui
-                    .add_enabled(has_structure, egui::Button::new("Save"))
-                    .clicked()
-                {
-                    actions.save = true;
-                    close = true;
-                }
-            });
-        self.file_open = open && !close;
-    }
-
     pub(super) fn fetch_window(
         &mut self,
         context: &egui::Context,

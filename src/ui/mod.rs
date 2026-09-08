@@ -15,6 +15,7 @@ mod camera;
 mod coloring;
 mod file;
 mod hierarchy;
+mod menu;
 mod mode;
 mod selections;
 
@@ -30,7 +31,6 @@ pub struct UiState {
     pub latest_error: Option<String>,
     history: Vec<String>,
     history_cursor: Option<usize>,
-    file_open: bool,
     fetch_open: bool,
     fetch_id: String,
     camera_open: bool,
@@ -339,50 +339,9 @@ pub struct UiInfo<'a> {
 impl UiState {
     pub fn show(&mut self, root: &mut egui::Ui, info: UiInfo<'_>) -> UiActions {
         let mut actions = UiActions::default();
-        let mut file_button = None;
         egui::Panel::top("toolbar").show(root, |ui| {
-            ui.horizontal(|ui| {
-                let response = ui.selectable_label(self.file_open, "File");
-                if response.clicked() {
-                    self.file_open = !self.file_open;
-                }
-                file_button = Some(response);
-                actions.fit = ui.button("Fit").clicked();
-                actions.reset_colors = ui.button("Reset colors").clicked();
-                if ui.selectable_label(self.mode_open, "Mode").clicked() {
-                    self.mode_open = !self.mode_open;
-                }
-                if ui
-                    .selectable_label(self.coloring_open, "Coloring")
-                    .clicked()
-                {
-                    self.coloring_open = !self.coloring_open;
-                }
-                if ui.selectable_label(self.camera_open, "Camera").clicked() {
-                    self.camera_open = !self.camera_open;
-                }
-                if ui.selectable_label(self.actions_open, "Actions").clicked() {
-                    self.actions_open = !self.actions_open;
-                }
-                ui.separator();
-                ui.strong(info.filename.unwrap_or("No molecule loaded"));
-                if let (Some(job_id), Some(stage)) = (info.background_job_id, info.background_stage)
-                {
-                    ui.spinner();
-                    ui.add(
-                        egui::ProgressBar::new(info.background_progress)
-                            .desired_width(110.0)
-                            .text(stage),
-                    );
-                    if ui.small_button("Cancel").clicked() {
-                        actions.cancel_background_job = Some(job_id);
-                    }
-                }
-            });
+            self.toolbar(ui, info, &mut actions);
         });
-        if let Some(response) = &file_button {
-            self.file_panel(response, info, &mut actions);
-        }
 
         egui::Panel::left("molecule manager")
             .default_size(350.0)
