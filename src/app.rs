@@ -356,6 +356,7 @@ impl Runtime {
             .iter()
             .find(|(_, job)| job.session_id == self.active_session_id);
         let info = UiInfo {
+            adapter_info: self.renderer.adapter_info(),
             filename: self.loaded_filename.as_deref(),
             molecule_id: self.molecule_id.as_deref(),
             session_tabs: &session_tabs,

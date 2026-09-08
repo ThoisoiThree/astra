@@ -66,7 +66,7 @@ impl UiState {
             .id(egui::Id::new("camera settings window"))
             .open(&mut open)
             .default_width(330.0)
-            .resizable(false)
+            .resizable(true)
             .show(context, |ui| {
                 ui.heading("Clipping planes");
                 egui::Grid::new("camera clipping settings")

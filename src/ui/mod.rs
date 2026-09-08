@@ -15,8 +15,10 @@ mod camera;
 mod coloring;
 mod file;
 mod hierarchy;
+mod info;
 mod menu;
 mod mode;
+mod panels;
 mod selections;
 
 use actions::*;
@@ -27,6 +29,7 @@ use selections::*;
 
 #[derive(Debug, Default)]
 pub struct UiState {
+    info_open: bool,
     pub command_input: String,
     pub latest_error: Option<String>,
     history: Vec<String>,
@@ -302,6 +305,7 @@ pub struct SessionTab {
 
 #[derive(Clone, Copy)]
 pub struct UiInfo<'a> {
+    pub adapter_info: &'a wgpu::AdapterInfo,
     pub close_pending: bool,
     pub close_busy: bool,
     pub recovery_file: Option<&'a std::path::Path>,
@@ -345,39 +349,43 @@ impl UiState {
 
         egui::Panel::left("molecule manager")
             .default_size(350.0)
-            .size_range(280.0..=520.0)
+            .size_range(220.0..=(root.available_width() * 0.75).max(220.0))
             .resizable(true)
             .show(root, |ui| {
-                molecule_summary(ui, info);
-                ui.add_space(10.0);
-                self.command_editor(ui, &mut actions);
-                if let Some(error) = &self.latest_error {
-                    ui.add_space(6.0);
-                    ui.colored_label(egui::Color32::from_rgb(245, 95, 95), error);
-                }
-                ui.separator();
-                named_selections(
-                    ui,
-                    info,
-                    &mut actions,
-                    &mut self.named_color_editor,
-                    &mut self.named_expression_editor,
-                    &mut self.rename_editor,
-                );
-                ui.separator();
-                inspector(ui, info);
-                if info.inspection.is_some() {
-                    ui.separator();
-                }
-                if !info.measurement_lines.is_empty() {
-                    measurement_lines(
+                panels::section(ui, "structure and expression", 220.0, |ui| {
+                    molecule_summary(ui, info);
+                    ui.add_space(10.0);
+                    self.command_editor(ui, &mut actions);
+                    if let Some(error) = &self.latest_error {
+                        ui.add_space(6.0);
+                        ui.colored_label(egui::Color32::from_rgb(245, 95, 95), error);
+                    }
+                });
+                panels::section(ui, "selection panel", 100.0, |ui| {
+                    named_selections(
                         ui,
                         info,
                         &mut actions,
-                        &mut self.measurement_color_editor,
+                        &mut self.named_color_editor,
+                        &mut self.named_expression_editor,
                         &mut self.rename_editor,
                     );
-                    ui.separator();
+                });
+                if info.inspection.is_some() {
+                    panels::section(ui, "inspector panel", 240.0, |ui| {
+                        inspector(ui, info);
+                    });
+                }
+                if !info.measurement_lines.is_empty() {
+                    panels::section(ui, "measurements panel", 140.0, |ui| {
+                        measurement_lines(
+                            ui,
+                            info,
+                            &mut actions,
+                            &mut self.measurement_color_editor,
+                            &mut self.rename_editor,
+                        );
+                    });
                 }
                 hierarchy_tree(
                     ui,
@@ -437,6 +445,7 @@ impl UiState {
         self.measurement_color_editor_window(root.ctx(), &mut actions);
         self.named_expression_editor_window(root.ctx(), &mut actions);
         self.rename_window(root.ctx(), &mut actions);
+        self.info_window(root.ctx(), info);
         if info.close_pending {
             self.close_window(root.ctx(), info, &mut actions);
         } else {

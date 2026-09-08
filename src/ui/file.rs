@@ -59,7 +59,7 @@ impl UiState {
             .id(egui::Id::new("scene recovery"))
             .open(&mut open)
             .collapsible(false)
-            .resizable(false)
+            .resizable(true)
             .show(context, |ui| {
                 ui.label("An autosaved scene is available.");
                 let name = path

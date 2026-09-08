@@ -175,6 +175,9 @@ impl UiState {
                         self.performance_overlay = !self.performance_overlay;
                     }
                 });
+                if ui.selectable_label(self.info_open, "Info").clicked() {
+                    self.info_open = !self.info_open;
+                }
                 ui.separator();
                 ui.label(info.filename.unwrap_or("No molecule loaded"));
                 if let (Some(job_id), Some(stage)) = (info.background_job_id, info.background_stage)

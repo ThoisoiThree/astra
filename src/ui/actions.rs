@@ -291,7 +291,7 @@ impl UiState {
             .id(egui::Id::new("actions window"))
             .open(&mut open)
             .default_width(340.0)
-            .resizable(false)
+            .resizable(true)
             .show(context, |ui| {
                 ui.heading("Distance line");
                 ui.label("Create from two named selections:");

@@ -117,14 +117,8 @@ enum HierarchyListRow {
     },
 }
 
-fn hierarchy_open(ui: &egui::Ui, id: egui::Id, force_open: bool) -> bool {
-    let mut state =
-        egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, false);
-    if force_open && !state.is_open() {
-        state.set_open(true);
-        state.store(ui.ctx());
-    }
-    state.is_open()
+fn hierarchy_open(ui: &egui::Ui, id: egui::Id) -> bool {
+    egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, false).is_open()
 }
 
 fn disclosure_button(ui: &mut egui::Ui, id: egui::Id) {
@@ -134,18 +128,12 @@ fn disclosure_button(ui: &mut egui::Ui, id: egui::Id) {
     state.store(ui.ctx());
 }
 
-fn visible_hierarchy_rows(
-    ui: &egui::Ui,
-    hierarchy: &MoleculeHierarchy,
-    inspected_atom_path: Option<(usize, usize, usize)>,
-) -> Vec<HierarchyListRow> {
+fn visible_hierarchy_rows(ui: &egui::Ui, hierarchy: &MoleculeHierarchy) -> Vec<HierarchyListRow> {
     let mut rows = Vec::new();
     for (chain_index, chain) in hierarchy.chains.iter().enumerate() {
         rows.push(HierarchyListRow::Chain(chain_index));
-        let chain_on_path = inspected_atom_path
-            .is_some_and(|(inspected_chain, _, _)| inspected_chain == chain_index);
         let chain_id = ui.make_persistent_id(("chain", chain_index));
-        if !hierarchy_open(ui, chain_id, chain_on_path) {
+        if !hierarchy_open(ui, chain_id) {
             continue;
         }
         for (residue_index, residue) in chain.residues.iter().enumerate() {
@@ -153,12 +141,8 @@ fn visible_hierarchy_rows(
                 chain_index,
                 residue_index,
             });
-            let residue_on_path =
-                inspected_atom_path.is_some_and(|(inspected_chain, inspected_residue, _)| {
-                    inspected_chain == chain_index && inspected_residue == residue_index
-                });
             let residue_id = ui.make_persistent_id(("residue", chain_index, residue_index));
-            if hierarchy_open(ui, residue_id, residue_on_path) {
+            if hierarchy_open(ui, residue_id) {
                 rows.extend(residue.atom_indices.iter().copied().map(|atom_index| {
                     HierarchyListRow::Atom {
                         atom_index,
@@ -196,15 +180,7 @@ pub(super) fn hierarchy_tree(
     });
     // Use the same scope for the row list and buttons inside nested layout UIs.
     let tree_id = ui.id();
-    let inspection_id = tree_id.with("last revealed atom");
-    let inspection_changed = ui.ctx().data_mut(|data| {
-        let previous = data.get_temp::<Option<(usize, usize, usize)>>(inspection_id);
-        data.insert_temp(inspection_id, inspected_atom_path);
-        previous != Some(inspected_atom_path)
-    });
-    // Reveal a newly inspected atom once, so a later manual collapse stays closed.
-    let reveal_path = inspected_atom_path.filter(|_| inspection_changed);
-    let rows = visible_hierarchy_rows(ui, hierarchy, reveal_path);
+    let rows = visible_hierarchy_rows(ui, hierarchy);
     let row_height = ui.spacing().interact_size.y;
     egui::ScrollArea::vertical()
         .id_salt("virtual molecule hierarchy")
@@ -508,7 +484,7 @@ mod tests {
     fn virtual_hierarchy_flattens_only_open_branches() {
         let hierarchy = two_residue_hierarchy();
         egui::__run_test_ui(|ui| {
-            assert_eq!(visible_hierarchy_rows(ui, &hierarchy, None).len(), 1);
+            assert_eq!(visible_hierarchy_rows(ui, &hierarchy).len(), 1);
 
             let chain_id = ui.make_persistent_id(("chain", 0));
             let mut chain_state = egui::collapsing_header::CollapsingState::load_with_default_open(
@@ -518,7 +494,7 @@ mod tests {
             );
             chain_state.set_open(true);
             chain_state.store(ui.ctx());
-            assert_eq!(visible_hierarchy_rows(ui, &hierarchy, None).len(), 3);
+            assert_eq!(visible_hierarchy_rows(ui, &hierarchy).len(), 3);
 
             let residue_id = ui.make_persistent_id(("residue", 0, 0));
             let mut residue_state =
@@ -529,7 +505,7 @@ mod tests {
                 );
             residue_state.set_open(true);
             residue_state.store(ui.ctx());
-            assert_eq!(visible_hierarchy_rows(ui, &hierarchy, None).len(), 4);
+            assert_eq!(visible_hierarchy_rows(ui, &hierarchy).len(), 4);
         });
     }
 }

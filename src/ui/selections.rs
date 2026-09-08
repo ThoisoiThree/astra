@@ -554,7 +554,7 @@ impl UiState {
         egui::Window::new("Rename object")
             .id(egui::Id::new("rename object window"))
             .open(&mut open)
-            .resizable(false)
+            .resizable(true)
             .show(context, |ui| {
                 ui.label("Display name");
                 let response = ui.add(

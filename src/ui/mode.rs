@@ -63,7 +63,7 @@ impl UiState {
             .id(egui::Id::new("display mode window"))
             .open(&mut open)
             .default_width(280.0)
-            .resizable(false)
+            .resizable(true)
             .show(context, |ui| {
                 let Some(display) = info.display else {
                     ui.weak("Open a structure to choose its display mode");

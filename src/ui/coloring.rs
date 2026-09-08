@@ -15,7 +15,7 @@ impl UiState {
             .id(egui::Id::new("coloring settings window"))
             .open(&mut open)
             .default_width(320.0)
-            .resizable(false)
+            .resizable(true)
             .show(context, |ui| {
                 let Some(display) = info.display else {
                     ui.weak("Open a PDB file to configure coloring");
@@ -82,7 +82,7 @@ impl UiState {
         egui::Window::new(format!("HSV color · {}", editor.label))
             .id(egui::Id::new("hierarchy HSV color editor"))
             .open(&mut open)
-            .resizable(false)
+            .resizable(true)
             .show(context, |ui| {
                 if egui::color_picker::color_picker_hsva_2d(
                     ui,
@@ -133,7 +133,7 @@ impl UiState {
         egui::Window::new(format!("HSV color · selection {}", editor.name))
             .id(egui::Id::new("named selection HSV color editor"))
             .open(&mut open)
-            .resizable(false)
+            .resizable(true)
             .show(context, |ui| {
                 if egui::color_picker::color_picker_hsva_2d(
                     ui,
@@ -172,7 +172,7 @@ impl UiState {
         egui::Window::new(format!("HSV color · line #{}", editor.id))
             .id(egui::Id::new("measurement line HSV color editor"))
             .open(&mut open)
-            .resizable(false)
+            .resizable(true)
             .show(context, |ui| {
                 if egui::color_picker::color_picker_hsva_2d(
                     ui,

@@ -98,6 +98,7 @@ struct CameraUniform {
 }
 
 pub struct Renderer {
+    adapter_info: wgpu::AdapterInfo,
     instance: wgpu::Instance,
     window: Arc<Window>,
     surface: wgpu::Surface<'static>,
@@ -314,6 +315,7 @@ impl Renderer {
         trace.mark("END profiler and viewport cache; renderer ready");
 
         Ok(Self {
+            adapter_info: adapter.get_info(),
             instance,
             window,
             surface,
@@ -359,6 +361,10 @@ impl Renderer {
 
     pub fn size(&self) -> PhysicalSize<u32> {
         PhysicalSize::new(self.config.width, self.config.height)
+    }
+
+    pub fn adapter_info(&self) -> &wgpu::AdapterInfo {
+        &self.adapter_info
     }
 
     pub fn stats(&self) -> RenderStats {
