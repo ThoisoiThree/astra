@@ -5,6 +5,7 @@ pub(super) fn performance_overlay(
     viewport: egui::Rect,
     stats: astra::render::RenderStats,
 ) {
+    context.request_repaint_after(std::time::Duration::from_millis(250));
     let position = egui::pos2(
         (viewport.right() - 238.0).max(viewport.left()),
         viewport.top() + 8.0,
@@ -15,6 +16,8 @@ pub(super) fn performance_overlay(
         .show(context, |ui| {
             egui::Frame::popup(ui.style()).show(ui, |ui| {
                 ui.strong("Renderer");
+                ui.monospace(format!("FPS        {:>7.0}", stats.fps))
+                    .on_hover_text("Presented frames in the last second; idle rendering is limited to UI updates.");
                 ui.monospace(format!("CPU frame  {:>7.2} ms", stats.cpu_frame_ms));
                 if stats.gpu_timestamps_supported {
                     for (label, milliseconds) in [

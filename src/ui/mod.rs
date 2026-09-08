@@ -251,6 +251,8 @@ pub enum ManagerAction {
 
 #[derive(Debug)]
 pub struct UiActions {
+    #[cfg(target_os = "windows")]
+    pub windows_backend: Option<astra::render::backend::WindowsBackend>,
     pub close_confirmation: Option<CloseAction>,
     pub recovery: Option<RecoveryAction>,
     pub open: bool,
@@ -274,6 +276,8 @@ pub struct UiActions {
 impl Default for UiActions {
     fn default() -> Self {
         Self {
+            #[cfg(target_os = "windows")]
+            windows_backend: None,
             close_confirmation: None,
             recovery: None,
             open: false,
@@ -305,6 +309,8 @@ pub struct SessionTab {
 
 #[derive(Clone, Copy)]
 pub struct UiInfo<'a> {
+    #[cfg(target_os = "windows")]
+    pub windows_backend: astra::render::backend::WindowsBackend,
     pub adapter_info: &'a wgpu::AdapterInfo,
     pub close_pending: bool,
     pub close_busy: bool,
@@ -445,7 +451,7 @@ impl UiState {
         self.measurement_color_editor_window(root.ctx(), &mut actions);
         self.named_expression_editor_window(root.ctx(), &mut actions);
         self.rename_window(root.ctx(), &mut actions);
-        self.info_window(root.ctx(), info);
+        self.info_window(root.ctx(), info, &mut actions);
         if info.close_pending {
             self.close_window(root.ctx(), info, &mut actions);
         } else {

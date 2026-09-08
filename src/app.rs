@@ -177,6 +177,8 @@ impl Runtime {
             redo_history: VecDeque::new(),
             repaint_due: None,
             pending_close: None,
+            #[cfg(target_os = "windows")]
+            windows_backend: astra::render::backend::WindowsBackend::load(),
             exit_ready: false,
             recovery_scan_pending: true,
             recovery_candidates: VecDeque::new(),
@@ -356,6 +358,8 @@ impl Runtime {
             .iter()
             .find(|(_, job)| job.session_id == self.active_session_id);
         let info = UiInfo {
+            #[cfg(target_os = "windows")]
+            windows_backend: self.windows_backend,
             adapter_info: self.renderer.adapter_info(),
             filename: self.loaded_filename.as_deref(),
             molecule_id: self.molecule_id.as_deref(),
@@ -461,6 +465,23 @@ impl Runtime {
     }
 
     fn handle_ui_actions(&mut self, actions: UiActions) {
+        #[cfg(target_os = "windows")]
+        if let Some(backend) = actions.windows_backend {
+            let saved = (|| -> Result<()> {
+                let path = astra::render::backend::WindowsBackend::settings_path()?;
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                atomic_write(&path, backend.label().as_bytes())?;
+                Ok(())
+            })();
+            match saved {
+                Ok(()) => self.windows_backend = backend,
+                Err(error) => {
+                    self.ui.latest_error = Some(format!("Could not save graphics backend: {error}"))
+                }
+            }
+        }
         if let Some(action) = actions.close_confirmation {
             self.handle_close_action(action);
             return;

@@ -1,3 +1,5 @@
+#[cfg(target_os = "windows")]
+pub mod backend;
 mod cartoon;
 mod dof;
 mod instances;

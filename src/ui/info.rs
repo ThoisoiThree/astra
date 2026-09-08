@@ -11,7 +11,12 @@ fn detail(ui: &mut egui::Ui, label: &str, value: &str) {
 }
 
 impl UiState {
-    pub(super) fn info_window(&mut self, context: &egui::Context, info: UiInfo<'_>) {
+    pub(super) fn info_window(
+        &mut self,
+        context: &egui::Context,
+        info: UiInfo<'_>,
+        _actions: &mut UiActions,
+    ) {
         if !self.info_open {
             return;
         }
@@ -66,6 +71,29 @@ impl UiState {
                         detail(ui, "Driver", &adapter.driver);
                         detail(ui, "Driver details / version", &adapter.driver_info);
                     });
+                #[cfg(target_os = "windows")]
+                {
+                    use astra::render::backend::WindowsBackend;
+                    ui.add_space(8.0);
+                    let mut selected = info.windows_backend;
+                    egui::ComboBox::from_label("Backend on next launch")
+                        .selected_text(selected.label())
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut selected,
+                                WindowsBackend::Vulkan,
+                                "Vulkan (default)",
+                            );
+                            ui.selectable_value(&mut selected, WindowsBackend::Dx12, "DX12");
+                        });
+                    if selected != info.windows_backend {
+                        _actions.windows_backend = Some(selected);
+                    }
+                    ui.small("Backend changes require restarting Astra.");
+                    if let Some(error) = &self.latest_error {
+                        ui.colored_label(ui.visuals().error_fg_color, error);
+                    }
+                }
             });
     }
 }

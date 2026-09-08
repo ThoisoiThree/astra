@@ -77,6 +77,7 @@ pub enum SurfaceIssue {
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RenderStats {
+    pub fps: f32,
     pub cpu_frame_ms: f32,
     pub gpu_pass_ms: [f32; PASS_COUNT],
     pub gpu_memory_bytes: u64,
@@ -98,6 +99,7 @@ struct CameraUniform {
 }
 
 pub struct Renderer {
+    presented_frames: std::collections::VecDeque<Instant>,
     adapter_info: wgpu::AdapterInfo,
     instance: wgpu::Instance,
     window: Arc<Window>,
@@ -166,6 +168,12 @@ impl Renderer {
         let trace = StartupTrace::new("gpu-init");
         let size = window.inner_size();
         let descriptor = wgpu::InstanceDescriptor::new_without_display_handle_from_env();
+        #[cfg(target_os = "windows")]
+        let descriptor = {
+            let mut descriptor = descriptor;
+            descriptor.backends = super::backend::WindowsBackend::load().backends();
+            descriptor
+        };
         trace.mark(format_args!(
             "BEGIN instance: backends={:?}, dx12_compiler={:?}",
             descriptor.backends, descriptor.backend_options.dx12.shader_compiler
@@ -315,6 +323,7 @@ impl Renderer {
         trace.mark("END profiler and viewport cache; renderer ready");
 
         Ok(Self {
+            presented_frames: std::collections::VecDeque::new(),
             adapter_info: adapter.get_info(),
             instance,
             window,
@@ -386,6 +395,11 @@ impl Renderer {
             + dof_width * dof_height * 8
             + self.dof.as_ref().map_or(0, DepthOfField::estimated_bytes);
         RenderStats {
+            fps: self
+                .presented_frames
+                .iter()
+                .filter(|frame| frame.elapsed().as_secs_f32() < 1.0)
+                .count() as f32,
             cpu_frame_ms: self.cpu_frame_ms,
             gpu_pass_ms: self
                 .profiler
@@ -1133,6 +1147,15 @@ impl Renderer {
         }
         trace.mark("BEGIN presentation");
         self.queue.present(output);
+        let now = Instant::now();
+        self.presented_frames.push_back(now);
+        while self
+            .presented_frames
+            .front()
+            .is_some_and(|frame| now.duration_since(*frame).as_secs_f32() >= 1.0)
+        {
+            self.presented_frames.pop_front();
+        }
         trace.mark("END presentation");
         self.viewport_cache.revision.commit(scene_key);
         for id in &textures_delta.free {

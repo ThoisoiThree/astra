@@ -85,6 +85,8 @@ impl ApplicationHandler for AstraApplication {
 }
 
 pub(super) struct Runtime {
+    #[cfg(target_os = "windows")]
+    pub(super) windows_backend: astra::render::backend::WindowsBackend,
     pub(super) window: Arc<Window>,
     pub(super) renderer: Renderer,
     pub(super) egui_context: egui::Context,
