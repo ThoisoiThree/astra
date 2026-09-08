@@ -442,6 +442,11 @@ impl Runtime {
         trace.mark(format_args!("END GPU frame: {render_result:?}"));
         match render_result {
             Ok(()) => self.start_recovery_scan_after_frame(),
+            Err(RenderError::DepthOfField(error)) => {
+                self.camera.depth_of_field.enabled = false;
+                self.ui.latest_error = Some(format!("DoF disabled: {error}"));
+                self.window.request_redraw();
+            }
             Err(RenderError::Surface(SurfaceIssue::Outdated)) => {
                 self.renderer.resize(self.window.inner_size());
                 self.window.request_redraw();

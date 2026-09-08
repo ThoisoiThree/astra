@@ -272,6 +272,9 @@ impl DepthOfField {
                 ],
             ),
         ] {
+            crate::diagnostics::write_graphics_log(format_args!(
+                "BEGIN DoF compute pipeline: {entry}"
+            ));
             let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some(entry),
                 layout: None,
@@ -280,6 +283,9 @@ impl DepthOfField {
                 compilation_options: Default::default(),
                 cache: None,
             });
+            crate::diagnostics::write_graphics_log(format_args!(
+                "END DoF compute pipeline: {entry}"
+            ));
             let mut entries = vec![wgpu::BindGroupEntry {
                 binding: 0,
                 resource: post.uniform.as_entire_binding(),

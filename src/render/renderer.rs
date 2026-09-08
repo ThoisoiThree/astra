@@ -59,6 +59,8 @@ pub enum RenderError {
     SurfaceConfiguration,
     #[error("could not acquire the next frame: {0}")]
     Surface(#[from] SurfaceIssue),
+    #[error("Could not initialize DoF: {0}")]
+    DepthOfField(String),
 }
 
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
@@ -172,11 +174,23 @@ impl Renderer {
         let descriptor = {
             let mut descriptor = descriptor;
             descriptor.backends = super::backend::WindowsBackend::load().backends();
+            #[cfg(all(target_env = "msvc", not(target_arch = "aarch64")))]
+            {
+                // DoF requires a modern HLSL compiler; do not silently fall back to FXC.
+                descriptor.backend_options.dx12.shader_compiler = wgpu::Dx12Compiler::StaticDxc;
+            }
             descriptor
         };
         trace.mark(format_args!(
             "BEGIN instance: backends={:?}, dx12_compiler={:?}",
             descriptor.backends, descriptor.backend_options.dx12.shader_compiler
+        ));
+        #[cfg(target_os = "windows")]
+        crate::diagnostics::write_graphics_log(format_args!(
+            "wgpu {}: backends={:?}, dx12_compiler={:?}",
+            env!("ASTRA_WGPU_VERSION"),
+            descriptor.backends,
+            descriptor.backend_options.dx12.shader_compiler
         ));
         let instance = wgpu::Instance::new(descriptor);
         trace.mark("END instance; BEGIN surface creation");
@@ -617,12 +631,38 @@ impl Renderer {
                 || self.dof.as_ref().is_none_or(|dof| dof.size != dof_size))
         {
             self.dof = None;
-            self.dof = Some(DepthOfField::new(
+            crate::diagnostics::write_graphics_log(format_args!(
+                "BEGIN DoF initialization: {:?}, size={dof_size:?}",
+                self.adapter_info
+            ));
+            let memory_scope = self.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+            let internal_scope = self.device.push_error_scope(wgpu::ErrorFilter::Internal);
+            let validation_scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+            let dof = DepthOfField::new(
                 &self.device,
                 &self.camera_layout,
                 &self.post_process,
                 &self.depth.view,
-            ));
+            );
+            // These scopes only contain synchronous resource/pipeline creation, no
+            // submitted GPU work. Pop every scope even when the first reports an error.
+            let errors = [
+                pollster::block_on(validation_scope.pop()),
+                pollster::block_on(internal_scope.pop()),
+                pollster::block_on(memory_scope.pop()),
+            ];
+            let errors = errors
+                .into_iter()
+                .flatten()
+                .map(|error| error.to_string())
+                .collect::<Vec<_>>();
+            if !errors.is_empty() {
+                let message = errors.join("\n");
+                crate::diagnostics::write_graphics_log(&message);
+                return Err(RenderError::DepthOfField(message));
+            }
+            crate::diagnostics::write_graphics_log("END DoF initialization");
+            self.dof = Some(dof);
         } else if !dof_enabled {
             self.dof = None;
         }
