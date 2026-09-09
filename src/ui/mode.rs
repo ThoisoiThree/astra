@@ -18,13 +18,25 @@ pub(super) fn performance_overlay(
                 ui.strong("Renderer");
                 ui.monospace(format!("FPS        {:>7.0}", stats.fps))
                     .on_hover_text("Presented frames in the last second; idle rendering is limited to UI updates.");
-                ui.monospace(format!("CPU frame  {:>7.2} ms", stats.cpu_frame_ms));
+                ui.monospace(format!("Frame wall {:>7.2} ms", stats.cpu_frame_ms))
+                    .on_hover_text("Renderer elapsed time, including driver/GPU waits; not CPU utilization or the frame interval.");
+                for (label, time) in ["Prepare", "Encode", "Acquire", "Submit", "Present"]
+                    .into_iter().zip(stats.cpu_stages_ms)
+                {
+                    ui.monospace(format!("{label:<10} {time:>7.2} ms"));
+                }
+                ui.separator();
                 if stats.gpu_timestamps_supported {
+                    ui.monospace(format!("GPU span   {:>7.2} ms", stats.gpu_frame_ms))
+                        .on_hover_text("First measured start to last measured end in one sampled frame. Pass intervals below may overlap or include dependency waits; do not sum them.");
                     for (label, milliseconds) in [
                         ("Scene", stats.gpu_pass_ms[0]),
                         ("AO raw", stats.gpu_pass_ms[1]),
                         ("AO blur", stats.gpu_pass_ms[2]),
-                        ("DOF", stats.gpu_pass_ms[3]),
+                        ("DOF span", stats.gpu_dof_ms),
+                        ("DOF layers", stats.gpu_pass_ms[3]),
+                        ("DOF merge", stats.gpu_pass_ms[7]),
+                        ("DOF splat", stats.gpu_pass_ms[8]),
                         ("Compose", stats.gpu_pass_ms[4]),
                         ("Labels", stats.gpu_pass_ms[5]),
                         ("UI", stats.gpu_pass_ms[6]),

@@ -77,7 +77,7 @@ async fn run() -> Result<()> {
             &depth.view,
         );
         post.set_dof_scale(&device, width, height, &depth.view, scale);
-        let dof = dof::DepthOfField::new(&device, &camera_layout, &post, &depth.view);
+        let dof = dof::DepthOfField::new_validation(&device, &camera_layout, &post, &depth.view);
         let projection =
             glam::camera::rh::proj::directx::orthographic(-1.0, 1.0, -1.0, 1.0, 1.0, 101.0);
         let mut uniform = PostUniform {
@@ -189,9 +189,10 @@ async fn run() -> Result<()> {
                 dof.encode_splat(&mut encoder, None);
             }
             let bytes_per_row = (dof.size[0] * 8).div_ceil(256) * 256;
+            let image_bytes = u64::from(bytes_per_row) * u64::from(dof.size[1]);
             let buffer = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("DOF regression readback"),
-                size: u64::from(bytes_per_row * dof.size[1]),
+                size: image_bytes * 2,
                 usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
                 mapped_at_creation: false,
             });
@@ -216,6 +217,30 @@ async fn run() -> Result<()> {
                     depth_or_array_layers: 1,
                 },
             );
+            if !oracle {
+                dof.encode_dense_comparison(&mut encoder);
+                encoder.copy_texture_to_buffer(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &post.dof_color._texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::TexelCopyBufferInfo {
+                        buffer: &buffer,
+                        layout: wgpu::TexelCopyBufferLayout {
+                            offset: image_bytes,
+                            bytes_per_row: Some(bytes_per_row),
+                            rows_per_image: None,
+                        },
+                    },
+                    wgpu::Extent3d {
+                        width: dof.size[0],
+                        height: dof.size[1],
+                        depth_or_array_layers: 1,
+                    },
+                );
+            }
             queue.submit([encoder.finish()]);
             let (sender, receiver) = std::sync::mpsc::channel();
             buffer.map_async(wgpu::MapMode::Read, .., move |r| {
@@ -235,6 +260,19 @@ async fn run() -> Result<()> {
                         ]))
                     }));
                     ensure!(actual.is_finite(), "nonfinite DOF at {x},{y}");
+                    if !oracle {
+                        let dense_offset = image_bytes as usize + offset;
+                        let dense = Vec3::from_array(std::array::from_fn(|c| {
+                            decode_half(u16::from_le_bytes([
+                                bytes[dense_offset + c * 2],
+                                bytes[dense_offset + c * 2 + 1],
+                            ]))
+                        }));
+                        ensure!(
+                            dense.is_finite() && (actual - dense).abs().max_element() <= 0.001,
+                            "compact and dense DoF differ at {x},{y}: {actual:?} vs {dense:?}"
+                        );
+                    }
                     let expected = if mode >= 4 {
                         gradient_reference(x, y, dof.size, &uniform)
                     } else if mode == 3 {

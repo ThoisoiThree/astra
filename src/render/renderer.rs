@@ -82,7 +82,11 @@ pub struct RenderStats {
     pub present_mode: wgpu::PresentMode,
     pub fps: f32,
     pub cpu_frame_ms: f32,
+    /// Wall times for preparation, encoding, surface acquisition, submission and presentation.
+    pub cpu_stages_ms: [f32; 5],
     pub gpu_pass_ms: [f32; PASS_COUNT],
+    pub gpu_frame_ms: f32,
+    pub gpu_dof_ms: f32,
     pub gpu_memory_bytes: u64,
     pub atom_instances: u32,
     pub bond_instances: u32,
@@ -144,6 +148,7 @@ pub struct Renderer {
     pending_pick: Option<PendingPickReadback>,
     profiler: Option<GpuProfiler>,
     cpu_frame_ms: f32,
+    cpu_stages_ms: [f32; 5],
 }
 
 pub struct PreparedCartoon(CartoonRenderData);
@@ -396,6 +401,7 @@ impl Renderer {
             pending_pick: None,
             profiler,
             cpu_frame_ms: 0.0,
+            cpu_stages_ms: [0.0; 5],
         })
     }
 
@@ -433,10 +439,19 @@ impl Renderer {
                 .filter(|frame| frame.elapsed().as_secs_f32() < 1.0)
                 .count() as f32,
             cpu_frame_ms: self.cpu_frame_ms,
+            cpu_stages_ms: self.cpu_stages_ms,
             gpu_pass_ms: self
                 .profiler
                 .as_ref()
                 .map_or([0.0; PASS_COUNT], GpuProfiler::latest_ms),
+            gpu_frame_ms: self
+                .profiler
+                .as_ref()
+                .map_or(0.0, GpuProfiler::latest_frame_ms),
+            gpu_dof_ms: self
+                .profiler
+                .as_ref()
+                .map_or(0.0, GpuProfiler::latest_dof_ms),
             gpu_memory_bytes: dynamic_bytes
                 + self.sphere.estimated_bytes
                 + self.cylinder.estimated_bytes
@@ -644,6 +659,10 @@ impl Renderer {
             self.post_process.dof_color._texture.width(),
             self.post_process.dof_color._texture.height(),
         ];
+        if previous_dof_scale != self.post_process.dof_scale {
+            // Bind groups reference the output texture, even if rounded dimensions match.
+            self.dof = None;
+        }
         if dof_enabled
             && (previous_dof_scale != self.post_process.dof_scale
                 || self.dof.as_ref().is_none_or(|dof| dof.size != dof_size))
@@ -681,9 +700,9 @@ impl Renderer {
             }
             crate::diagnostics::write_graphics_log("END DoF initialization");
             self.dof = Some(dof);
-        } else if !dof_enabled {
-            self.dof = None;
         }
+        // Keep resources while disabled: toggling the lens must not recompile
+        // every shader. Resize or a changed target size still replaces them.
         let view_projection = camera.view_projection();
         let forward = camera.optical_axis();
         let mut camera_right = forward.cross(Vec3::Y).normalize_or_zero();
@@ -783,6 +802,8 @@ impl Renderer {
         }
 
         trace.mark("END frame preparation; BEGIN surface acquisition");
+        let prepare_ms = cpu_start.elapsed().as_secs_f32() * 1_000.0;
+        let acquire_start = Instant::now();
         let output = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(output)
             | wgpu::CurrentSurfaceTexture::Suboptimal(output) => output,
@@ -794,6 +815,8 @@ impl Renderer {
                 return Err(SurfaceIssue::Validation.into());
             }
         };
+        let acquire_ms = acquire_start.elapsed().as_secs_f32() * 1_000.0;
+        let encode_start = Instant::now();
         trace.mark("END surface acquisition; BEGIN command encoding");
         let view = output
             .texture
@@ -968,12 +991,14 @@ impl Renderer {
             let mut timestamps = self.profiler.as_ref().map(|p| p.writes(ProfilePass::Dof));
             let end_timestamps = timestamps
                 .as_ref()
-                .map(|t| wgpu::ComputePassTimestampWrites {
+                .map(|t| wgpu::RenderPassTimestampWrites {
                     query_set: t.query_set,
                     beginning_of_pass_write_index: None,
                     end_of_pass_write_index: t.end_of_pass_write_index,
                 });
-            if let Some(t) = &mut timestamps {
+            if let Some(t) = &mut timestamps
+                && quality.dof_layer_count() > 1
+            {
                 t.end_of_pass_write_index = None;
             }
             {
@@ -1023,6 +1048,14 @@ impl Renderer {
             }
             dof.encode_mask(&mut encoder);
             for layer in 1..quality.dof_layer_count() {
+                let peel_timestamps = end_timestamps
+                    .as_ref()
+                    .filter(|_| layer + 1 == quality.dof_layer_count())
+                    .map(|t| wgpu::RenderPassTimestampWrites {
+                        query_set: t.query_set,
+                        beginning_of_pass_write_index: None,
+                        end_of_pass_write_index: t.end_of_pass_write_index,
+                    });
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("DOF partial depth peeling"),
                     color_attachments: &[
@@ -1045,7 +1078,7 @@ impl Renderer {
                         }),
                         stencil_ops: None,
                     }),
-                    timestamp_writes: None,
+                    timestamp_writes: peel_timestamps,
                     occlusion_query_set: None,
                     multiview_mask: None,
                 });
@@ -1068,7 +1101,21 @@ impl Renderer {
                     &dof.toon_pipeline,
                 );
             }
-            dof.encode_splat(&mut encoder, end_timestamps);
+            let compute_timestamps = |kind| {
+                self.profiler.as_ref().map(|p| {
+                    let t = p.writes(kind);
+                    wgpu::ComputePassTimestampWrites {
+                        query_set: t.query_set,
+                        beginning_of_pass_write_index: t.beginning_of_pass_write_index,
+                        end_of_pass_write_index: t.end_of_pass_write_index,
+                    }
+                })
+            };
+            dof.encode_splat_profiled(
+                &mut encoder,
+                compute_timestamps(ProfilePass::DofReduce),
+                compute_timestamps(ProfilePass::DofSplat),
+            );
         }
         if scene_changed {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -1186,8 +1233,12 @@ impl Renderer {
             .as_mut()
             .and_then(|profiler| profiler.encode_readback(&self.device, &mut encoder));
         trace.mark("END command encoding; BEGIN queue submission");
+        let command_buffer = encoder.finish();
+        let encode_ms = encode_start.elapsed().as_secs_f32() * 1_000.0;
+        let submit_start = Instant::now();
         self.queue
-            .submit(callback_buffers.into_iter().chain([encoder.finish()]));
+            .submit(callback_buffers.into_iter().chain([command_buffer]));
+        let submit_ms = submit_start.elapsed().as_secs_f32() * 1_000.0;
         trace.mark("END queue submission");
         if let (Some(profiler), Some(buffer)) = (&mut self.profiler, profile_readback) {
             profiler.begin_readback(buffer);
@@ -1204,7 +1255,9 @@ impl Renderer {
             });
         }
         trace.mark("BEGIN presentation");
+        let present_start = Instant::now();
         self.queue.present(output);
+        let present_ms = present_start.elapsed().as_secs_f32() * 1_000.0;
         let now = Instant::now();
         self.presented_frames.push_back(now);
         while self
@@ -1220,6 +1273,17 @@ impl Renderer {
             self.egui_renderer.free_texture(id);
         }
         let elapsed_ms = cpu_start.elapsed().as_secs_f32() * 1_000.0;
+        for (smoothed, sample) in self
+            .cpu_stages_ms
+            .iter_mut()
+            .zip([prepare_ms, encode_ms, acquire_ms, submit_ms, present_ms])
+        {
+            *smoothed = if self.cpu_frame_ms == 0.0 {
+                sample
+            } else {
+                *smoothed * 0.9 + sample * 0.1
+            };
+        }
         self.cpu_frame_ms = if self.cpu_frame_ms == 0.0 {
             elapsed_ms
         } else {

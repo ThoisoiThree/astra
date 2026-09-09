@@ -71,7 +71,7 @@ pub(super) fn validate(
         let depth = targets::DepthTarget::new(device, width, height);
         let mut post = PostProcess::new(device, renderer::SCENE_FORMAT, width, height, &depth.view);
         post.set_dof_scale(device, width, height, &depth.view, scale);
-        let dof = dof::DepthOfField::new(device, camera_layout, &post, &depth.view);
+        let dof = dof::DepthOfField::new_validation(device, camera_layout, &post, &depth.view);
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("molecular regression scene layout"),
             bind_group_layouts: &[Some(camera_layout)],

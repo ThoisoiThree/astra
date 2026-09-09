@@ -88,40 +88,41 @@ impl AmbientOcclusionQuality {
 
     pub const fn sample_count(self) -> u32 {
         match self {
-            Self::Preview => 12,
-            Self::Medium => 32,
-            Self::High => 48,
+            Self::Preview => 6,
+            Self::Medium => 12,
+            Self::High => 32,
         }
     }
 
     pub const fn dof_layer_count(self) -> u32 {
         match self {
-            Self::Preview => 3,
-            Self::Medium => 4,
-            Self::High => 5,
+            Self::Preview => 2,
+            Self::Medium => 3,
+            Self::High => 4,
         }
     }
 
     pub const fn dof_resolution_scale(self) -> f32 {
         match self {
-            Self::Preview => 0.5,
-            Self::Medium | Self::High => 1.0,
+            Self::Preview => 0.25,
+            Self::Medium => 0.5,
+            Self::High => 1.0,
         }
     }
 
     pub const fn cartoon_samples_per_residue(self) -> usize {
         match self {
-            Self::Preview => 5,
-            Self::Medium => 10,
-            Self::High => 14,
+            Self::Preview => 3,
+            Self::Medium => 5,
+            Self::High => 10,
         }
     }
 
     pub const fn cartoon_width_segments(self) -> u32 {
         match self {
-            Self::Preview => 4,
-            Self::Medium => 8,
-            Self::High => 12,
+            Self::Preview => 2,
+            Self::Medium => 4,
+            Self::High => 8,
         }
     }
 }

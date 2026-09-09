@@ -1,6 +1,6 @@
 use std::{cell::Cell, sync::mpsc};
 
-pub(super) const PASS_COUNT: usize = 7;
+pub(super) const PASS_COUNT: usize = 9;
 const QUERY_COUNT: u32 = (PASS_COUNT * 2) as u32;
 const QUERY_BYTES: u64 = QUERY_COUNT as u64 * std::mem::size_of::<u64>() as u64;
 
@@ -13,12 +13,14 @@ pub(super) enum ProfilePass {
     Compose = 4,
     Annotations = 5,
     Ui = 6,
+    DofReduce = 7,
+    DofSplat = 8,
 }
 
 struct PendingReadback {
     buffer: wgpu::Buffer,
     receiver: mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>,
-    active_mask: u8,
+    active_mask: u16,
 }
 
 pub(super) struct GpuProfiler {
@@ -27,8 +29,10 @@ pub(super) struct GpuProfiler {
     timestamp_period_ns: f32,
     pending: Option<PendingReadback>,
     latest_ms: [f32; PASS_COUNT],
+    latest_frame_ms: f32,
+    latest_dof_ms: f32,
     frame_index: u64,
-    active_mask: Cell<u8>,
+    active_mask: Cell<u16>,
 }
 
 impl GpuProfiler {
@@ -51,6 +55,8 @@ impl GpuProfiler {
                 timestamp_period_ns: queue.get_timestamp_period(),
                 pending: None,
                 latest_ms: [0.0; PASS_COUNT],
+                latest_frame_ms: 0.0,
+                latest_dof_ms: 0.0,
                 frame_index: 0,
                 active_mask: Cell::new(0),
             })
@@ -87,6 +93,18 @@ impl GpuProfiler {
             && let Ok(mapped) = pending.buffer.get_mapped_range(0..QUERY_BYTES)
         {
             let timestamps = bytemuck::cast_slice::<u8, u64>(&mapped);
+            // Pass intervals can overlap or include dependency waits. Report
+            // elapsed ranges, not a sum that counts the same GPU interval twice.
+            self.latest_frame_ms =
+                timestamp_span_ms(timestamps, pending.active_mask, self.timestamp_period_ns);
+            let dof_mask = (1 << ProfilePass::Dof as u8)
+                | (1 << ProfilePass::DofReduce as u8)
+                | (1 << ProfilePass::DofSplat as u8);
+            self.latest_dof_ms = timestamp_span_ms(
+                timestamps,
+                pending.active_mask & dof_mask,
+                self.timestamp_period_ns,
+            );
             for (index, pair) in timestamps.chunks_exact(2).enumerate() {
                 self.latest_ms[index] = if pending.active_mask & (1 << index) != 0 {
                     pair[1].saturating_sub(pair[0]) as f32 * self.timestamp_period_ns / 1_000_000.0
@@ -134,4 +152,23 @@ impl GpuProfiler {
     pub(super) fn latest_ms(&self) -> [f32; PASS_COUNT] {
         self.latest_ms
     }
+
+    pub(super) fn latest_frame_ms(&self) -> f32 {
+        self.latest_frame_ms
+    }
+    pub(super) fn latest_dof_ms(&self) -> f32 {
+        self.latest_dof_ms
+    }
+}
+
+fn timestamp_span_ms(timestamps: &[u64], mask: u16, period_ns: f32) -> f32 {
+    let mut first = u64::MAX;
+    let mut last = 0;
+    for (index, pair) in timestamps.chunks_exact(2).enumerate() {
+        if mask & (1 << index) != 0 {
+            first = first.min(pair[0]);
+            last = last.max(pair[1]);
+        }
+    }
+    last.saturating_sub(first) as f32 * period_ns / 1_000_000.0
 }

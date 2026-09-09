@@ -2,6 +2,22 @@
 // Output occupies surviving source slots, so positions need no lossy encoding.
 @group(0) @binding(7) var reduced_target: texture_storage_2d_array<rgba32uint, write>;
 @group(0) @binding(8) var reduced_source: texture_2d_array<u32>;
+@group(0) @binding(9) var block_counts: texture_2d<u32>;
+@group(0) @binding(10) var block_sources: texture_2d_array<u32>;
+@group(0) @binding(11) var block_counts_target: texture_storage_2d<r32uint, write>;
+@group(0) @binding(12) var block_sources_target: texture_storage_2d_array<rgba32uint, write>;
+
+fn store_block_sources(block: vec2<u32>, slot: u32, sources: vec4<u32>) {
+    let texel = (slot % 16u) / 4u;
+    let p = vec2<i32>(block * 2u + vec2<u32>(texel % 2u, texel / 2u));
+    textureStore(block_sources_target, p, i32(slot / 16u), sources);
+}
+
+fn block_source(block: vec2<i32>, slot: u32) -> u32 {
+    let texel = (slot % 16u) / 4u;
+    let p = block * 2 + vec2<i32>(i32(texel % 2u), i32(texel / 2u));
+    return textureLoad(block_sources, p, i32(slot / 16u), 0)[slot % 4u];
+}
 
 struct ReducedFragment {
     color: vec3<f32>,
@@ -104,7 +120,9 @@ fn reduce(@builtin(global_invocation_id) id: vec3<u32>) {
         for (var x = 0; x < 4; x++) {
             let p = origin + vec2<i32>(x,y);
             if any(p >= size) { continue; }
-            for (var layer = 0u; layer < HOST_MAX_DOF_LAYERS; layer++) {
+            // Splat traversal only reads active layers; newly enabled layers are
+            // cleared on the next reduction before any of their records are read.
+            for (var layer = 0u; layer < active_layer_count(); layer++) {
                 textureStore(reduced_target, p, i32(layer), vec4<u32>(0u));
             }
         }
@@ -142,6 +160,7 @@ fn reduce(@builtin(global_invocation_id) id: vec3<u32>) {
         }
         var cursors = vec4<u32>(0u);
         var output_count = 0u;
+        var source_ids = vec4<u32>(0u);
         loop {
             var heads: array<ReducedFragment, 4>;
             var nearest = 4u;
@@ -179,8 +198,22 @@ fn reduce(@builtin(global_invocation_id) id: vec3<u32>) {
                 }
                 quadrants[step * MAX_QUADRANT_FRAGMENTS + at] = output;
                 output_count++;
-            } else { emit_fragment(output); }
+            } else {
+                emit_fragment(output);
+                source_ids[output_count % 4u] = output.source;
+                if output_count % 4u == 3u {
+                    store_block_sources(id.xy, output_count, source_ids);
+                }
+                output_count++;
+            }
         }
         if step < 4u { quadrant_counts[step] = output_count; }
+        else {
+            if output_count % 4u != 0u {
+                store_block_sources(id.xy, output_count - 1u, source_ids);
+            }
+            // Slots beyond the count are never consumed; no full-list clear is needed.
+            textureStore(block_counts_target, vec2<i32>(id.xy), vec4<u32>(output_count));
+        }
     }
 }

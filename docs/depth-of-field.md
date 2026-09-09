@@ -100,9 +100,9 @@ for depth reconstruction and image mapping.
 
 | Quality | Depth layers | DOF resolution |
 | --- | ---: | ---: |
-| Preview | 3 | Half |
-| Medium | 4 | Full |
-| High | 5 | Full |
+| Preview | 2 | Quarter |
+| Medium | 3 | Half |
+| High | 4 | Full |
 
 DOF remains opt-in in the Camera panel. This is the sole DOF algorithm once
 enabled; the former stochastic aperture gather is removed. UI and measurement

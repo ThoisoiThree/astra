@@ -61,7 +61,7 @@ impl PostProcess {
             height,
             AO_FORMAT,
         );
-        let dof_scale = 0.5;
+        let dof_scale = crate::AmbientOcclusionQuality::default().dof_resolution_scale();
         let dof_color = ColorTarget::new_storage(
             device,
             "depth of field color",
@@ -373,7 +373,7 @@ impl PostProcess {
         depth_view: &wgpu::TextureView,
         scale: f32,
     ) {
-        let scale = scale.clamp(0.5, 1.0);
+        let scale = scale.clamp(0.25, 1.0);
         if (self.dof_scale - scale).abs() <= f32::EPSILON {
             return;
         }

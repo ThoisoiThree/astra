@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="746" height="1054" viewBox="249 99 746 1054" role="img" aria-labelledby="title desc">
+<title id="title">Astra — logo with wordmark</title>
+<desc id="desc">Vector reconstruction of the supplied Astra logo. Blue ribbon arrows, purple ribbons, and a six-spoke central symbol. Transparent background; all lettering is outlined.</desc>
+<defs>
+  <linearGradient id="cyan" gradientUnits="userSpaceOnUse" x1="311" y1="322" x2="463" y2="338"><stop stop-color="#55c9ee"/><stop offset=".55" stop-color="#65c9e8"/><stop offset="1" stop-color="#43b5e4"/></linearGradient>
+  <linearGradient id="blue-fold" gradientUnits="userSpaceOnUse" x1="423" y1="304" x2="530" y2="449"><stop stop-color="#1377cf"/><stop offset=".56" stop-color="#288bd0"/><stop offset="1" stop-color="#329ed9"/></linearGradient>
+  <linearGradient id="blue-inner" gradientUnits="userSpaceOnUse" x1="367" y1="406" x2="519" y2="495"><stop stop-color="#47b7df"/><stop offset=".5" stop-color="#37a1d9"/><stop offset="1" stop-color="#197bcc"/></linearGradient>
+  <linearGradient id="blue-arrow" gradientUnits="userSpaceOnUse" x1="306" y1="342" x2="407" y2="415"><stop stop-color="#007cd9"/><stop offset=".58" stop-color="#0875d0"/><stop offset="1" stop-color="#0870c8"/></linearGradient>
+  <linearGradient id="lower-cyan" gradientUnits="userSpaceOnUse" x1="304" y1="732" x2="462" y2="722"><stop stop-color="#51c8ed"/><stop offset=".55" stop-color="#68cbe8"/><stop offset="1" stop-color="#43b6e2"/></linearGradient>
+  <linearGradient id="lower-fold" gradientUnits="userSpaceOnUse" x1="422" y1="750" x2="535" y2="620"><stop stop-color="#137bcf"/><stop offset=".5" stop-color="#2589ce"/><stop offset="1" stop-color="#359fda"/></linearGradient>
+  <linearGradient id="lower-inner" gradientUnits="userSpaceOnUse" x1="366" y1="633" x2="525" y2="560"><stop stop-color="#43b7e0"/><stop offset=".5" stop-color="#329ed8"/><stop offset="1" stop-color="#1a7bcc"/></linearGradient>
+  <linearGradient id="lower-arrow" gradientUnits="userSpaceOnUse" x1="313" y1="722" x2="390" y2="635"><stop stop-color="#007cda"/><stop offset="1" stop-color="#0872cc"/></linearGradient>
+  <linearGradient id="purple-top-back" gradientUnits="userSpaceOnUse" x1="601" y1="198" x2="657" y2="269"><stop stop-color="#b09ded"/><stop offset=".52" stop-color="#9882e0"/><stop offset="1" stop-color="#4b3abc"/></linearGradient>
+  <linearGradient id="purple-top-tip" gradientUnits="userSpaceOnUse" x1="606" y1="145" x2="557" y2="253"><stop stop-color="#9275e6"/><stop offset=".52" stop-color="#9376df"/><stop offset="1" stop-color="#4930b3"/></linearGradient>
+  <linearGradient id="purple-top-front" gradientUnits="userSpaceOnUse" x1="565" y1="371" x2="699" y2="281"><stop stop-color="#4d36b8"/><stop offset=".43" stop-color="#8d6ee0"/><stop offset="1" stop-color="#9d7de3"/></linearGradient>
+  <linearGradient id="purple-top-tail" gradientUnits="userSpaceOnUse" x1="575" y1="369" x2="665" y2="425"><stop stop-color="#b29cef"/><stop offset=".6" stop-color="#bda7f4"/><stop offset="1" stop-color="#b19bec"/></linearGradient>
+  <linearGradient id="purple-bottom-back" gradientUnits="userSpaceOnUse" x1="586" y1="647" x2="674" y2="703"><stop stop-color="#b7a1f0"/><stop offset=".5" stop-color="#a68be9"/><stop offset="1" stop-color="#8260d5"/></linearGradient>
+  <linearGradient id="purple-bottom-front" gradientUnits="userSpaceOnUse" x1="568" y1="789" x2="690" y2="696"><stop stop-color="#9f7ee4"/><stop offset=".5" stop-color="#9070dc"/><stop offset="1" stop-color="#4a35b8"/></linearGradient>
+  <linearGradient id="purple-bottom-fold" gradientUnits="userSpaceOnUse" x1="571" y1="807" x2="648" y2="860"><stop stop-color="#4931b5"/><stop offset=".55" stop-color="#8d6fdd"/><stop offset="1" stop-color="#9d7ce1"/></linearGradient>
+  <linearGradient id="purple-bottom-tip" gradientUnits="userSpaceOnUse" x1="677" y1="809" x2="643" y2="904"><stop stop-color="#5038b8"/><stop offset=".45" stop-color="#9373e1"/><stop offset="1" stop-color="#9b77e5"/></linearGradient>
+  <linearGradient id="hub" x1="18%" y1="0%" x2="80%" y2="100%"><stop stop-color="#8d7be4"/><stop offset=".42" stop-color="#5c52cf"/><stop offset="1" stop-color="#332fa7"/></linearGradient>
+  <linearGradient id="node" x1="0%" y1="0%" x2="100%" y2="100%"><stop stop-color="#2784de"/><stop offset="1" stop-color="#347ad0"/></linearGradient>
+<clipPath id="node-clearance"><path clip-rule="evenodd" fill-rule="evenodd" d="M250 100H1010V930H250ZM653 435.5a26 26 0 1 0 -52 0a26 26 0 1 0 52 0ZM569.5 486a26 26 0 1 0 -52 0a26 26 0 1 0 52 0ZM736.5 486a26 26 0 1 0 -52 0a26 26 0 1 0 52 0ZM569.5 582a26 26 0 1 0 -52 0a26 26 0 1 0 52 0ZM736.5 582a26 26 0 1 0 -52 0a26 26 0 1 0 52 0ZM653 631a26 26 0 1 0 -52 0a26 26 0 1 0 52 0Z"/></clipPath>
+</defs>
+<g id="symbol" aria-label="Astra symbol">
+<g clip-path="url(#node-clearance)"><g><path fill="url(#cyan)" d="M307 321C326 289 372 278 408 289C435 297 453 319 464 358C412 337 347 322 307 321Z"/>
+<path fill="url(#blue-fold)" d="M408 289C450 302 490 325 512 355C534 384 539 424 548 461L500 421C481 404 471 381 464 358C453 319 435 297 408 289Z"/>
+<path fill="url(#blue-inner)" d="M399 398L518 484L518 497C456 500 412 480 364 437Z"/>
+<path fill="url(#blue-arrow)" d="M307 321C330 351 366 370 420 379L358 453C331 424 309 380 304 349C301 337 302 328 307 321Z"/></g><g transform="translate(1254 0) scale(-1 1)"><path fill="url(#cyan)" d="M307 321C326 289 372 278 408 289C435 297 453 319 464 358C412 337 347 322 307 321Z"/>
+<path fill="url(#blue-fold)" d="M408 289C450 302 490 325 512 355C534 384 539 424 548 461L500 421C481 404 471 381 464 358C453 319 435 297 408 289Z"/>
+<path fill="url(#blue-inner)" d="M399 398L518 484L518 497C456 500 412 480 364 437Z"/>
+<path fill="url(#blue-arrow)" d="M307 321C330 351 366 370 420 379L358 453C331 424 309 380 304 349C301 337 302 328 307 321Z"/></g><g><path fill="url(#lower-inner)" d="M356 625C411 567 457 552 530 560L388 664Z"/>
+<path fill="url(#lower-fold)" d="M548 606L534 659C523 708 491 741 414 764C436 752 453 726 462 698C478 651 503 634 536 606Z"/>
+<path fill="url(#lower-cyan)" d="M303 732C344 733 406 718 462 698C453 726 436 752 414 764C373 777 324 763 308 745C306 741 304 737 303 732Z"/>
+<path fill="url(#lower-arrow)" d="M356 604C369 632 389 654 408 678C358 685 325 705 303 732C292 702 318 645 356 604Z"/></g><g transform="translate(1254 0) scale(-1 1)"><path fill="url(#lower-inner)" d="M356 625C411 567 457 552 530 560L388 664Z"/>
+<path fill="url(#lower-fold)" d="M548 606L534 659C523 708 491 741 414 764C436 752 453 726 462 698C478 651 503 634 536 606Z"/>
+<path fill="url(#lower-cyan)" d="M303 732C344 733 406 718 462 698C453 726 436 752 414 764C373 777 324 763 308 745C306 741 304 737 303 732Z"/>
+<path fill="url(#lower-arrow)" d="M356 604C369 632 389 654 408 678C358 685 325 705 303 732C292 702 318 645 356 604Z"/></g><path fill="url(#purple-top-back)" d="M622 183C648 194 690 209 695 231C696 244 675 257 657 264C632 253 596 246 575 229Z"/>
+<path fill="url(#purple-top-tip)" d="M625 123C625 144 629 158 629 173C630 196 605 210 582 225C566 237 557 252 554 268C547 241 551 203 562 183C575 161 603 151 625 123Z"/>
+<path fill="url(#purple-top-tail)" d="M601 359C623 370 656 374 666 391C676 410 665 425 653 434A26 26 0 0 0 604.8 421.9C589 416 568 410 568 394C568 380 586 366 601 359Z"/>
+<path fill="url(#purple-top-front)" d="M695 231C698 248 700 268 701 279C706 319 674 325 615 352C587 365 564 380 568 399C559 380 556 357 560 333C565 298 600 287 657 264C680 255 696 245 695 231Z"/>
+<path fill="url(#purple-bottom-back)" d="M601 631C586 643 577 660 585 674C593 690 623 697 646 704C666 696 683 684 682 670C677 656 659 650 649.2 644.5A26 26 0 0 1 601 631Z"/>
+<path fill="url(#purple-bottom-fold)" d="M595 792C618 803 650 812 670 826L625 872C596 862 566 850 560 833C551 816 573 802 595 792Z"/>
+<path fill="url(#purple-bottom-front)" d="M682 670C690 687 692 721 686 740C679 765 634 778 595 794C574 802 555 812 560 833C555 820 553 790 552 777C548 744 586 731 646 704C668 695 684 683 682 670Z"/>
+<path fill="url(#purple-bottom-tip)" d="M694 787C699 823 693 852 676 872C659 890 641 902 629 920C629 903 627 888 625 872C623 852 650 838 670 826C683 816 691 802 694 787Z"/></g>
+<g fill="none" stroke="#307fd0" stroke-width="10">
+<path d="M627 450V486M627 582V616M557 494L586 510M668 510L697 494M557 574L586 558M668 558L697 574"/>
+</g>
+<g fill="url(#node)"><circle cx="627" cy="435.5" r="19.5"/><circle cx="543.5" cy="486" r="19.5"/><circle cx="710.5" cy="486" r="19.5"/><circle cx="543.5" cy="582" r="19.5"/><circle cx="710.5" cy="582" r="19.5"/><circle cx="627" cy="631" r="19.5"/></g>
+<circle fill="url(#hub)" cx="627" cy="534" r="41.5"/>
+</g>
+<g id="wordmark" fill="#102d64" aria-label="Astra">
+<path fill-rule="evenodd" d="M273 1126L357.5 937.5H394L478 1126H439.5L420 1080.5H331L311.5 1126ZM344 1050.5H407.5L376 976.5Z"/>
+<path d="M594 997L584 1026C570 1018 556 1015 545 1015C531 1015 523 1020 523 1027C523 1037 539 1039 557 1044C583 1051 606 1060 606 1086C606 1114 584 1129 546 1129C524 1129 502 1124 487 1114L498 1084C511 1094 531 1100 547 1100C563 1100 571 1095 571 1088C571 1078 555 1075 537 1071C513 1065 487 1056 487 1030C487 1002 511 985.5 547 985.5C565 985.5 582 990 594 997Z"/>
+<path d="M635.5 949H671V988.5H708.5V1019H671V1074C671 1089 677 1095.5 691 1095.5C698 1095.5 705 1094 711.5 1091V1124C703 1127 694 1127.5 685 1127.5C652 1127.5 635.5 1110 635.5 1076V1019H613.5V988.5H635.5Z"/>
+<path d="M735.5 989.5H769.5V1002.5C781 991 797 985.5 817 986.5V1019.5C787 1016 771 1031 771 1059.5V1126H735.5Z"/>
+<path fill-rule="evenodd" d="M839.5 997C855 989 874 985.5 892 985.5C943 985.5 970 1008 970 1051V1126H934.5V1108C924 1122 908 1129 886.5 1129C851 1129 828 1111 828 1084C828 1055 853 1037.5 888 1037.5C905 1037.5 921 1041 934 1045C932 1025 917 1015 891 1015C875 1015 859 1019 846 1026ZM934 1069C923 1064 910 1061 897 1061C876 1061 863.5 1069 863.5 1082C863.5 1095 874 1102 891 1102C914 1102 934 1088 934 1072Z"/>
+</g>
+</svg>

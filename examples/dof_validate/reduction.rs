@@ -10,7 +10,7 @@ pub(super) fn validate(
     let depth = targets::DepthTarget::new(device, size, size);
     let mut post = PostProcess::new(device, renderer::SCENE_FORMAT, size, size, &depth.view);
     post.set_dof_scale(device, size, size, &depth.view, 1.0);
-    let dof = dof::DepthOfField::new(device, camera, &post, &depth.view);
+    let dof = dof::DepthOfField::new_validation(device, camera, &post, &depth.view);
     let projection =
         glam::camera::rh::proj::directx::orthographic(-1.0, 1.0, -1.0, 1.0, 1.0, 101.0);
     for case in 0..5 {

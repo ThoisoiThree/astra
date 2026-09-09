@@ -105,7 +105,8 @@ fn dilate_y(@builtin(global_invocation_id) id: vec3<u32>) {
 
 struct Fragment {
     color: vec4<f32>,
-    // Eye-space depth, conservative CoC radius and represented source-pixel count.
+    // Eye-space depth, conservative CoC radius, represented source-pixel count,
+    // and opacity cached for all output pixels sharing this fragment.
     shape: vec4<f32>,
 };
 
@@ -124,9 +125,13 @@ fn fragment_alpha(coc_radius: f32, mass: f32, coverage: f32) -> f32 {
     if coverage <= 0.0 { return 0.0; }
     if coc_radius <= 0.5 { return coverage; }
 
+    return clamp(fragment_opacity(coc_radius, mass) * coverage, 0.0, 1.0);
+}
+
+fn fragment_opacity(coc_radius: f32, mass: f32) -> f32 {
+    if coc_radius <= 0.5 { return 1.0; }
     let single_alpha = min(1.0, 1.0 / (coc_radius * coc_radius));
-    let merged_alpha = 1.0 - pow(1.0 - single_alpha, max(mass, 1.0));
-    return clamp(merged_alpha * coverage, 0.0, 1.0);
+    return 1.0 - pow(1.0 - single_alpha, max(mass, 1.0));
 }
 
 fn raw_layer_valid(p: vec2<i32>, layer: u32, z: f32) -> bool {
@@ -160,7 +165,6 @@ var<workgroup> done: u32;
 var<workgroup> unsaturated: atomic<u32>;
 var<workgroup> chunk: array<Fragment, 32>;
 var<workgroup> centers: array<vec2<f32>, 32>;
-
 fn less(a: vec2<u32>, b: vec2<u32>) -> bool {
     return a.x < b.x || (a.x == b.x && a.y < b.y);
 }
@@ -178,16 +182,37 @@ fn fragment_pixel(index: u32) -> vec2<i32> {
     return vec2<i32>(i32(index % size.x), i32((index / size.x) % size.y));
 }
 
+fn append_tile_candidate(z: f32, coc: f32, center: vec2<f32>, source_id: u32,
+    tile_min: vec2<f32>, tile_max: vec2<f32>) {
+    let key = vec2<u32>(bitcast<u32>(z), source_id);
+    if !prefix_matches(key) { return; }
+    let delta = center - clamp(center, tile_min, tile_max);
+    if length(delta) > max(coc, 0.5) + 0.5 { return; }
+    atomicAnd(&key_and[0], key.x);
+    atomicAnd(&key_and[1], key.y);
+    atomicOr(&key_or[0], key.x);
+    atomicOr(&key_or[1], key.y);
+    let slot = atomicAdd(&count, 1u);
+    if slot < CAPACITY { keys[slot] = key; }
+}
+
 @compute @workgroup_size(16, 16)
 fn splat(@builtin(workgroup_id) tile: vec3<u32>, @builtin(local_invocation_index) lane: u32,
     @builtin(global_invocation_id) id: vec3<u32>) {
-    accumulate_tile(tile, lane, id, true);
+    accumulate_tile(tile, lane, id, true, true);
 }
 
 @compute @workgroup_size(16, 16)
 fn splat_reference(@builtin(workgroup_id) tile: vec3<u32>, @builtin(local_invocation_index) lane: u32,
     @builtin(global_invocation_id) id: vec3<u32>) {
-    accumulate_tile(tile, lane, id, false);
+    accumulate_tile(tile, lane, id, false, false);
+}
+
+// Validation baseline for compaction: identical reduced fragments, dense traversal.
+@compute @workgroup_size(16, 16)
+fn splat_dense(@builtin(workgroup_id) tile: vec3<u32>, @builtin(local_invocation_index) lane: u32,
+    @builtin(global_invocation_id) id: vec3<u32>) {
+    accumulate_tile(tile, lane, id, true, false);
 }
 
 // Independent ordering oracle for small validation images. It performs no tile
@@ -259,7 +284,7 @@ fn splat_oracle(@builtin(global_invocation_id) id: vec3<u32>) {
     textureStore(result, vec2<i32>(id.xy), vec4<f32>(resolved, 1.0));
 }
 
-fn accumulate_tile(tile: vec3<u32>, lane: u32, id: vec3<u32>, reduced: bool) {
+fn accumulate_tile(tile: vec3<u32>, lane: u32, id: vec3<u32>, reduced: bool, compact: bool) {
     let size = vec2<i32>(post.quality.zw);
     let valid_pixel = all(id.xy < vec2<u32>(size));
     let pixel = vec2<f32>(id.xy) + 0.5;
@@ -291,33 +316,44 @@ fn accumulate_tile(tile: vec3<u32>, lane: u32, id: vec3<u32>, reduced: bool) {
         }
         for (var i = lane; i < CAPACITY; i += 256u) { keys[i] = vec2<u32>(0xffffffffu); }
         workgroupBarrier();
-        for (var i = lane; i < area * active_layer_count(); i += 256u) {
-            let layer = i / area;
-            let offset = i % area;
-            let p = begin + vec2<i32>(i32(offset % u32(extent.x)), i32(offset / u32(extent.x)));
-            var z = layer_depth(p, i32(layer));
-            if !reduced && !raw_layer_valid(p, layer, z) { continue; }
-            var fragment_radius = radius(z);
-            var center = vec2<f32>(p) + 0.5;
-            if reduced {
-                let fragment = unpack_fragment(p, i32(layer));
-                if fragment.mass == 0.0 { continue; }
-                z = fragment.z;
-                fragment_radius = fragment.coc;
-                center = fragment_center(fragment);
+        if compact {
+            let first_block = begin / 4;
+            let block_extent = (end + 3) / 4 - first_block;
+            let block_area = u32(block_extent.x * block_extent.y);
+            // Eight lanes traverse each compact 4x4 source block. Unlike the
+            // texture scan, this never visits holes left by merging/umbra culling.
+            for (var b = lane / 8u; b < block_area; b += 32u) {
+                let block = first_block + vec2<i32>(i32(b % u32(block_extent.x)), i32(b / u32(block_extent.x)));
+                let surviving = textureLoad(block_counts, block, 0).r;
+                for (var slot = lane % 8u; slot < surviving; slot += 8u) {
+                    let source_id = block_source(block, slot);
+                    let p = fragment_pixel(source_id);
+                    // Boundary blocks straddle the old candidate rectangle;
+                    // keep exactly its source set before the usual circle test.
+                    if any(p < begin) || any(p >= end) { continue; }
+                    let layer = i32(source_id / u32(size.x * size.y));
+                    let fragment = unpack_fragment(p, layer);
+                    append_tile_candidate(fragment.z, fragment.coc, fragment_center(fragment),
+                        source_id, tile_min, tile_max);
+                }
             }
-            let delta = center - clamp(center, tile_min, tile_max);
-            // The circumscribed circle is conservative for every iris rotation.
-            if length(delta) > max(fragment_radius, 0.5) + 0.5 { continue; }
-            let source_id = (layer * u32(size.y) + u32(p.y)) * u32(size.x) + u32(p.x);
-            let key = vec2<u32>(bitcast<u32>(z), source_id);
-            if !prefix_matches(key) { continue; }
-            atomicAnd(&key_and[0], key.x);
-            atomicAnd(&key_and[1], key.y);
-            atomicOr(&key_or[0], key.x);
-            atomicOr(&key_or[1], key.y);
-            let slot = atomicAdd(&count, 1u);
-            if slot < CAPACITY { keys[slot] = key; }
+        } else {
+            for (var i = lane; i < area * active_layer_count(); i += 256u) {
+                let layer = i / area;
+                let offset = i % area;
+                let p = begin + vec2<i32>(i32(offset % u32(extent.x)), i32(offset / u32(extent.x)));
+                let source_id = (layer * u32(size.y) + u32(p.y)) * u32(size.x) + u32(p.x);
+                if reduced {
+                    let fragment = unpack_fragment(p, i32(layer));
+                    if fragment.mass == 0.0 { continue; }
+                    append_tile_candidate(fragment.z, fragment.coc, fragment_center(fragment),
+                        source_id, tile_min, tile_max);
+                } else {
+                    let z = layer_depth(p, i32(layer));
+                    if !raw_layer_valid(p, layer, z) { continue; }
+                    append_tile_candidate(z, radius(z), vec2<f32>(p) + 0.5, source_id, tile_min, tile_max);
+                }
+            }
         }
         workgroupBarrier();
         let length = atomicLoad(&count);
@@ -364,15 +400,21 @@ fn accumulate_tile(tile: vec3<u32>, lane: u32, id: vec3<u32>, reduced: bool) {
                 let index = keys[base + lane].y;
                 let p = fragment_pixel(index);
                 let layer = i32(index / u32(size.x * size.y));
-                let z = layer_depth(p, layer);
-                chunk[lane].color = raw_layer_color(p, layer);
-                chunk[lane].shape = vec4<f32>(z, radius(z), 1.0, 0.0);
-                centers[lane] = vec2<f32>(p) + 0.5;
                 if reduced {
                     let fragment = unpack_fragment(p, layer);
                     chunk[lane].color = vec4<f32>(fragment.color, 1.0);
                     chunk[lane].shape = vec4<f32>(fragment.z, fragment.coc, fragment.mass, 0.0);
                     centers[lane] = fragment_center(fragment);
+                } else {
+                    let z = layer_depth(p, layer);
+                    chunk[lane].color = raw_layer_color(p, layer);
+                    chunk[lane].shape = vec4<f32>(z, radius(z), 1.0, 0.0);
+                    centers[lane] = vec2<f32>(p) + 0.5;
+                }
+                // Radius and represented mass are identical for all 256 output
+                // pixels. Evaluate the power once per loaded fragment, not per pixel.
+                if compact {
+                    chunk[lane].shape.w = fragment_opacity(chunk[lane].shape.y, chunk[lane].shape.z);
                 }
             }
             workgroupBarrier();
@@ -381,7 +423,12 @@ fn accumulate_tile(tile: vec3<u32>, lane: u32, id: vec3<u32>, reduced: bool) {
                     let f = chunk[i];
                     let offset = pixel - centers[i];
                     let coverage = fragment_coverage(offset, f.shape.y);
-                    let alpha = fragment_alpha(f.shape.y, f.shape.z, coverage);
+                    var alpha = clamp(f.shape.w * coverage, 0.0, 1.0);
+                    if !compact {
+                        // Keep the old per-pixel expression in the validation
+                        // paths so the comparison also covers opacity hoisting.
+                        alpha = fragment_alpha(f.shape.y, f.shape.z, coverage);
+                    }
                     let weight = transmission * alpha;
                     rgb += weight * f.color.rgb;
                     transmission -= weight;

@@ -65,6 +65,8 @@ pub(super) struct DepthOfField {
     color: ArrayTarget,
     depth: ArrayTarget,
     pub(super) reduced: wgpu::Texture,
+    block_counts: wgpu::Texture,
+    block_sources: wgpu::Texture,
     shaded_first: ColorTarget,
     shade_bindings: wgpu::BindGroup,
     shade_pipeline: wgpu::RenderPipeline,
@@ -85,6 +87,27 @@ impl DepthOfField {
         camera_layout: &wgpu::BindGroupLayout,
         post: &PostProcess,
         scene_depth: &wgpu::TextureView,
+    ) -> Self {
+        Self::new_internal(device, camera_layout, post, scene_depth, false)
+    }
+
+    /// Validation tools opt into the expensive comparison pipelines.
+    #[allow(dead_code)]
+    pub(super) fn new_validation(
+        device: &wgpu::Device,
+        camera_layout: &wgpu::BindGroupLayout,
+        post: &PostProcess,
+        scene_depth: &wgpu::TextureView,
+    ) -> Self {
+        Self::new_internal(device, camera_layout, post, scene_depth, true)
+    }
+
+    fn new_internal(
+        device: &wgpu::Device,
+        camera_layout: &wgpu::BindGroupLayout,
+        post: &PostProcess,
+        scene_depth: &wgpu::TextureView,
+        validation: bool,
     ) -> Self {
         let size = [
             post.dof_color._texture.width(),
@@ -109,6 +132,43 @@ impl DepthOfField {
             view_formats: &[],
         });
         let reduced_view = reduced.create_view(&wgpu::TextureViewDescriptor {
+            dimension: Some(wgpu::TextureViewDimension::D2Array),
+            ..Default::default()
+        });
+        // A 4x4 source block has at most 16 * MAX_DOF_LAYERS surviving
+        // fragments. Four IDs per texel, in a 2x2 array footprint, store that
+        // exact upper bound without a global append buffer or overflow drops.
+        let blocks = [size[0].div_ceil(4), size[1].div_ceil(4)];
+        let block_counts = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("DOF compact block counts"),
+            size: wgpu::Extent3d {
+                width: blocks[0],
+                height: blocks[1],
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R32Uint,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING,
+            view_formats: &[],
+        });
+        let block_sources = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("DOF compact block source IDs"),
+            size: wgpu::Extent3d {
+                width: blocks[0] * 2,
+                height: blocks[1] * 2,
+                depth_or_array_layers: MAX_DOF_LAYERS,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba32Uint,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING,
+            view_formats: &[],
+        });
+        let block_counts_view = block_counts.create_view(&Default::default());
+        let block_sources_view = block_sources.create_view(&wgpu::TextureViewDescriptor {
             dimension: Some(wgpu::TextureViewDimension::D2Array),
             ..Default::default()
         });
@@ -237,6 +297,8 @@ impl DepthOfField {
                     (3, &mask_views[0]),
                     (6, &shaded_first.view),
                     (7, &reduced_view),
+                    (11, &block_counts_view),
+                    (12, &block_sources_view),
                 ],
             ),
             (
@@ -248,6 +310,8 @@ impl DepthOfField {
                     (5, &post.dof_color.view),
                     (6, &shaded_first.view),
                     (8, &reduced_view),
+                    (9, &block_counts_view),
+                    (10, &block_sources_view),
                 ],
             ),
             (
@@ -259,6 +323,8 @@ impl DepthOfField {
                     (5, &post.dof_color.view),
                     (6, &shaded_first.view),
                     (8, &reduced_view),
+                    (9, &block_counts_view),
+                    (10, &block_sources_view),
                 ],
             ),
             (
@@ -271,7 +337,23 @@ impl DepthOfField {
                     (6, &shaded_first.view),
                 ],
             ),
-        ] {
+            (
+                "splat_dense",
+                vec![
+                    (1, &color.view),
+                    (2, &depth.view),
+                    (3, &mask_views[0]),
+                    (5, &post.dof_color.view),
+                    (6, &shaded_first.view),
+                    (8, &reduced_view),
+                    (9, &block_counts_view),
+                    (10, &block_sources_view),
+                ],
+            ),
+        ]
+        .into_iter()
+        .take(if validation { 8 } else { 5 })
+        {
             crate::diagnostics::write_graphics_log(format_args!(
                 "BEGIN DoF compute pipeline: {entry}"
             ));
@@ -307,6 +389,8 @@ impl DepthOfField {
             color,
             depth,
             reduced,
+            block_counts,
+            block_sources,
             shaded_first,
             shade_bindings,
             shade_pipeline: post.dof_shade_pipeline.clone(),
@@ -357,19 +441,42 @@ impl DepthOfField {
         }
     }
 
+    #[allow(dead_code)]
     pub(super) fn encode_splat(
         &self,
         encoder: &mut wgpu::CommandEncoder,
         timestamps: Option<wgpu::ComputePassTimestampWrites<'_>>,
     ) {
-        self.encode_accumulation(encoder, timestamps, true);
+        self.encode_accumulation(encoder, timestamps, None, true);
+    }
+
+    pub(super) fn encode_splat_profiled(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        reduction: Option<wgpu::ComputePassTimestampWrites<'_>>,
+        splat: Option<wgpu::ComputePassTimestampWrites<'_>>,
+    ) {
+        self.encode_accumulation(encoder, splat, reduction, true);
     }
 
     // No-reduction comparison path. This is useful for validating fragment reduction,
     // but it is not an independent accumulation oracle because it shares sorting/compositing.
     #[allow(dead_code)]
     pub(super) fn encode_reference(&self, encoder: &mut wgpu::CommandEncoder) {
-        self.encode_accumulation(encoder, None, false);
+        self.encode_accumulation(encoder, None, None, false);
+    }
+
+    /// Run after encode_splat, reusing its shaded/reduced textures unchanged.
+    #[allow(dead_code)]
+    pub(super) fn encode_dense_comparison(&self, encoder: &mut wgpu::CommandEncoder) {
+        let stage = &self.stages[7];
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("DOF dense compaction baseline"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&stage.pipeline);
+        pass.set_bind_group(0, &stage.bindings, &[]);
+        pass.dispatch_workgroups(self.size[0].div_ceil(16), self.size[1].div_ceil(16), 1);
     }
 
     /// Extremely slow but ordering-independent validation path. It deliberately
@@ -382,7 +489,7 @@ impl DepthOfField {
             return false;
         }
 
-        self.encode_visible_shading(encoder);
+        self.encode_visible_shading(encoder, None);
         let stage = &self.stages[6];
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("DOF independent ordering oracle"),
@@ -394,9 +501,14 @@ impl DepthOfField {
         true
     }
 
-    fn encode_visible_shading(&self, encoder: &mut wgpu::CommandEncoder) {
+    fn encode_visible_shading(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        timestamps: Option<wgpu::RenderPassTimestampWrites<'_>>,
+    ) {
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("DOF shade visible fragments"),
+            timestamp_writes: timestamps,
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: &self.shaded_first.view,
                 resolve_target: None,
@@ -417,14 +529,26 @@ impl DepthOfField {
         &self,
         encoder: &mut wgpu::CommandEncoder,
         timestamps: Option<wgpu::ComputePassTimestampWrites<'_>>,
+        mut reduction_timestamps: Option<wgpu::ComputePassTimestampWrites<'_>>,
         reduced: bool,
     ) {
-        self.encode_visible_shading(encoder);
+        let shading_timestamps =
+            reduction_timestamps
+                .as_ref()
+                .map(|t| wgpu::RenderPassTimestampWrites {
+                    query_set: t.query_set,
+                    beginning_of_pass_write_index: t.beginning_of_pass_write_index,
+                    end_of_pass_write_index: None,
+                });
+        if let Some(t) = &mut reduction_timestamps {
+            t.beginning_of_pass_write_index = None;
+        }
+        self.encode_visible_shading(encoder, shading_timestamps);
         if reduced {
             let stage = &self.stages[3];
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("DOF hierarchical fragment merging"),
-                timestamp_writes: None,
+                timestamp_writes: reduction_timestamps,
             });
             pass.set_pipeline(&stage.pipeline);
             pass.set_bind_group(0, &stage.bindings, &[]);
@@ -446,6 +570,11 @@ impl DepthOfField {
             * (u64::from(MAX_DOF_LAYERS) * (8 + 4) + 16)
             + u64::from(self.reduced.width())
                 * u64::from(self.reduced.height())
+                * u64::from(MAX_DOF_LAYERS)
+                * 16
+            + u64::from(self.block_counts.width()) * u64::from(self.block_counts.height()) * 4
+            + u64::from(self.block_sources.width())
+                * u64::from(self.block_sources.height())
                 * u64::from(MAX_DOF_LAYERS)
                 * 16
     }
