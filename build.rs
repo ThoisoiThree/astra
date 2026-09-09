@@ -1,4 +1,8 @@
+#[path = "build/icon.rs"]
+mod icon;
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    icon::generate()?;
     // Read the resolved version rather than duplicating the Cargo dependency range.
     let lock = std::fs::read_to_string("Cargo.lock")?;
     let wgpu_version = lock

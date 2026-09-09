@@ -91,6 +91,14 @@ impl Runtime {
         trace.mark("BEGIN window creation");
         let attributes = WindowAttributes::default()
             .with_title("Astra")
+            .with_window_icon(Some(
+                winit::window::Icon::from_rgba(
+                    include_bytes!(concat!(env!("OUT_DIR"), "/astra-icon.rgba")).to_vec(),
+                    64,
+                    64,
+                )
+                .context("could not decode the embedded Astra icon")?,
+            ))
             .with_inner_size(LogicalSize::new(1280.0, 800.0))
             .with_min_inner_size(LogicalSize::new(720.0, 480.0));
         let window = Arc::new(

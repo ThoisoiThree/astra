@@ -36,6 +36,8 @@ wgpu = { version = "30", features = ["static-dxc"] }
 [build-dependencies]
 prost-build = "0.14"
 protoc-bin-vendored = "3"
+resvg = { version = "0.45", default-features = false }
+winresource = "0.1"
 
 [dev-dependencies]
 naga = { version = "30", features = ["wgsl-in"] }
