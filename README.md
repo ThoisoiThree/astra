@@ -1,21 +1,50 @@
-# Astra
+<p align="center">
+  <img src="resources/logo/astra_icon.svg" alt="Astra logo" width="112">
+</p>
 
-Astra is a native desktop application for viewing and inspecting molecular
-structures. It combines interactive 3D representations, a chain–residue–atom
-hierarchy, named selections, distance measurements, and native AMOEBA 2018
-interaction analysis. Projects preserve the structure, its presentation, and
-analysis results in a portable `.mol` file.
+<h1 align="center">Astra</h1>
 
-The application is written in Rust with wgpu rendering and an egui interface.
-It is under active development.
+<p align="center">
+  <strong>Molecular visualization, inspection, and structure preparation.</strong><br>
+  A native desktop application built with Rust, wgpu, and egui.
+</p>
 
-| Capability | Description |
+<p align="center">
+  Windows · macOS · Linux<br>
+  Open source · AGPL-3.0 · Active development
+</p>
+
+<p align="center">
+  <a href="#build-and-dependencies">Build</a> ·
+  <a href="#working-with-structures">Usage</a> ·
+  <a href="#selections-and-commands">Selections</a> ·
+  <a href="docs/protonation.md">Structure preparation</a> ·
+  <a href="#architecture-and-development">Development</a>
+</p>
+
+Astra brings molecular structures, selections, measurements, and presentation
+settings into one workspace. Explore assemblies through a chain–residue–atom
+hierarchy, prepare selected residues, and save a complete project as a portable
+`.mol` scene.
+
+<p align="center">
+  <img src="resources/ui.png" alt="Astra displaying the 4R8P molecular assembly in a cartoon representation, colored by chain, beside its selection tools and molecular hierarchy" width="1200">
+</p>
+
+<p align="center"><em>4R8P in the Astra workspace, with chain coloring and the molecular hierarchy.</em></p>
+
+| Capability | What you can do |
 | --- | --- |
-| Structure input | PDB, PDBx/mmCIF, BinaryCIF, PDBML/XML, gzip-compressed files, and downloads from RCSB PDB |
-| Visualization | Cartoon, Ball & stick, and Toon representations; multiple color schemes; ambient occlusion and optical depth of field |
-| Inspection and selection | Atom picking, hierarchical inspection, Boolean expressions, and styled named selections |
-| Measurements and analysis | Dashed distance lines and AMOEBA 2018 functional-group interaction scores |
-| Project management | Independent tabs, saved scenes, undo/redo, and autosave recovery |
+| Open structures | Load PDB, PDBx/mmCIF, BinaryCIF, PDBML/XML, and gzip-compressed files, or fetch structures from RCSB PDB. |
+| Explore in 3D | Switch between Cartoon, Ball & stick, and Toon; adjust coloring, ambient occlusion, and depth of field. |
+| Select and inspect | Pick atoms, navigate the hierarchy, and build styled named selections with Boolean expressions. |
+| Prepare structures | Restore missing protein heavy atoms and build explicit H at a specified pH in selected residues. |
+| Measure distances | Create dashed measurement lines with distance labels and adjustable styling. |
+| Keep your workspace | Work across tabs, save self-contained scenes, undo changes, and recover autosaved work. |
+
+Experimental AMOEBA 2018 interaction analysis is available through
+**Info → Enable experimental features**. See the
+[energy model and validation](docs/amoeba.md) for its definition and limitations.
 
 ## Build and dependencies
 

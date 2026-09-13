@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build Astra.app with the icon generated from logo/astra_icon.svg."""
+"""Build Astra.app with the icon generated from resources/logo/astra_icon.svg."""
 
 import json
 import pathlib

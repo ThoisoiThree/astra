@@ -3,10 +3,10 @@ use std::{env, error::Error, fs, path::PathBuf};
 use resvg::{tiny_skia, usvg};
 
 pub fn generate() -> Result<(), Box<dyn Error>> {
-    println!("cargo:rerun-if-changed=logo/astra_icon.svg");
+    println!("cargo:rerun-if-changed=resources/logo/astra_icon.svg");
     println!("cargo:rerun-if-changed=build/icon.rs");
     let output = PathBuf::from(env::var_os("OUT_DIR").ok_or("missing OUT_DIR")?);
-    let svg = fs::read("logo/astra_icon.svg")?;
+    let svg = fs::read("resources/logo/astra_icon.svg")?;
     let tree = usvg::Tree::from_data(&svg, &usvg::Options::default())?;
     let render = |size: u32| -> Result<tiny_skia::Pixmap, Box<dyn Error>> {
         let mut pixels = tiny_skia::Pixmap::new(size, size).ok_or("invalid icon dimensions")?;

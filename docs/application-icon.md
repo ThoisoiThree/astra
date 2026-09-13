@@ -1,6 +1,6 @@
 # Application icon
 
-`logo/astra_icon.svg` is the source artwork. `build/icon.rs` renders it during
+`resources/logo/astra_icon.svg` is the source artwork. `build/icon.rs` renders it during
 the Cargo build, preserving its proportions on a transparent square. The SVG
 renderer is a build dependency only; it is not linked into the application.
 Changing the SVG automatically regenerates the icons on the next build.
