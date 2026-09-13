@@ -5,7 +5,7 @@
 <h1 align="center">Astra</h1>
 
 <p align="center">
-  <strong>Molecular visualization, inspection, and structure preparation.</strong><br>
+  <strong>Molecular visualization & inspection software.</strong><br>
   A native desktop application built with Rust, wgpu, and egui.
 </p>
 
