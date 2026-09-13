@@ -380,6 +380,34 @@ impl Runtime {
                 self.named_selection_statuses.remove(&name);
                 self.recalculate_named_selections();
             }
+            ManagerAction::PrepareHydrogens {
+                selection,
+                settings,
+            } => {
+                if let Err(error) = self.start_protonation(&selection, settings) {
+                    self.ui.latest_error = Some(error.to_string());
+                }
+            }
+            ManagerAction::CreateHydrogenBonds {
+                selection,
+                settings,
+            } => {
+                if let Err(error) = self.start_hydrogen_bonds(&selection, settings) {
+                    self.ui.latest_error = Some(format!("{error:#}"));
+                }
+            }
+            ManagerAction::SetHydrogenBondThreshold { id, threshold } => {
+                if threshold.is_finite()
+                    && let Some(report) = self
+                        .measurement_lines
+                        .iter_mut()
+                        .find(|line| line.id == id)
+                        .and_then(|line| line.hydrogen_bonds.as_mut())
+                {
+                    report.energy_threshold = threshold;
+                    self.renderer.update_measurements(&self.measurement_lines);
+                }
+            }
             ManagerAction::CreateMeasurement {
                 first_selection,
                 second_selection,
@@ -486,6 +514,57 @@ impl Runtime {
                 }
             }
         }
+    }
+
+    pub(super) fn start_hydrogen_bonds(
+        &mut self,
+        selection: &str,
+        settings: astra::molecule::amoeba::AnalysisSettings,
+    ) -> Result<()> {
+        let molecule = self
+            .molecule
+            .as_ref()
+            .context("load a structure before AMOEBA analysis")?;
+        let selected = self
+            .named_selections
+            .get(selection)
+            .with_context(|| format!("named selection '{selection}' does not exist"))?
+            .indices()
+            .collect::<Vec<_>>();
+        if selected.is_empty() {
+            anyhow::bail!("named selection '{selection}' is empty");
+        }
+        if self
+            .background_jobs
+            .values()
+            .any(|j| j.kind == JobKind::HydrogenBonds && j.session_id == self.active_session_id)
+        {
+            anyhow::bail!("AMOEBA analysis is already running in this tab");
+        }
+        let id = self.next_job_id;
+        self.next_job_id = self.next_job_id.wrapping_add(1);
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.submit_job(JobRequest::HydrogenBonds {
+            id,
+            molecule: Box::new(molecule.clone()),
+            selection: selection.to_owned(),
+            settings,
+            selected,
+            cancel: cancel.clone(),
+        })?;
+        self.background_jobs.insert(
+            id,
+            BackgroundJob {
+                session_id: self.active_session_id,
+                version: self.document_version,
+                kind: JobKind::HydrogenBonds,
+                stage: "Queued AMOEBA analysis".into(),
+                progress: 0.0,
+                cancel,
+            },
+        );
+        self.ui.latest_error = None;
+        Ok(())
     }
 
     pub(super) fn create_measurement(&mut self, first_name: &str, second_name: &str) -> Result<()> {

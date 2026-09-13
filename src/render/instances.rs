@@ -286,35 +286,37 @@ impl GpuMesh {
 pub(super) fn measurement_instances(lines: &[MeasurementLine]) -> Vec<InstanceRaw> {
     let mut instances = Vec::new();
     for line in lines.iter().filter(|line| line.is_visible()) {
-        let vector = line.second.position - line.first.position;
-        let length = vector.length();
-        if length <= f32::EPSILON {
-            continue;
+        for (first, second) in line.segments() {
+            let vector = second - first;
+            let length = vector.length();
+            if length <= f32::EPSILON {
+                continue;
+            }
+            let direction = vector / length;
+            let rotation = Quat::from_rotation_arc(Vec3::Y, direction);
+            let half_label_gap = (length * 0.1).clamp(0.18, 0.45).min(length * 0.35);
+            let middle = length * 0.5;
+            append_measurement_dashes(
+                &mut instances,
+                first,
+                direction,
+                rotation,
+                0.0,
+                middle - half_label_gap,
+                line.effective_color(),
+                line.thickness,
+            );
+            append_measurement_dashes(
+                &mut instances,
+                first,
+                direction,
+                rotation,
+                middle + half_label_gap,
+                length,
+                line.effective_color(),
+                line.thickness,
+            );
         }
-        let direction = vector / length;
-        let rotation = Quat::from_rotation_arc(Vec3::Y, direction);
-        let half_label_gap = (length * 0.1).clamp(0.18, 0.45).min(length * 0.35);
-        let middle = length * 0.5;
-        append_measurement_dashes(
-            &mut instances,
-            line.first.position,
-            direction,
-            rotation,
-            0.0,
-            middle - half_label_gap,
-            line.effective_color(),
-            line.thickness,
-        );
-        append_measurement_dashes(
-            &mut instances,
-            line.first.position,
-            direction,
-            rotation,
-            middle + half_label_gap,
-            length,
-            line.effective_color(),
-            line.thickness,
-        );
     }
     instances
 }

@@ -55,7 +55,7 @@ The authoritative payload contract is [`schemas/molecule_1_0.proto`](../schemas/
 - Derived caches and GPU data never enter the format; this prevents renderer changes from becoming
   file-format changes.
 
-The current implementation writes schema `1` and implements reader version `2`. Files using only the
+The current implementation writes schema `1` and implements reader version `3`. Files using only the
 reader-1 feature set declare `minimum_reader_version = 1`; secondary-structure coloring declares
 version `2`. A reader rejects a higher requirement before constructing runtime state. Both the local
 container and decompressed payload are limited to 512 MiB, and decompression never reserves the full
@@ -77,3 +77,10 @@ Floating-point coordinates and camera values are stored as IEEE-754 binary32, ma
 Opening a scene restores the same semantic scene and camera. Exact output pixels can still vary with
 viewport aspect ratio, GPU shader precision, font rasterization, and future renderer improvements;
 those platform-specific artifacts are intentionally not serialized.
+
+AMOEBA measurement objects require reader 3. `MeasurementLine.hydrogen_bonds` (field 9)
+is a versioned UTF-8 JSON report containing candidate atom/group indices, continuous
+energies and their decomposition, diagnostic geometry, template status and SCF settings.
+It also stores the energy display threshold; ordinary line style fields apply to the
+whole object. Older readers reject these files instead of silently losing the analysis.
+Reader 3 additionally supports element codes 17–22 (Li, Rb, Cs, Be, Sr, Ba).

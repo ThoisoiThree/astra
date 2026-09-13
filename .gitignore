@@ -6,3 +6,6 @@ TODO.txt
 .gitignore
 /reference
 /logs
+
+/.venv-amoeba/
+__pycache__/

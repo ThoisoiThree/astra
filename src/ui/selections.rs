@@ -24,22 +24,11 @@ fn selection_tree_open(ui: &egui::Ui, id: egui::Id) -> bool {
     egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, false).is_open()
 }
 
-fn selection_disclosure_button(ui: &mut egui::Ui, id: egui::Id, open: bool) {
-    let symbol = if open { "▾" } else { "▸" };
-    let response = ui
-        .push_id(id.with("toggle"), |ui| {
-            ui.add_sized(
-                [ui.spacing().indent, ui.spacing().interact_size.y],
-                egui::Button::new(symbol).frame(false),
-            )
-        })
-        .inner;
-    if response.clicked() {
-        let mut state =
-            egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, false);
-        state.toggle(ui);
-        state.store(ui.ctx());
-    }
+fn selection_disclosure_button(ui: &mut egui::Ui, id: egui::Id) {
+    let mut state =
+        egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, false);
+    state.show_toggle_button(ui, egui::collapsing_header::paint_default_icon);
+    state.store(ui.ctx());
 }
 
 fn visible_selection_rows<'a>(
@@ -315,7 +304,7 @@ pub(super) fn named_selections(
                             ui.add_space(ui.spacing().indent);
                         } else {
                             let id = tree_id.with(("named selection", name));
-                            selection_disclosure_button(ui, id, selection_tree_open(ui, id));
+                            selection_disclosure_button(ui, id);
                         }
                         named_selection_header(
                             ui,
@@ -341,7 +330,7 @@ pub(super) fn named_selections(
                         };
                         ui.add_space(ui.spacing().indent);
                         let id = tree_id.with(("named chain", selection_name, chain_index));
-                        selection_disclosure_button(ui, id, selection_tree_open(ui, id));
+                        selection_disclosure_button(ui, id);
                         let target = InspectionTarget::Chain(chain_index);
                         let chain_name = info
                             .hierarchy_names
@@ -385,7 +374,7 @@ pub(super) fn named_selections(
                             chain_index,
                             residue_index,
                         ));
-                        selection_disclosure_button(ui, id, selection_tree_open(ui, id));
+                        selection_disclosure_button(ui, id);
                         let target = InspectionTarget::Residue {
                             chain_index,
                             residue_index,
@@ -461,7 +450,13 @@ pub(super) fn selection_status_badge(ui: &mut egui::Ui, status: &SelectionStatus
             format!("Using the last valid result: {error}"),
         ),
     };
-    ui.colored_label(color, "●").on_hover_text(detail);
+    // Draw the status marker independently of the active font's glyph coverage.
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(12.0, ui.spacing().interact_size.y),
+        egui::Sense::hover(),
+    );
+    ui.painter().circle_filled(rect.center(), 3.5, color);
+    response.on_hover_text(detail);
 }
 
 pub(super) fn named_expression_menu(

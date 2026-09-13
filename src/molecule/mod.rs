@@ -1,3 +1,4 @@
+pub mod amoeba;
 mod bonds;
 mod element;
 mod hierarchy;

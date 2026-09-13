@@ -1,257 +1,252 @@
 # Astra
 
-`Astra` is an early, usable native molecular viewer written in Rust. This MVP
-loads PDB, PDBx/mmCIF, BinaryCIF, and PDBML/XML structures, builds renderer-independent molecular topology, evaluates a
-composable selection language, and displays atoms and bonds through batched wgpu
-instancing with a small egui interface.
+Astra is a native desktop application for viewing and inspecting molecular
+structures. It combines interactive 3D representations, a chain–residue–atom
+hierarchy, named selections, distance measurements, and native AMOEBA 2018
+interaction analysis. Projects preserve the structure, its presentation, and
+analysis results in a portable `.mol` file.
 
-> Screenshot placeholder — a real project screenshot will be added after UI polish.
+The application is written in Rust with wgpu rendering and an egui interface.
+It is under active development.
 
-## Current features
+| Capability | Description |
+| --- | --- |
+| Structure input | PDB, PDBx/mmCIF, BinaryCIF, PDBML/XML, gzip-compressed files, and downloads from RCSB PDB |
+| Visualization | Cartoon, Ball & stick, and Toon representations; multiple color schemes; ambient occlusion and optical depth of field |
+| Inspection and selection | Atom picking, hierarchical inspection, Boolean expressions, and styled named selections |
+| Measurements and analysis | Dashed distance lines and AMOEBA 2018 functional-group interaction scores |
+| Project management | Independent tabs, saved scenes, undo/redo, and autosave recovery |
 
-- PDB, PDBx/mmCIF, BinaryCIF, and PDBML/XML coordinate parsing, including gzip
-- Conservative element inference and common biological element properties
-- Spatial-grid covalent bond inference (no global all-pairs scan)
-- Depth-tested, lit instanced spheres and sticks
-- Orbit, pan, zoom, automatic framing, resize handling, and Fit
-- Click-to-pick atoms with atom/residue/chain property inspection
-- Chain → residue → atom hierarchy with independent selection/expansion controls
-- Hierarchical HSV color overrides and inherited tri-state visibility controls
-- Global and hierarchical Cartoon/Ball & stick/Toon display modes
-- Named selections with color/visibility attributes and a preserved internal hierarchy
-- Portable Molecule 1.0 (`.mol`) project files with embedded geometry, selections, styling, camera state,
-  schema versioning, and Zstandard compression
-- Dashed distance measurements with Å labels and editable line styles
-- Camera panel with clipping and thin-lens optical bokeh controls
-- Element/CPK, chain, residue, residue-type, secondary-structure, B-factor, and uniform color schemes
-- Open/Fetch/Save file menu, RCSB PDB download by ID, command-line path, and drag-and-drop
-- Boolean selection AST with useful position-bearing syntax errors
-- Per-atom color, sphere/stick visibility, and non-destructive selection highlight
-- Command history with Up/Down while the command field is focused
-- 50-step non-camera undo/redo history with Ctrl/Cmd+Z and Ctrl/Cmd+R
+## Build and dependencies
 
-## Requirements
+### Common requirements
 
-- Current stable Rust with edition 2024 support
-- A desktop supported by winit/wgpu: Windows (D3D12), macOS (Metal), or Linux
-  (Vulkan; an OpenGL fallback may be available)
-- On Linux, the normal graphics/window-system development packages required by
-  winit and wgpu
+Install the current stable Rust toolchain using the
+[official Rust installation guide](https://doc.rust-lang.org/book/ch01-01-installation.html).
+The project uses Rust edition 2024. Build commands below should be executed from
+the repository root.
 
-## Build and run
+Cargo resolves Rust dependencies from `Cargo.lock`. The build supplies its own
+Protocol Buffers compiler and generates application icons from the included SVG;
+a separate `protoc` installation is unnecessary. Native compilation tools and
+graphics drivers depend on the platform.
 
-Run the bundled molecule immediately:
+| Platform | Native build tools | Graphics |
+| --- | --- | --- |
+| Windows | MSVC C++ Build Tools and Windows SDK | Vulkan by default; DX12 can be selected in the application |
+| macOS | Xcode Command Line Tools | Metal |
+| Linux | GCC or Clang, `pkg-config`, and X11/Wayland development libraries | Vulkan loader and a compatible GPU driver |
 
-```bash
-cargo run -- examples/minimal.pdb
-cargo run -- examples/4R8P.pdb
+AMOEBA analysis is implemented in Rust with embedded AMOEBA 2018 parameters and
+requires no additional runtime dependencies. Python 3 is used only by the macOS
+packaging script and optional developer tools for regenerating reference data.
+
+### Windows
+
+Install Visual Studio Build Tools with the **Desktop development with C++**
+workload and a Windows SDK, then install Rust with the MSVC toolchain. Use a
+terminal in which Cargo and the native build tools are available.
+
+```powershell
+cargo build --release --locked
 ```
 
-Or start without a file and use **File → Open**:
+The executable is `target\release\astra.exe`. Open it directly, or provide a
+structure path:
 
-```bash
-cargo run
+```powershell
+.\target\release\astra.exe examples\minimal.pdb
 ```
 
-Optimized build:
+Install the GPU manufacturer's graphics driver with Vulkan support. Astra also
+provides a DX12 backend. Non-ARM64 MSVC builds link DXC into the application for
+shader compilation.
 
-```bash
-cargo build --release
+### macOS
+
+Install Xcode Command Line Tools:
+
+```sh
+xcode-select --install
 ```
 
-Controls: click an atom to select and inspect it, left-drag orbits, right-drag or
-Shift+left-drag pans, and the mouse wheel/trackpad zooms. Ctrl/Cmd with either
-right-drag or macOS three-finger drag translates the camera and pivot in screen
-space, so the gesture always follows visible left/right/up/down. The
-hierarchy manager can select whole chains, residues, or individual atoms. **Fit**
-reframes the molecule and **Reset colors** restores chain coloring.
+Build the standalone executable:
 
-Supported coordinate inputs are `.pdb`/`.ent`, `.cif`/`.mmcif`, `.bcif`, and
-PDBML `.xml`; each can be gzip-compressed. Biological assembly files use these
-same readers. Structure-factor and validation CIF/XML files are recognized, but
-if they contain no `atom_site` coordinates the viewer reports that they are
-non-displayable data rather than treating them as a broken structure. Validation
-PDF reports likewise have no molecular coordinates.
+```sh
+cargo build --release --locked
+```
 
-The **File** menu contains **Open**, **Fetch**, **Save as**, and **Save**. **Fetch** opens a
-modal PDB ID dialog with cancellable download progress and transfer speed. Large files use
-four HTTP byte-range workers when RCSB advertises range support; small files use one stream
-to avoid connection overhead. Downloads are stored under `~/downloads/pdb/` and opened
-without blocking the UI. Save as
-creates a Molecule 1.0 `.mol` project; subsequent Save operations update that file atomically.
-Unsaved tabs carry a dot indicator, prompt before closing, and are autosaved to a separate recovery
-area after an idle delay. Recovery discovery runs in the background after the first frame.
-The recovery window offers **Restore**, **Discard**, or **Later**; scene contents are read
-and decoded in the background only after Restore. Later keeps the autosaves for the next
-launch. Recovered scenes remain unsaved until saved to a project file.
-Molecule `.mol` projects are identified by their `MOLECULE` magic; MDL
-Molfile uses the same extension but is reported as unsupported rather than misdecoded.
+The executable is `target/release/astra`. To create a Finder application with its
+icon and bundle metadata, install Python 3 and use the packaging script:
 
-Open can select one or several files. Every structure or `.mol` scene opens in its own tab
-above the viewport; tabs can be switched or closed with `×`. Molecule display state,
-selections, measurements, camera, and undo/redo history remain independent per tab. The
-structure ID is read from PDB `HEADER` or mmCIF `_entry.id`, with the filename used as a
-fallback, and is shown beside **Molecule** in the hierarchy manager.
+```sh
+python3 scripts/package_macos.py
+```
 
-Ctrl/Cmd+Z undoes edits to selections, named selections, colors, visibility,
-representations, and other display state. Ctrl/Cmd+R reapplies them. The newest
-50 edits are retained; camera changes and loading a different structure are not
-part of this history.
+The script builds the release executable and creates `target/release/Astra.app`
+with an ad-hoc signature. Developer ID signing and notarization are separate
+distribution steps. See [macOS packaging and application icons](docs/application-icon.md).
 
-### Display mode
+### Linux
 
-The top toolbar menus are ordered **Mode**, **Coloring**, **Camera**. Cartoon is
-the default and derives helix, beta-strand, turn, and coil assignments from protein
-backbone geometry in every supported coordinate format. Helices use broad ribbons,
-beta strands terminate in directional arrows, turns/coils use round tubes, and
-nucleic acids retain a wide ribbon through `P` atoms. Centripetal splines, ten
-samples per residue, and parallel-transported frames keep bends and transitions
-continuous; disconnected residues and chains are never bridged. Ligands and
-residues without a cartoon backbone remain in Ball & stick. The second global
-mode is **Ball & stick**, matching the viewer's original rendering.
-**Toon** renders space-filling atoms as analytic ray/sphere impostors, writes
-atom/residue/chain IDs, and adds depth-gated illustrative outlines over a warm
-paper background. Smoothly intersecting atoms merge visually instead of receiving
-an unconditional circle around every sphere.
+Install a native compiler, the window-system development libraries, and a Vulkan
+runtime. For a Debian/Ubuntu desktop, a starting package set is:
 
-All modes use Chain coloring by default; Element/CPK remains available in the
-Coloring menu. Picking an
-atom in the viewport reveals its hierarchy path and highlights the atom, its
-residue, and its chain without adding the ancestors to the editable
-multi-selection.
+```sh
+sudo apt update
+sudo apt install build-essential pkg-config \
+  libx11-dev libxrandr-dev libxi-dev libxcursor-dev \
+  libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
+  libvulkan1 xdg-desktop-portal zenity
+```
 
-Every chain, residue, and atom has a mode badge before its color and visibility
-attributes. A gray badge inherits; an orange badge is a local override. Clicking
-cycles through the three modes and back to inheritance. Right-click
-provides **Reset to default** and **Set to children**. Effective priority is atom
-→ residue → chain → named selection → global; a value equal to the global mode is
-stored as inheritance rather than as an unnecessary override.
+Install a Vulkan driver appropriate for the GPU. Intel/AMD systems using Mesa
+can use `mesa-vulkan-drivers`; other drivers should come from the distribution
+or GPU vendor.
 
-The **Mode** window also contains ambient-occlusion controls: enable/disable,
-strength, world-space radius, surface bias, and Low/Medium/High quality (16/32/48
-samples). The implementation reconstructs positions and normals from molecular
-depth, uses a rotated low-discrepancy screen-space kernel, and applies a depth-aware
-bilateral filter. It applies to Cartoon, Ball & stick, and Toon.
+File dialogs use XDG Desktop Portal. Install a file-picker portal backend
+appropriate for the desktop, such as `xdg-desktop-portal-gtk`,
+`xdg-desktop-portal-gnome`, or `xdg-desktop-portal-kde`. Zenity supplies fallback
+file dialogs and message dialogs. See the
+[rfd Linux backend requirements](https://docs.rs/rfd/0.17.2/rfd/#linux--bsd-backends).
+Package names differ on other distributions.
 
-### Camera and optical depth of field
+Build and open the application:
 
-Open **Camera** in the top toolbar to edit the near and far clipping planes,
-which default to 1 and 1000. The
-DOF renderer uses **Franke et al. (2018), Multi-Layer Depth of Field Rendering
-with Tiled Splatting** as its main algorithm. It builds partial depth layers near
-discontinuities and sorts and composites splats front to back in 16×16
-tiles. Hidden geometry can become visible through out-of-focus foreground
-silhouettes. Preview uses 3 layers at half resolution; Medium/High use 4/5 layers
-at full resolution. Overfull tiles are partitioned and processed in order without
-dropping fragments. Section 6 reduction merges similar defocused fragments in
-two stages (2×2 and 4×4), preserving unmerged list entries and trimming fragments
-inside the merged footprint's umbra. Unchanged viewports reuse the cached image.
+```sh
+cargo build --release --locked
+./target/release/astra
+```
 
-Focal length, sensor height, f-stop, maximum CoC **radius**, iris blade count,
-and iris rotation are editable. Zero blades selects a circular iris; 3–12 blades
-select polygonal bokeh. AO and visible-surface toon contours enter the source
-layer before DOF; the accumulated image is antialiased afterwards. Annotations
-and UI remain sharp. See [algorithm notes](docs/depth-of-field.md)
-for the paper analysis, implementation choices, and limitations.
+A structure path can be passed as the first argument:
 
-The focus point can be resolved from:
+```sh
+./target/release/astra examples/minimal.pdb
+```
 
-- a chain ID (focuses its atom centroid);
-- a residue by chain and residue number;
-- a nucleic-acid base by chain, residue number, and PDB residue name;
-- an atom by PDB serial number;
-- the chain, residue, or atom currently shown in the Inspector.
+### AMOEBA analysis
 
-Focus points remain attached to molecular coordinates while the camera orbits.
-**Set pivot from inspected** moves the orbit pivot to the selected atom or to the
-centroid of the selected residue/chain without moving the eye. **Reset pivot**
-returns it to the molecule center.
+AMOEBA 2018 is included in every build on all supported platforms. No interpreter
+or separate force-field installation is needed. Analysis requires a complete
+structure with explicit hydrogens and a supported protonation state; unmatched
+residues are reported as `unparameterized`.
 
-### Coloring and hierarchy overrides
+See [AMOEBA preparation, energy definition, and validation](docs/amoeba.md).
 
-Open **Coloring** in the top toolbar to choose Element/CPK, Chain, Residue
-identity, Residue type, Secondary structure, B-factor, or Uniform coloring.
-Secondary-structure coloring uses red helices, yellow sheets, blue turns, gray
-coils, and violet nucleic acids; non-polymer atoms retain their element colors.
-Every chain, residue, and atom row has a color square. Clicking it opens an HSV
-editor; **Default** removes the local override. Effective priority is atom →
-residue → chain → active base scheme, and a local color participates in that
-priority only while it is a real override (an inherited/default match is
-discarded).
+## Working with structures
 
-The eye beside each hierarchy row cycles gray → green → red → gray: inherit,
-force visible, hide, inherit. A lower-level state wins, so a green residue or atom
-remains visible inside a red chain. Clicking a row selects/highlights it without
-opening it; only its disclosure triangle expands or collapses the node.
+### Opening files
 
-Shift-click selects the inclusive same-level range from the last normal-click
-anchor: chains between chains, residues between residues, or atoms between
-atoms. Ctrl/Cmd-click toggles one row without moving that anchor. Editing the
-color square or eye of any selected row applies the new value to the whole set.
-Right-click either attribute for **Reset to default** or **Set to children**. The
-latter recursively forces the row's effective value onto its residues and atoms.
+Use **File → Open**, drag a file into the window, or pass a path to the executable.
+Multiple files can be opened together; each structure or project receives its
+own tab. **File → Fetch from PDB** downloads a structure by its RCSB PDB ID, with
+progress reporting and cancellation. Downloads are stored in `~/downloads/pdb/`.
 
-Named selections use the same color square, visibility eye, reset, and propagation
-controls. Expanding one shows only its selected atoms while preserving their
-chain → residue → atom hierarchy. A named-selection style is a parent layer, so
-explicit chain, residue, and atom overrides still take priority.
+| Format | Extensions | Notes |
+| --- | --- | --- |
+| PDB | `.pdb`, `.ent` | Coordinate records and available connectivity |
+| PDBx/mmCIF | `.cif`, `.mmcif` | Requires atomic coordinates |
+| BinaryCIF | `.bcif` | Binary coordinate input |
+| PDBML | `.xml` | Requires atomic coordinates |
+| Astra project | `.mol` | Embedded structure, display settings, selections, measurements, and camera |
 
-### Distance lines
+All coordinate formats also support gzip compression. Structure-factor files,
+validation reports, and other files without atomic coordinates cannot be
+displayed as molecular structures. Astra projects use a `MOLECULE` file signature;
+MDL Molfile, which shares the `.mol` extension, is unsupported.
 
-Create two named selections with the **Select!** button, then open **Actions** and
-choose them as endpoints A and B. Each endpoint may contain one atom or atoms
-from exactly one residue/nucleic-acid base; residue and base endpoints use their
-atom centroid. **Create distance line** adds a depth-tested dashed line with a
-centered distance label in ångströms.
+### Navigation and inspection
 
-Dashed segments have closed flat end caps. Lines are rendered in a separate
-depth-tested annotation pass after molecular AO and DOF, so measurements and
-future markup do not alter molecular depth, ambient occlusion, or shading.
+| Action | Control |
+| --- | --- |
+| Inspect an atom | Click it in the viewport |
+| Orbit | Left-drag |
+| Pan | Right-drag or Ctrl/Cmd+drag |
+| Zoom | Mouse wheel or trackpad |
+| Frame the structure | **Fit** |
+| Select a hierarchy range | Shift-click rows at the same level |
+| Toggle a hierarchy item | Ctrl/Cmd-click |
+| Undo / redo | Ctrl/Cmd+Z / Ctrl/Cmd+R |
+| Browse command history | Up / Down while the expression field is focused |
 
-Every measurement is an independent object in the **Lines** folder. Its HSV
-color, gray/green/red visibility state, line thickness (0.01–10 Å), label size
-(8–48 pt), and lifetime can be edited there. Measurement creation, styling,
-visibility changes, resizing, and deletion participate in the 50-step Undo/Redo
-history.
+The hierarchy groups atoms by chain and residue. Clicking a row selects it;
+its disclosure triangle controls expansion. The Inspector shows properties of
+the selected atom, residue, or chain. User-facing names can be changed through
+**Rename** without modifying the original molecular identifiers.
 
-Right-click a chain, residue/base, atom, named selection, or measurement line and
-choose **Rename** to assign a user-facing name. Molecular aliases never modify
-the original structure identifiers; **Reset name** restores their generated PDB/
-mmCIF label. Renaming a named selection updates stored `selection …` references.
+### Representations and appearance
 
-## Selection language
+**Mode** selects the global representation:
 
-Keywords are ASCII case-insensitive. Boolean precedence is `not`, `and`, `xor`,
-then `or`; parentheses override precedence.
+- **Cartoon** shows protein ribbons and nucleic-acid backbones. Protein secondary
+  structure is inferred from backbone geometry. Ligands and residues without a
+  cartoon backbone remain in Ball & stick.
+- **Ball & stick** shows atoms and covalent connections.
+- **Toon** shows space-filling atoms with illustrative outlines.
+
+**Coloring** offers Element/CPK, Chain, Residue identity, Residue type, Secondary
+structure, B-factor, and Uniform schemes. Chain coloring is the default.
+**Mode** also provides ambient-occlusion controls.
+
+Chains, residues, atoms, and named selections can override representation,
+color, and visibility. More specific hierarchy overrides take precedence over
+parent and named-selection settings. Visibility cycles through inherit, show,
+and hide; a visible child can override a hidden parent. Context menus provide
+**Reset to default** and **Set to children**.
+
+### Camera and depth of field
+
+**Camera** controls clipping, the orbit pivot, focus, and optical depth of field.
+Focus can target an atom, residue, base, chain, or the current Inspector item.
+The focus point remains in molecular coordinates as the camera moves.
+
+Optical controls include focal length, sensor height, f-stop, blur radius,
+quality, and circular or polygonal aperture shape. Measurement labels and the
+interface remain sharp. See [depth-of-field implementation](docs/depth-of-field.md)
+and [performance notes](docs/dof-performance.md) for algorithm details.
+
+## Selections and commands
+
+Use the expression field and **Select!** to evaluate selections or save a named
+selection. Entering only a new name stores the current viewport/hierarchy
+selection. A named selection can also be created directly:
 
 ```text
-all                     none
-element C               name CA
-resn ALA                resi 42
-resi 10-30              chain A
-serial 123              hetatm
-polymer
-selection active_site
+select active_site: chain A and resi 10-30
+```
 
-not <expression>
-<expression> and <expression>
-<expression> xor <expression>
-<expression> or <expression>
-(<expression>)
+Named selections appear in the manager with their own hierarchy, style, and
+visibility controls. **Edit expression** reevaluates a selection while retaining
+its style. Renaming a selection updates stored references to its name.
 
-Chain A/LEU*                 residue-name wildcard
-Chain B/[20:22, 70:71]       residue list and inclusive ranges
-Chain A/LEU*/C*              optional atom-name wildcard
-../LEU* AND [20:30, 45:50]   combine masks and residue ranges
+### Selection syntax
+
+Keywords are ASCII case-insensitive. Boolean precedence is `not`, `and`, `xor`,
+then `or`; parentheses override that order.
+
+| Selector | Example |
+| --- | --- |
+| All or no atoms | `all`, `none` |
+| Element or atom name | `element C`, `name CA` |
+| Residue name or number | `resn ALA`, `resi 42`, `resi 10-30` |
+| Chain or PDB serial | `chain A`, `serial 123` |
+| Record/category | `hetatm`, `polymer` |
+| Named selection | `selection active_site` |
+| Boolean composition | `chain A and (resn ASP or resn GLU)` |
+
+Path expressions combine chain, residue, and atom masks:
+
+```text
+Chain A/LEU*
+Chain B/[20:22, 70:71]
+Chain A/LEU*/C*
+../LEU* AND [20:30, 45:50]
 ```
 
 Path masks are case-insensitive. `*` matches any sequence, `?` matches one
-character, and `..` means any chain. Commas inside `[]` do not conflict with the
-colon separating a named selection from its expression.
+character, and `..` matches any chain. Bracketed lists support inclusive ranges.
 
-## Commands
-
-Selection expressions and commands are separate typed parsers:
+### Commands
 
 ```text
 select <expression>
@@ -261,78 +256,134 @@ show spheres|sticks, <expression>
 hide spheres|sticks, <expression>
 ```
 
-To save the atoms currently selected in the viewport or hierarchy, enter only a
-new name such as `active_site` and press **Select!**. The explicit
-`select active_site:` form is also accepted. Full commands such as `select all`
-retain their existing meaning.
-
-Try these with `examples/minimal.pdb`:
+For example:
 
 ```text
-select chain A and resi 1-2
 select active_site: chain A and resi 1-2
-select leucines: Chain A/LEU*
-select loops: Chain B/[20:22, 70:71]
-select leucine_loops: ../LEU* AND [20:30, 45:50]
 color magenta, selection active_site
-select hetatm and not element H
-color red, element O
 color #33aaff, chain A and element C
-show spheres, hetatm
 hide spheres, element H
-hide sticks, chain B
 ```
 
-Named colors currently include red, green, blue, yellow, orange, magenta, cyan,
-white, and gray/grey.
+Named colors include red, green, blue, yellow, orange, magenta, cyan, white, and
+gray/grey. Syntax errors include the position of the invalid input.
 
-The legacy comma form for named selections remains accepted. Right-click a named
-selection in the manager and choose **Edit expression** to reevaluate it while
-keeping its color and visibility settings.
+## Measurements and interaction analysis
 
-## Architecture
+### Distance measurements
 
-The project deliberately remains one Cargo package with strict state boundaries:
+In **Actions**, choose two named selections as endpoints and select
+**Create distance line**. Each endpoint must contain one atom or atoms belonging
+to exactly one residue/base. Multi-atom endpoints use their atom centroid.
+
+The result is an independent measurement object with a dashed line and a distance
+label in ångströms. Its color, visibility, thickness, label size, and name can be
+edited in the measurement panel. Creation, styling, and deletion support undo/redo.
+
+### Structure preparation at a specified pH
+
+**Actions → Prepare structure · pH** restores missing heavy atoms in standard
+protein residues touched by a named selection, then builds explicit H on those
+protein and water residues using tabulated
+pKa values and AMOEBA templates. Choose pH (default 7.0) and the neutral histidine
+tautomer. Heavy-atom restoration is enabled by default and can be disabled.
+Existing heavy-atom coordinates remain fixed. The calculation runs natively and
+supports cancellation and Undo/redo.
+
+Separate reports list restored atoms, ambiguous protonation sites and skipped
+residues. Saved named selections identify new heavy atoms and H. Reconstruction
+requires N, CA and C anchors; missing backbone segments, ligands and nucleic-acid
+heavy atoms are not rebuilt. Unsupported protonation states are reported rather
+than substituted. Existing AMOEBA results must be recalculated after preparation.
+See [preparation workflow, pKa table and limitations](docs/protonation.md).
+
+### AMOEBA hydrogen-bond analysis
+
+**Actions → Hydrogen bonds · AMOEBA 2018** takes one named selection and computes
+continuous interaction scores for chemically eligible donor–H/acceptor candidates.
+It uses permanent multipoles, mutual polarization, and vdW interactions:
 
 ```text
-PDB/mmCIF/BCIF/PDBML -> Molecule (atoms/topology) -> selection AST/evaluation
-                                                    -> DisplayState
-CameraState + Molecule + DisplayState -> instanced wgpu Renderer
-HDR scene color + depth -> thin-lens aperture gather -> egui overlay
-egui UiState -> typed Command -> DisplayState mutation
+ΔE_pair = E_full − E_AB_decoupled
 ```
 
-`molecule`, `selection`, and `command` have no dependency on egui or application
-GPU objects. `DisplayState` owns colors, representation masks, and the current
-selection; the renderer derives GPU instance buffers only when that state changes.
-See `AGENTS.md` for the contributor contract.
+The decoupled evaluation removes only interactions between the two groups and
+reconverges induced dipoles throughout the parameterized environment. Negative
+scores indicate stabilizing coupling. A broad spatial cutoff limits candidate
+search; distance and angle do not determine whether a candidate is displayed.
+The display filter uses energy, with `ΔE < 0` as its default.
 
-## Current limitations
+The result object stores all candidates, energy components, geometry diagnostics,
+and parameterization status. Visible D–A pairs are drawn as styled distance lines.
+Functional groups are defined as template-derived AMOEBA polarization domains;
+multiple candidates can therefore share one group score. Scores are not additive
+bond energies or binding free energies.
 
-- Only the first model and altloc blank/A are loaded
-- Connectivity has no bond order and uses approximate distance perception
-- No molecular surfaces, crystal symmetry, or electron-density maps
-- No trajectory playback
-- No browser build yet
+**Explicit hydrogens are required.** Unsupported or incomplete residues are marked
+`unparameterized`; their covalently connected components are excluded without a
+geometric fallback. The remaining structure supplies the polarization environment,
+including atoms outside the named selection. Large structures can require long
+CPU calculations. See [AMOEBA methodology and limitations](docs/amoeba.md).
 
-## Roadmap
+## Projects, history, and recovery
 
-1. Improved bond perception
-2. Sequence viewer
-3. Molecular surfaces and electron-density maps
-4. Trajectory support
-5. Assemblies and crystal symmetry
-6. Scripting/API
-7. WASM/browser target
+**File → Save as** creates an Astra `.mol` project. Subsequent **Save** operations
+replace it atomically. Projects embed molecular geometry, selections, styling,
+measurements, AMOEBA results, and camera state using a versioned, compressed format.
+See the [Molecule file-format specification](docs/molecule-format.md).
 
-## Development checks
+Tabs maintain independent display state, selections, measurements, camera, and
+undo/redo history. Up to 50 non-camera edits can be undone. Camera movements and
+structure loading are outside that history.
 
-```bash
+Unsaved tabs are marked and prompt before closing. Autosaves are written to a
+separate recovery area. At startup, available recoveries offer **Restore**,
+**Discard**, or **Later**. Restored scenes remain unsaved until written to a project
+file; postponing recovery keeps the autosave for a later launch.
+
+## Architecture and development
+
+Astra is one Cargo package with separate molecular, selection, application, and
+rendering layers.
+
+| Module | Responsibility |
+| --- | --- |
+| `molecule` | Structure parsing, chemical data, topology, and AMOEBA analysis |
+| `selection` | Selection syntax and evaluation against molecular data |
+| `command` | Parsing user commands into typed actions |
+| `camera` | Renderer-independent camera state and operations |
+| `render` | GPU meshes, instances, pipelines, and post-processing |
+| `scene` | Portable project serialization and compatibility |
+| `ui` / `app` | Interaction widgets, state changes, and background work |
+
+Core molecular and selection logic does not depend on a GPU or window.
+`DisplayState` owns presentation attributes, and rendering derives its inputs
+from explicit molecular, display, and camera state.
+
+Run the standard checks before submitting changes:
+
+```sh
 cargo fmt --check
 cargo check
 cargo test
 cargo clippy --all-targets --all-features -- -D warnings
 ```
+
+Native AMOEBA numerical regressions run in the standard test suite against
+committed OpenMM Reference fixtures. Regenerating those fixtures uses optional
+Python development tools described in [AMOEBA validation](docs/amoeba.md).
+
+## Current limitations
+
+- Structure loading retains only the first model and blank/A alternate locations.
+- Viewer connectivity uses approximate distance-based bond inference and stores
+  no bond orders. AMOEBA builds its own template-based chemical topology.
+- Molecular surfaces, electron-density maps, crystal-symmetry expansion, and
+  trajectory playback are not implemented.
+- There is no browser build.
+- AMOEBA requires explicit-H structures; native pH preparation covers complete
+  proteins and water. Ligand parameter generation and
+  parameter-import controls are not implemented.
 
 ## License
 

@@ -43,6 +43,11 @@ pub struct UiState {
     performance_overlay: bool,
     measurement_first: String,
     measurement_second: String,
+    hydrogen_bond_selection: String,
+    preparation_selection: String,
+    preparation_settings: astra::molecule::amoeba::protonation::Settings,
+    pub preparation_report: Option<astra::molecule::amoeba::protonation::Report>,
+    hydrogen_bond_settings: astra::molecule::amoeba::AnalysisSettings,
     color_editor: Option<ColorEditor>,
     named_color_editor: Option<NamedColorEditor>,
     measurement_color_editor: Option<MeasurementColorEditor>,
@@ -213,6 +218,18 @@ pub enum ManagerAction {
         expression: String,
     },
     RemoveNamed(String),
+    PrepareHydrogens {
+        selection: String,
+        settings: astra::molecule::amoeba::protonation::Settings,
+    },
+    CreateHydrogenBonds {
+        selection: String,
+        settings: astra::molecule::amoeba::AnalysisSettings,
+    },
+    SetHydrogenBondThreshold {
+        id: u64,
+        threshold: f64,
+    },
     CreateMeasurement {
         first_selection: String,
         second_selection: String,

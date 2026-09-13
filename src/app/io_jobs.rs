@@ -22,9 +22,26 @@ pub(super) enum JobKind {
     Recover,
     Save,
     Cartoon,
+    HydrogenBonds,
+    Protonation,
 }
 
 pub(super) enum JobRequest {
+    Protonate {
+        id: u64,
+        molecule: Box<Molecule>,
+        settings: astra::molecule::amoeba::protonation::Settings,
+        selected: Vec<usize>,
+        cancel: Arc<AtomicBool>,
+    },
+    HydrogenBonds {
+        id: u64,
+        molecule: Box<Molecule>,
+        selection: String,
+        settings: astra::molecule::amoeba::AnalysisSettings,
+        selected: Vec<usize>,
+        cancel: Arc<AtomicBool>,
+    },
     ScanRecovery,
     DiscardRecovery {
         path: PathBuf,
@@ -69,6 +86,8 @@ pub(super) enum JobEvent {
 }
 
 pub(super) enum JobOutput {
+    Protonated(Box<astra::molecule::amoeba::protonation::Prepared>),
+    HydrogenBonds(astra::molecule::amoeba::HydrogenBondReport),
     Loaded(Box<LoadedPayload>),
     Saved(PathBuf),
     Cartoon(PreparedCartoon),
@@ -545,6 +564,43 @@ pub(super) fn background_worker(
 ) {
     while let Ok(request) = requests.recv() {
         let (id, result) = match request {
+            JobRequest::Protonate {
+                id,
+                molecule,
+                settings,
+                selected,
+                cancel,
+            } => {
+                send_job_progress(&events, &window, id, "Preparing selected residues", 0.1);
+                let result = astra::molecule::amoeba::protonation::prepare_selected(
+                    &molecule, settings, &selected, &cancel,
+                )
+                .map(|p| JobOutput::Protonated(Box::new(p)))
+                .map_err(|e| e.to_string());
+                (id, result)
+            }
+            JobRequest::HydrogenBonds {
+                id,
+                molecule,
+                selection,
+                settings,
+                selected,
+                cancel,
+            } => {
+                send_job_progress(
+                    &events,
+                    &window,
+                    id,
+                    "AMOEBA parameterization and mutual polarization",
+                    0.1,
+                );
+                let result = astra::molecule::amoeba::analyze(
+                    &molecule, &selection, &selected, settings, &cancel,
+                )
+                .map(JobOutput::HydrogenBonds)
+                .map_err(|error| error.to_string());
+                (id, result)
+            }
             JobRequest::ScanRecovery => {
                 let trace = StartupTrace::new("recovery");
                 trace.mark("BEGIN background recovery scan");

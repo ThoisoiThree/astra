@@ -29,7 +29,7 @@ pub const SCENE_EXTENSION: &str = "mol";
 pub const SCENE_FORMAT_NAME: &str = "Molecule 1.0";
 pub const SCENE_MIME_TYPE: &str = "application/vnd.astra.molecule";
 pub const SCENE_SCHEMA_VERSION: u32 = 1;
-pub const SCENE_READER_VERSION: u32 = 2;
+pub const SCENE_READER_VERSION: u32 = 3;
 
 mod container;
 #[cfg(test)]
@@ -106,6 +106,13 @@ impl wire::SceneV1 {
         if document.display.colors.len() != atom_count {
             return Err(invalid("display state does not match molecule atom count"));
         }
+        for line in &document.measurement_lines {
+            if let Some(report) = &line.hydrogen_bonds {
+                report
+                    .validate(atom_count)
+                    .map_err(|error| invalid(error.to_string()))?;
+            }
+        }
         let selections = document
             .named_selections
             .iter()
@@ -140,7 +147,7 @@ impl wire::SceneV1 {
                 .measurement_lines
                 .iter()
                 .map(measurement_to_wire)
-                .collect(),
+                .collect::<Result<Vec<_>, _>>()?,
             camera: Some(camera_to_wire(&document.camera)),
             hierarchy_names: document
                 .hierarchy_names
@@ -234,6 +241,11 @@ impl wire::SceneV1 {
                     "measurement line id {} occurs more than once",
                     line.id
                 )));
+            }
+            if let Some(report) = &line.hydrogen_bonds {
+                report
+                    .validate(molecule.atoms.len())
+                    .map_err(|error| invalid(error.to_string()))?;
             }
             measurement_lines.push(line);
         }
@@ -615,8 +627,8 @@ fn selection_style_from_wire(
     })
 }
 
-fn measurement_to_wire(line: &MeasurementLine) -> wire::MeasurementLineV1 {
-    wire::MeasurementLineV1 {
+fn measurement_to_wire(line: &MeasurementLine) -> Result<wire::MeasurementLineV1, SceneError> {
+    Ok(wire::MeasurementLineV1 {
         id: line.id,
         name: line.name.clone(),
         first: Some(measurement_endpoint_to_wire(&line.first)),
@@ -625,7 +637,14 @@ fn measurement_to_wire(line: &MeasurementLine) -> wire::MeasurementLineV1 {
         visibility: visibility_code(line.visibility) as i32,
         label_size: line.label_size,
         thickness: line.thickness,
-    }
+        hydrogen_bonds: line
+            .hydrogen_bonds
+            .as_ref()
+            .map(serde_json::to_vec)
+            .transpose()
+            .map_err(|error| invalid(format!("cannot encode AMOEBA report: {error}")))?
+            .unwrap_or_default(),
+    })
 }
 
 fn measurement_endpoint_to_wire(endpoint: &MeasurementEndpoint) -> wire::MeasurementEndpointV1 {
@@ -648,6 +667,12 @@ fn measurement_from_wire(line: wire::MeasurementLineV1) -> Result<MeasurementLin
     )?;
     let mut result = MeasurementLine::new(line.id, first, second);
     result.name = line.name;
+    if !line.hydrogen_bonds.is_empty() {
+        result.hydrogen_bonds = Some(
+            serde_json::from_slice(&line.hydrogen_bonds)
+                .map_err(|error| invalid(format!("invalid AMOEBA report: {error}")))?,
+        );
+    }
     result.color = (!line.color.is_empty())
         .then(|| checked_color(&line.color, "measurement color"))
         .transpose()?;
@@ -864,6 +889,7 @@ mod tests {
         };
         display.replace_named_layers(&[(vec![0], named_style)]);
         let line = MeasurementLine {
+            hydrogen_bonds: None,
             id: 7,
             name: "Catalytic distance".into(),
             first: MeasurementEndpoint {
@@ -906,6 +932,22 @@ mod tests {
             pivot_description: "Residue GLY 1".into(),
             camera,
         }
+    }
+
+    #[test]
+    fn amoeba_reports_require_reader_three() {
+        let mut document = document();
+        // An empty report still carries parameterization results and must not
+        // be silently loaded as a zero-length distance in an old reader.
+        let mut report: crate::molecule::amoeba::HydrogenBondReport =
+            serde_json::from_str(include_str!("../tests/fixtures/amoeba_water_dimer.json"))
+                .unwrap();
+        report.candidates.clear();
+        report.residues.clear();
+        document.measurement_lines[0].hydrogen_bonds = Some(report);
+        let message = wire::SceneV1::from_document(&document).unwrap();
+        assert_eq!(message.minimum_reader_version, 3);
+        assert!(legacy_reader_message(&encode(&document).unwrap()).is_err());
     }
 
     #[test]

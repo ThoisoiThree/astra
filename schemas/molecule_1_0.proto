@@ -106,6 +106,8 @@ message MeasurementLine {
   VisibilityOverride visibility = 6;
   float label_size = 7;
   float thickness = 8;
+  // Versioned AMOEBA analysis JSON; requires reader 3. Empty for a distance line.
+  bytes hydrogen_bonds = 9;
 }
 
 message MeasurementEndpoint {
@@ -171,6 +173,13 @@ enum Element {
   ELEMENT_CA = 14;
   ELEMENT_FE = 15;
   ELEMENT_ZN = 16;
+  ELEMENT_LI = 17;
+  ELEMENT_RB = 18;
+  ELEMENT_CS = 19;
+  ELEMENT_BE = 20;
+  ELEMENT_SR = 21;
+  ELEMENT_BA = 22;
+
 }
 
 enum DisplayMode {

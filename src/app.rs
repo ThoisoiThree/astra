@@ -51,6 +51,7 @@ mod actions;
 mod closing;
 mod history;
 mod io_jobs;
+mod protonation;
 mod recovery;
 mod runtime;
 mod session;
@@ -926,6 +927,59 @@ impl Runtime {
                                     .update_prepared_cartoon(molecule, display, prepared);
                             }
                         }
+                        Ok(JobOutput::Protonated(prepared)) => {
+                            if job.cancel.load(Ordering::Relaxed) {
+                                continue;
+                            }
+                            let original_session = self.active_session_id;
+                            if job.session_id != original_session {
+                                self.activate_session(job.session_id);
+                            }
+                            if self.active_session_id == job.session_id
+                                && self.document_version == job.version
+                            {
+                                self.apply_protonation(*prepared);
+                            } else if self.active_session_id == job.session_id {
+                                self.ui.latest_error=Some("Structure preparation discarded because the scene changed; prepare again".into());
+                            }
+                            if original_session != self.active_session_id {
+                                self.activate_session(original_session);
+                            }
+                        }
+                        Ok(JobOutput::HydrogenBonds(report)) => {
+                            if job.cancel.load(Ordering::Relaxed) {
+                                continue;
+                            }
+                            let original_session = self.active_session_id;
+                            if job.session_id != original_session {
+                                self.activate_session(job.session_id);
+                            }
+                            if self.active_session_id == job.session_id
+                                && self.document_version == job.version
+                            {
+                                let before = self.begin_edit();
+                                let endpoint = MeasurementEndpoint {
+                                    position: Vec3::ZERO,
+                                    description: "AMOEBA functional-group interaction".into(),
+                                };
+                                let mut object = MeasurementLine::new(
+                                    self.next_measurement_id,
+                                    endpoint.clone(),
+                                    endpoint,
+                                );
+                                self.next_measurement_id += 1;
+                                object.name = format!("H-bonds · {}", report.selection);
+                                object.hydrogen_bonds = Some(report);
+                                self.measurement_lines.push(object);
+                                self.renderer.update_measurements(&self.measurement_lines);
+                                self.commit_edit(before);
+                            } else if self.active_session_id == job.session_id {
+                                self.ui.latest_error = Some("AMOEBA result discarded because the scene changed; run the analysis again".into());
+                            }
+                            if original_session != self.active_session_id {
+                                self.activate_session(original_session);
+                            }
+                        }
                         Ok(JobOutput::Cancelled) => {}
                         Err(error) if error == "background operation canceled" => {}
                         Err(error) => self.ui.latest_error = Some(error),
@@ -1411,6 +1465,10 @@ impl Runtime {
     fn apply_edit_operation(&mut self, operation: &EditOperation, direction: HistoryDirection) {
         for change in &operation.changes {
             match change {
+                EditChange::Molecule(change) => {
+                    self.replace_molecular_geometry(history_value(change, direction).clone());
+                    self.ui.preparation_report = None;
+                }
                 EditChange::Display(change) => {
                     let state = history_value(change, direction).clone();
                     match (state, &self.molecule, &mut self.display) {
@@ -1466,6 +1524,16 @@ impl Runtime {
             }
         }
         self.recalculate_named_selections();
+        if operation
+            .changes
+            .iter()
+            .any(|c| matches!(c, EditChange::Molecule(_)))
+        {
+            if let (Some(m), Some(d)) = (&self.molecule, &self.display) {
+                self.renderer.update_instances(m, d);
+            }
+            self.needs_cartoon_refresh = false;
+        }
         self.renderer.update_measurements(&self.measurement_lines);
         self.ui.latest_error = None;
     }

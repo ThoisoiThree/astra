@@ -19,6 +19,12 @@ pub enum Element {
     Ca,
     Fe,
     Zn,
+    Li,
+    Rb,
+    Cs,
+    Be,
+    Sr,
+    Ba,
     Unknown,
 }
 
@@ -41,6 +47,12 @@ impl Element {
             Self::Ca => "Ca",
             Self::Fe => "Fe",
             Self::Zn => "Zn",
+            Self::Li => "Li",
+            Self::Rb => "Rb",
+            Self::Cs => "Cs",
+            Self::Be => "Be",
+            Self::Sr => "Sr",
+            Self::Ba => "Ba",
             Self::Unknown => "?",
         }
     }
@@ -56,8 +68,8 @@ impl Element {
             Self::F | Self::Cl => [0.12, 0.78, 0.20],
             Self::Br => [0.60, 0.13, 0.06],
             Self::I => [0.45, 0.10, 0.65],
-            Self::Na => [0.45, 0.40, 0.95],
-            Self::Mg => [0.13, 0.62, 0.13],
+            Self::Li | Self::Rb | Self::Cs | Self::Na => [0.45, 0.40, 0.95],
+            Self::Be | Self::Sr | Self::Ba | Self::Mg => [0.13, 0.62, 0.13],
             Self::K => [0.56, 0.25, 0.83],
             Self::Ca => [0.25, 0.95, 0.25],
             Self::Fe => [0.88, 0.40, 0.20],
@@ -85,6 +97,12 @@ impl Element {
             Self::Ca => 1.76,
             Self::Fe => 1.32,
             Self::Zn => 1.22,
+            Self::Li => 1.28,
+            Self::Rb => 2.20,
+            Self::Cs => 2.44,
+            Self::Be => 0.96,
+            Self::Sr => 1.95,
+            Self::Ba => 2.15,
             Self::Unknown => 0.77,
         }
     }
@@ -107,6 +125,12 @@ impl Element {
             Self::Ca => 2.31,
             Self::Fe => 2.00,
             Self::Zn => 2.10,
+            Self::Li => 2.12,
+            Self::Rb => 3.03,
+            Self::Cs => 3.43,
+            Self::Be => 1.53,
+            Self::Sr => 2.49,
+            Self::Ba => 2.68,
             Self::Unknown => 1.70,
         }
     }
@@ -133,6 +157,12 @@ impl FromStr for Element {
             "CA" => Self::Ca,
             "FE" => Self::Fe,
             "ZN" => Self::Zn,
+            "LI" => Self::Li,
+            "RB" => Self::Rb,
+            "CS" => Self::Cs,
+            "BE" => Self::Be,
+            "SR" => Self::Sr,
+            "BA" => Self::Ba,
             _ => return Err(()),
         };
         Ok(element)

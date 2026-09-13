@@ -6,7 +6,18 @@ use crate::{
 use super::{SceneDocument, SceneError, validation::invalid};
 
 pub(super) fn minimum_reader_version(document: &SceneDocument) -> u32 {
-    if document.display.coloring_mode == ColoringMode::SecondaryStructure {
+    if document
+        .measurement_lines
+        .iter()
+        .any(|line| line.hydrogen_bonds.is_some())
+        || document
+            .molecule
+            .atoms
+            .iter()
+            .any(|a| element_code(a.element) >= 17)
+    {
+        3
+    } else if document.display.coloring_mode == ColoringMode::SecondaryStructure {
         2
     } else {
         1
@@ -32,6 +43,12 @@ pub(super) fn element_code(element: Element) -> i32 {
         Element::Ca => 14,
         Element::Fe => 15,
         Element::Zn => 16,
+        Element::Li => 17,
+        Element::Rb => 18,
+        Element::Cs => 19,
+        Element::Be => 20,
+        Element::Sr => 21,
+        Element::Ba => 22,
     }
 }
 
@@ -54,6 +71,13 @@ pub(super) fn element_from_code(code: i32) -> Result<Element, SceneError> {
         14 => Ok(Element::Ca),
         15 => Ok(Element::Fe),
         16 => Ok(Element::Zn),
+        17 => Ok(Element::Li),
+        18 => Ok(Element::Rb),
+        19 => Ok(Element::Cs),
+        20 => Ok(Element::Be),
+        21 => Ok(Element::Sr),
+        22 => Ok(Element::Ba),
+
         value => Err(invalid(format!("unknown element code {value}"))),
     }
 }

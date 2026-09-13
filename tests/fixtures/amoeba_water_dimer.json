@@ -1,0 +1,178 @@
+{
+  "version": 1,
+  "selection": "water",
+  "force_field": "AMOEBA 2018 / OpenMM 8.4.0",
+  "cutoff": 6.0,
+  "tolerance": 1e-06,
+  "max_iterations": 500,
+  "energy_threshold": 0.0,
+  "candidates": [
+    {
+      "donor": 0,
+      "hydrogen": 1,
+      "acceptor": 3,
+      "donor_group": [
+        0,
+        1,
+        2
+      ],
+      "acceptor_group": [
+        3,
+        4,
+        5
+      ],
+      "donor_position": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "acceptor_position": [
+        2.9,
+        0.15,
+        0.0
+      ],
+      "da_distance": 2.9038767191463206,
+      "ha_distance": 1.9487814141149848,
+      "dha_angle": 175.58551006290963,
+      "parameterization_status": "parameterized",
+      "delta_energy": -5.206344588655389,
+      "permanent": -10.82105458832929,
+      "vdw": 9.768207039623453,
+      "polarization": -4.153497039949553,
+      "scf_iterations": 0,
+      "scf_residual_debye": 0.0
+    },
+    {
+      "donor": 0,
+      "hydrogen": 2,
+      "acceptor": 3,
+      "donor_group": [
+        0,
+        1,
+        2
+      ],
+      "acceptor_group": [
+        3,
+        4,
+        5
+      ],
+      "donor_position": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "acceptor_position": [
+        2.9,
+        0.15,
+        0.0
+      ],
+      "da_distance": 2.9038767191463206,
+      "ha_distance": 3.2347069419037022,
+      "dha_angle": 61.58607992925272,
+      "parameterization_status": "parameterized",
+      "delta_energy": -5.206344588655389,
+      "permanent": -10.82105458832929,
+      "vdw": 9.768207039623453,
+      "polarization": -4.153497039949553,
+      "scf_iterations": 0,
+      "scf_residual_debye": 0.0
+    },
+    {
+      "donor": 3,
+      "hydrogen": 4,
+      "acceptor": 0,
+      "donor_group": [
+        3,
+        4,
+        5
+      ],
+      "acceptor_group": [
+        0,
+        1,
+        2
+      ],
+      "donor_position": [
+        2.9,
+        0.15,
+        0.0
+      ],
+      "acceptor_position": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "da_distance": 2.9038767191463206,
+      "ha_distance": 3.8599156726540027,
+      "dha_angle": 2.2271293706287723,
+      "parameterization_status": "parameterized",
+      "delta_energy": -5.206344588655389,
+      "permanent": -10.82105458832929,
+      "vdw": 9.768207039623453,
+      "polarization": -4.153497039949553,
+      "scf_iterations": 0,
+      "scf_residual_debye": 0.0
+    },
+    {
+      "donor": 3,
+      "hydrogen": 5,
+      "acceptor": 0,
+      "donor_group": [
+        3,
+        4,
+        5
+      ],
+      "acceptor_group": [
+        0,
+        1,
+        2
+      ],
+      "donor_position": [
+        2.9,
+        0.15,
+        0.0
+      ],
+      "acceptor_position": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "da_distance": 2.9038767191463206,
+      "ha_distance": 2.869761139886036,
+      "dha_angle": 82.47275252634313,
+      "parameterization_status": "parameterized",
+      "delta_energy": -5.206344588655389,
+      "permanent": -10.82105458832929,
+      "vdw": 9.768207039623453,
+      "polarization": -4.153497039949553,
+      "scf_iterations": 0,
+      "scf_residual_debye": 0.0
+    }
+  ],
+  "residues": [
+    {
+      "residue": "A:1:HOH",
+      "atoms": [
+        0,
+        1,
+        2
+      ],
+      "status": "parameterized",
+      "reason": "HOH"
+    },
+    {
+      "residue": "A:2:HOH",
+      "atoms": [
+        3,
+        4,
+        5
+      ],
+      "status": "parameterized",
+      "reason": "HOH"
+    }
+  ],
+  "full_permanent": -10.82105458832929,
+  "full_vdw": 9.768207039623453,
+  "full_polarization": -4.153497039949553,
+  "scf_iterations": 8,
+  "scf_residual_debye": 2.653280292530118e-07
+}

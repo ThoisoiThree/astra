@@ -178,6 +178,7 @@ impl UiState {
     }
 
     pub fn document_changed(&mut self) {
+        self.preparation_report = None;
         self.color_editor = None;
         self.named_color_editor = None;
         self.measurement_color_editor = None;

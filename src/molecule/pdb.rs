@@ -150,6 +150,12 @@ pub(crate) fn infer_element(raw_name: &str) -> Element {
                         | Element::Ca
                         | Element::Fe
                         | Element::Zn
+                        | Element::Li
+                        | Element::Rb
+                        | Element::Cs
+                        | Element::Be
+                        | Element::Sr
+                        | Element::Ba
                 )
             })
             .map(|element| element.symbol().to_string())

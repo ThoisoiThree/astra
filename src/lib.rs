@@ -391,6 +391,63 @@ pub struct DisplayStateData {
     modes: HierarchyOverrides<ModeOverride>,
 }
 
+impl DisplayStateData {
+    /// Carry sparse formatting across an explicit atom remap. Hierarchy ids are
+    /// derived afresh because protonation can rename residues and remove H.
+    pub fn remapped(mut self, old: &Molecule, new: &Molecule, mapping: &[Option<usize>]) -> Self {
+        let old_members = hierarchy_membership(old);
+        let new_members = hierarchy_membership(new);
+        let mut chains = HashMap::new();
+        let mut residues = HashMap::new();
+        for (i, j) in mapping.iter().enumerate() {
+            if let Some(j) = j
+                && let (Some(a), Some(b)) = (old_members.get(i), new_members.get(*j))
+            {
+                chains.insert(a.chain, b.chain);
+                residues.insert(a.residue, b.residue);
+            }
+        }
+        fn atoms<T: Copy>(values: HashMap<usize, T>, map: &[Option<usize>]) -> HashMap<usize, T> {
+            values
+                .into_iter()
+                .filter_map(|(i, v)| map.get(i).copied().flatten().map(|j| (j, v)))
+                .collect()
+        }
+        fn hierarchy<T: Copy>(
+            values: HierarchyOverrides<T>,
+            map: &[Option<usize>],
+            chains: &HashMap<u32, u32>,
+            residues: &HashMap<u32, u32>,
+        ) -> HierarchyOverrides<T> {
+            HierarchyOverrides {
+                atoms: atoms(values.atoms, map),
+                chains: values
+                    .chains
+                    .into_iter()
+                    .filter_map(|(i, v)| chains.get(&i).map(|&j| (j, v)))
+                    .collect(),
+                residues: values
+                    .residues
+                    .into_iter()
+                    .filter_map(|(i, v)| residues.get(&i).map(|&j| (j, v)))
+                    .collect(),
+            }
+        }
+        let mut selection = vec![false; new.atoms.len()];
+        for i in self.selection.indices() {
+            if let Some(Some(j)) = mapping.get(i) {
+                selection[*j] = true;
+            }
+        }
+        self.selection = AtomMask::from_bools(selection);
+        self.representation_overrides = atoms(self.representation_overrides, mapping);
+        self.colors = hierarchy(self.colors, mapping, &chains, &residues);
+        self.visibility = hierarchy(self.visibility, mapping, &chains, &residues);
+        self.modes = hierarchy(self.modes, mapping, &chains, &residues);
+        self
+    }
+}
+
 /// Per-document display state. Hierarchy edits are sparse; the public flat
 /// arrays are a derived renderer cache rebuilt from the authoritative state.
 #[derive(Debug, Clone, PartialEq)]

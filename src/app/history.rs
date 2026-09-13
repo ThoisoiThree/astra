@@ -57,6 +57,7 @@ pub(super) struct HierarchyNameChange {
 
 #[derive(Debug, Clone, PartialEq)]
 pub(super) enum EditChange {
+    Molecule(Box<ValueChange<Molecule>>),
     Display(Box<ValueChange<Option<DisplayStateData>>>),
     NamedSelection(Box<NamedSelectionChange>),
     Measurement(Box<MeasurementChange>),
@@ -76,6 +77,36 @@ pub(super) enum HistoryDirection {
 }
 
 impl EditOperation {
+    pub(super) fn molecular(
+        before: EditTransaction,
+        after: EditTransaction,
+        old: Molecule,
+        new: Molecule,
+    ) -> Self {
+        let display = ValueChange {
+            before: before.display.clone(),
+            after: after.display.clone(),
+        };
+        let mut op = Self::between(before, after);
+        // Geometry replacement reconstructs the display cache even when the
+        // sparse style itself did not change (e.g. replacing the same H count).
+        if !op
+            .changes
+            .iter()
+            .any(|c| matches!(c, EditChange::Display(_)))
+        {
+            op.changes.insert(0, EditChange::Display(Box::new(display)));
+        }
+        op.changes.insert(
+            0,
+            EditChange::Molecule(Box::new(ValueChange {
+                before: old,
+                after: new,
+            })),
+        );
+        op
+    }
+
     pub(super) fn between(before: EditTransaction, after: EditTransaction) -> Self {
         let mut changes = Vec::new();
         if before.display != after.display {
