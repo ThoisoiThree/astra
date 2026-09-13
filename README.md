@@ -18,7 +18,7 @@
   <a href="#build-and-dependencies">Build</a> ·
   <a href="#working-with-structures">Usage</a> ·
   <a href="#selections-and-commands">Selections</a> ·
-  <a href="docs/protonation.md">Structure preparation</a> ·
+  <a href="#experimental">Experimental</a> ·
   <a href="#architecture-and-development">Development</a>
 </p>
 
@@ -326,12 +326,15 @@ heavy atoms are not rebuilt. Unsupported protonation states are reported rather
 than substituted. Existing AMOEBA results must be recalculated after preparation.
 See [preparation workflow, pKa table and limitations](docs/protonation.md).
 
+## Experimental
+
+Experimental tools are hidden by default. Enable **Info → Enable experimental
+features** to reveal them under **Actions → Experimental features**. The switch
+is off on each application launch.
+
 ### AMOEBA hydrogen-bond analysis
 
-**Info → Enable experimental features** reveals the **Experimental features**
-section in Actions. This switch is off by default on each application launch.
-
-**Actions → Hydrogen bonds · AMOEBA 2018** takes one named selection and computes
+**Hydrogen bonds · AMOEBA 2018** takes one named selection and computes
 continuous interaction scores for chemically eligible donor–H/acceptor candidates.
 It uses permanent multipoles, mutual polarization, and vdW interactions:
 
