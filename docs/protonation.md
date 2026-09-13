@@ -11,7 +11,8 @@ the supported input range is 0–14.
 2. Leave **Restore missing heavy atoms first** enabled to repair incomplete protein residues, or disable it to prepare H only.
 3. Click **Prepare structure at this pH**.
 4. Inspect the heavy-atom and protonation reports for prepared and skipped residues and ambiguous sites.
-5. Run **Hydrogen bonds · AMOEBA 2018** with the desired named selection.
+5. For AMOEBA analysis, enable **Info → Enable experimental features**, then run
+   **Actions → Experimental features → Hydrogen bonds · AMOEBA 2018** with the desired named selection.
 
 At least one selected atom selects its entire residue for preparation, including
 when only a hydrogen is selected. Other residues retain their atom records and

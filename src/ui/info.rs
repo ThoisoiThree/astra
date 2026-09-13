@@ -39,6 +39,11 @@ impl UiState {
                 ui.add_enabled(false, egui::Button::new("Repository — coming soon"))
                     .on_disabled_hover_text("Repository link will be added later");
                 ui.separator();
+                ui.checkbox(
+                    &mut self.experimental_features,
+                    "Enable experimental features",
+                );
+                ui.separator();
                 ui.strong("System");
                 egui::Grid::new("application system info")
                     .num_columns(2)

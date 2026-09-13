@@ -30,6 +30,7 @@ use selections::*;
 #[derive(Debug, Default)]
 pub struct UiState {
     info_open: bool,
+    experimental_features: bool,
     pub command_input: String,
     pub latest_error: Option<String>,
     history: Vec<String>,

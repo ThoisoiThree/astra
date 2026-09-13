@@ -362,7 +362,9 @@ impl UiState {
                         }});
                     }
                 });
-                ui.separator();
+                if self.experimental_features {
+                    ui.separator();
+                    egui::CollapsingHeader::new("Experimental features").default_open(true).show(ui, |ui| {
                 ui.heading("Hydrogen bonds · AMOEBA 2018");
                 measurement_selection_combo(ui, "Named selection", &names, &mut self.hydrogen_bond_selection);
                 ui.small("Requires explicit H. D, H and A must belong to the selection; the full parameterized structure supplies the environment.");
@@ -383,6 +385,8 @@ impl UiState {
                 });
                 if ui.add_enabled(!self.hydrogen_bond_selection.is_empty(), egui::Button::new("Calculate AMOEBA hydrogen bonds")).clicked() {
                     actions.manager = Some(ManagerAction::CreateHydrogenBonds { selection: self.hydrogen_bond_selection.clone(), settings: self.hydrogen_bond_settings });
+                }
+                    });
                 }
                 ui.separator();
                 ui.heading("Distance line");

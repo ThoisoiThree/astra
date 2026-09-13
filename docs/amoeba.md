@@ -1,5 +1,8 @@
 # AMOEBA 2018 hydrogen-bond analysis
 
+**Info → Enable experimental features** reveals the **Experimental features**
+section in Actions. This switch is off by default on each application launch.
+
 Actions → **Hydrogen bonds · AMOEBA 2018** takes a named selection. The calculation
 runs on the existing background worker and can be canceled. Its result is a
 separate measurement object in the molecule manager, with shared color,

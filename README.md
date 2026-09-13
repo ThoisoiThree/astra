@@ -299,6 +299,9 @@ See [preparation workflow, pKa table and limitations](docs/protonation.md).
 
 ### AMOEBA hydrogen-bond analysis
 
+**Info → Enable experimental features** reveals the **Experimental features**
+section in Actions. This switch is off by default on each application launch.
+
 **Actions → Hydrogen bonds · AMOEBA 2018** takes one named selection and computes
 continuous interaction scores for chemically eligible donor–H/acceptor candidates.
 It uses permanent multipoles, mutual polarization, and vdW interactions:
