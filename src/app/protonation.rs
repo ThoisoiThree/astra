@@ -50,11 +50,10 @@ impl Runtime {
     }
     pub(super) fn replace_molecular_geometry(&mut self, molecule: Molecule) {
         self.cartoon_generation = self.cartoon_generation.wrapping_add(1);
-        for job in self
-            .background_jobs
-            .values()
-            .filter(|j| j.session_id == self.active_session_id && j.kind == JobKind::Cartoon)
-        {
+        for job in self.background_jobs.values().filter(|j| {
+            j.session_id == self.active_session_id
+                && matches!(j.kind, JobKind::Cartoon | JobKind::FrameGeometry)
+        }) {
             job.cancel.store(true, Ordering::Relaxed);
         }
         self.pending_pick = None;
@@ -82,6 +81,14 @@ impl Runtime {
         let Some(old) = self.molecule.clone() else {
             return;
         };
+        if let Some(player) = self.trajectory.take() {
+            // Frames no longer match once atoms are added or removed; the prepared
+            // structure keeps the coordinates of the displayed frame.
+            log::info!(
+                "Trajectory {} unloaded because structure preparation changed the atoms",
+                player.label
+            );
+        }
         let before = self.begin_edit();
         let display = before
             .display

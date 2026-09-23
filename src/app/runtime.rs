@@ -59,6 +59,7 @@ impl ApplicationHandler for AstraApplication {
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         if let Some(runtime) = &mut self.runtime {
             runtime.poll_background_jobs();
+            runtime.poll_trajectory();
             runtime.poll_pick_result();
             if runtime.batch.is_some() {
                 runtime.advance_batch();
@@ -89,7 +90,11 @@ impl ApplicationHandler for AstraApplication {
                 .pending_pick
                 .as_ref()
                 .map(|_| now + Duration::from_millis(8));
-            let deadline = [runtime.next_autosave_deadline(), repaint, pick]
+            let playback = runtime
+                .trajectory
+                .as_ref()
+                .and_then(super::trajectory::TrajectoryPlayer::deadline);
+            let deadline = [runtime.next_autosave_deadline(), repaint, pick, playback]
                 .into_iter()
                 .flatten()
                 .min();
@@ -121,6 +126,9 @@ pub(super) struct Runtime {
     pub(super) measurement_lines: Vec<MeasurementLine>,
     /// Derived from the display state; refreshed whenever geometry is rebuilt.
     pub(super) label_items: Vec<astra::labels::LabelItem>,
+    pub(super) trajectory: Option<super::trajectory::TrajectoryPlayer>,
+    /// A trajectory frame arrived while its ribbons/surface were still being built.
+    pub(super) frame_geometry_pending: bool,
     pub(super) next_measurement_id: u64,
     pub(super) hierarchy_names: BTreeMap<InspectionTarget, String>,
     pub(super) inspection: Option<InspectionTarget>,
@@ -171,4 +179,6 @@ pub(super) struct Runtime {
     /// Command-line batch rendering in progress.
     pub(super) batch: Option<super::structure::BatchState>,
     pub(super) batch_failure: Option<String>,
+    /// `--trajectory` and `--frame` for the structure given on the command line.
+    pub(super) startup_trajectory: Option<(PathBuf, Option<usize>)>,
 }

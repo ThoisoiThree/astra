@@ -28,6 +28,7 @@ pub(super) struct DocumentSession {
     pub(super) document_version: u64,
     pub(super) cartoon_generation: u64,
     pub(super) needs_cartoon_refresh: bool,
+    pub(super) trajectory: Option<super::trajectory::TrajectoryPlayer>,
     pub(super) camera: OrbitCamera,
     pub(super) undo_history: VecDeque<EditOperation>,
     pub(super) redo_history: VecDeque<EditOperation>,
@@ -64,6 +65,7 @@ impl DocumentSession {
             document_version: 0,
             cartoon_generation: 0,
             needs_cartoon_refresh: false,
+            trajectory: None,
             camera: OrbitCamera::new(aspect),
             undo_history: VecDeque::new(),
             redo_history: VecDeque::new(),
@@ -122,6 +124,10 @@ impl DocumentSession {
             focus_description: self.focus_description.clone(),
             pivot_description: self.pivot_description.clone(),
             camera: self.camera.clone(),
+            trajectory: self
+                .trajectory
+                .as_ref()
+                .map(|player| player.scene_trajectory()),
         })
     }
 }

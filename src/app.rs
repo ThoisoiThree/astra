@@ -56,6 +56,7 @@ mod recovery;
 mod runtime;
 mod session;
 mod structure;
+mod trajectory;
 use actions::*;
 use history::*;
 use io_jobs::*;
@@ -91,6 +92,10 @@ struct PendingPick {
 impl Runtime {
     fn new(event_loop: &ActiveEventLoop, options: crate::cli::Options) -> Result<Self> {
         let initial_path = options.path;
+        let startup_trajectory = options
+            .trajectory
+            .filter(|_| options.batch.is_none())
+            .map(|path| (path, options.frame));
         let batch = options.batch.map(structure::BatchState::new);
         let trace = StartupTrace::new("startup");
         trace.mark("BEGIN window creation");
@@ -148,6 +153,8 @@ impl Runtime {
             named_selection_statuses: BTreeMap::new(),
             measurement_lines: Vec::new(),
             label_items: Vec::new(),
+            trajectory: None,
+            frame_geometry_pending: false,
             next_measurement_id: 1,
             hierarchy_names: BTreeMap::new(),
             inspection: None,
@@ -199,6 +206,7 @@ impl Runtime {
             recovery_candidates: VecDeque::new(),
             batch,
             batch_failure: None,
+            startup_trajectory,
         };
         if let Some(path) = initial_path
             && let Err(error) = runtime.start_load_path(&path)
@@ -371,10 +379,9 @@ impl Runtime {
         self.ui.log_new_error();
         let raw_input = self.egui_state.take_egui_input(&self.window);
         let session_tabs = self.session_tabs();
-        let background_job = self
-            .background_jobs
-            .iter()
-            .find(|(_, job)| job.session_id == self.active_session_id);
+        let background_job = self.background_jobs.iter().find(|(_, job)| {
+            job.session_id == self.active_session_id && job.kind != JobKind::FrameGeometry
+        });
         let info = UiInfo {
             #[cfg(target_os = "windows")]
             windows_backend: self.windows_backend,
@@ -407,6 +414,19 @@ impl Runtime {
             named_selection_statuses: &self.named_selection_statuses,
             measurement_lines: &self.measurement_lines,
             labels: &self.label_items,
+            trajectory: self
+                .trajectory
+                .as_ref()
+                .map(|player| crate::ui::TrajectoryInfo {
+                    label: &player.label,
+                    format: player.format.map(|format| format.label()),
+                    frame_count: player.frame_count,
+                    current: player.current,
+                    playing: player.playing,
+                    settings: player.settings,
+                    time: player.time,
+                    cell: player.cell,
+                }),
             hierarchy_names: &self.hierarchy_names,
             inspection: self.inspection,
             hierarchy_selection: &self.hierarchy_selection,
@@ -592,6 +612,9 @@ impl Runtime {
                 Ok(None) => {}
                 Err(error) => self.ui.latest_error = Some(format!("{error:#}")),
             }
+        }
+        if let Some(action) = actions.trajectory {
+            self.handle_trajectory_action(action);
         }
         if let Some(request) = actions.structure_request
             && let Err(error) = self.start_derived_structure(request)
@@ -817,6 +840,11 @@ impl Runtime {
             &mut self.needs_cartoon_refresh,
             &mut session.needs_cartoon_refresh,
         );
+        std::mem::swap(&mut self.trajectory, &mut session.trajectory);
+        if let Some(player) = &mut self.trajectory {
+            player.playing = false;
+        }
+        self.frame_geometry_pending = false;
         std::mem::swap(&mut self.camera, &mut session.camera);
         std::mem::swap(&mut self.undo_history, &mut session.undo_history);
         std::mem::swap(&mut self.redo_history, &mut session.redo_history);
@@ -841,6 +869,7 @@ impl Runtime {
     /// Empties the active tab's document before a new structure is loaded into it.
     fn clear_active_document(&mut self) {
         self.label_items.clear();
+        self.trajectory = None;
         self.molecule = None;
         self.hierarchy = None;
         self.secondary_structure = None;
@@ -957,6 +986,22 @@ impl Runtime {
                                 *payload,
                                 job.kind == JobKind::Recover,
                             );
+                            if self.molecule.is_some()
+                                && let Some((path, frame)) = self.startup_trajectory.take()
+                            {
+                                match self.load_trajectory(path) {
+                                    Ok(()) => {
+                                        if let (Some(frame), Some(player)) =
+                                            (frame, &mut self.trajectory)
+                                        {
+                                            player.seek(frame);
+                                        }
+                                    }
+                                    Err(error) => {
+                                        self.ui.latest_error = Some(format!("{error:#}"));
+                                    }
+                                }
+                            }
                         }
                         Ok(JobOutput::Saved(path)) => {
                             self.apply_saved_job(job.session_id, job.version, path);
@@ -967,9 +1012,13 @@ impl Runtime {
                                 && let (Some(molecule), Some(display)) =
                                     (&self.molecule, &self.display)
                             {
-                                self.renderer
-                                    .update_prepared_cartoon(molecule, display, prepared);
-                                self.refresh_labels();
+                                if job.kind == JobKind::FrameGeometry {
+                                    self.renderer.update_cartoon_geometry(prepared);
+                                } else {
+                                    self.renderer
+                                        .update_prepared_cartoon(molecule, display, prepared);
+                                    self.refresh_labels();
+                                }
                             }
                         }
                         Ok(JobOutput::Protonated(prepared)) => {
@@ -1040,10 +1089,37 @@ impl Runtime {
         {
             self.schedule_cartoon_job();
         }
+        if self.frame_geometry_pending && !self.geometry_job_running() {
+            self.frame_geometry_pending = false;
+            self.schedule_geometry_job(JobKind::FrameGeometry);
+        }
         self.advance_close();
     }
 
     fn schedule_cartoon_job(&mut self) {
+        self.schedule_geometry_job(JobKind::Cartoon);
+    }
+
+    fn geometry_job_running(&self) -> bool {
+        self.background_jobs.values().any(|job| {
+            matches!(job.kind, JobKind::Cartoon | JobKind::FrameGeometry)
+                && job.session_id == self.active_session_id
+        })
+    }
+
+    /// Rebuilds ribbons and surfaces for new coordinates without cancelling work in
+    /// flight; the latest frame is built once the current job completes.
+    pub(super) fn request_frame_geometry(&mut self) {
+        if self.geometry_job_running() {
+            self.frame_geometry_pending = true;
+        } else {
+            self.schedule_geometry_job(JobKind::FrameGeometry);
+        }
+    }
+
+    /// `Cartoon` rebuilds everything and cancels older builds; `FrameGeometry` replaces
+    /// only ribbons and surfaces after coordinates change.
+    fn schedule_geometry_job(&mut self, kind: JobKind) {
         let (Some(molecule), Some(display), Some(hierarchy), Some(secondary_structure)) = (
             &self.molecule,
             &self.display,
@@ -1052,12 +1128,14 @@ impl Runtime {
         ) else {
             return;
         };
-        for job in self
-            .background_jobs
-            .values()
-            .filter(|job| job.kind == JobKind::Cartoon && job.session_id == self.active_session_id)
-        {
-            job.cancel.store(true, Ordering::Relaxed);
+        if kind == JobKind::Cartoon {
+            for job in self.background_jobs.values().filter(|job| {
+                matches!(job.kind, JobKind::Cartoon | JobKind::FrameGeometry)
+                    && job.session_id == self.active_session_id
+            }) {
+                job.cancel.store(true, Ordering::Relaxed);
+            }
+            self.frame_geometry_pending = false;
         }
         let id = self.next_job_id;
         self.next_job_id = self.next_job_id.wrapping_add(1);
@@ -1073,16 +1151,22 @@ impl Runtime {
             cancel: cancel.clone(),
         };
         if self.submit_job(request).is_err() {
-            self.needs_cartoon_refresh = true;
+            if kind == JobKind::Cartoon {
+                self.needs_cartoon_refresh = true;
+            } else {
+                self.frame_geometry_pending = true;
+            }
             return;
         }
-        self.needs_cartoon_refresh = false;
+        if kind == JobKind::Cartoon {
+            self.needs_cartoon_refresh = false;
+        }
         self.background_jobs.insert(
             id,
             BackgroundJob {
                 session_id: self.active_session_id,
                 version: generation,
-                kind: JobKind::Cartoon,
+                kind,
                 stage: "Queued ribbon geometry".into(),
                 progress: 0.0,
                 cancel,
@@ -1115,7 +1199,17 @@ impl Runtime {
                     secondary_structure,
                     atom_bvh,
                     display,
+                    frames,
                 } => {
+                    self.trajectory = (!frames.is_empty()).then(|| {
+                        let mut models = vec![molecule.positions()];
+                        models.extend(frames);
+                        trajectory::TrajectoryPlayer::from_models(
+                            models,
+                            molecule.positions(),
+                            self.window.clone(),
+                        )
+                    });
                     self.loaded_filename = Some(filename);
                     self.molecule_id = Some(molecule_id);
                     self.scene_path = None;
@@ -1164,7 +1258,15 @@ impl Runtime {
                         focus_description,
                         pivot_description,
                         mut camera,
+                        trajectory,
                     } = *document;
+                    self.trajectory = trajectory.map(|saved| {
+                        trajectory::TrajectoryPlayer::restore(
+                            saved,
+                            Some(path.as_path()),
+                            self.window.clone(),
+                        )
+                    });
                     self.molecule_id = Some(if source_name.trim().is_empty() {
                         molecule_id_from_filename(&filename)
                     } else {
@@ -1297,6 +1399,7 @@ impl Runtime {
             focus_description: self.focus_description.clone(),
             pivot_description: self.pivot_description.clone(),
             camera: self.camera.clone(),
+            trajectory: self.scene_trajectory(),
         })
     }
 

@@ -41,6 +41,7 @@ fn scored_object_round_trips_with_style_and_all_candidates() {
     assert_eq!(line.segments().count(), 1);
     assert!(line.segments().all(|(a, b)| a.distance(b) > 2.0));
     let document = SceneDocument {
+        trajectory: None,
         source_name: "water".into(),
         display: DisplayState::for_molecule(&molecule),
         molecule,
@@ -151,6 +152,7 @@ fn preparation_preserves_sparse_style_across_hydrogen_reindexing_and_scene_save(
         }
     }
     let document = SceneDocument {
+        trajectory: None,
         source_name: "prepared water".into(),
         molecule: p.molecule.clone(),
         display: restored.clone(),
@@ -191,6 +193,7 @@ fn restored_heavy_atoms_and_their_selection_survive_scene_save() {
         assert_eq!(display.colors[i], color);
     }
     let document = SceneDocument {
+        trajectory: None,
         source_name: "repaired alanine".into(),
         molecule: p.molecule,
         display,

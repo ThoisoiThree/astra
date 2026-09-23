@@ -113,6 +113,12 @@ impl Runtime {
         if !self.viewport.contains(point) || self.molecule.is_none() {
             return;
         }
+        if self.atom_bvh.is_none()
+            && let Some(molecule) = &self.molecule
+        {
+            // Rebuilt lazily after trajectory frames move the atoms.
+            self.atom_bvh = Some(AtomBvh::build(molecule));
+        }
         let cpu_fallback = self
             .camera
             .screen_ray(point, self.viewport)

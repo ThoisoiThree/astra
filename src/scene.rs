@@ -71,6 +71,18 @@ pub struct SceneDocument {
     pub focus_description: String,
     pub pivot_description: String,
     pub camera: OrbitCamera,
+    pub trajectory: Option<SceneTrajectory>,
+}
+
+/// A trajectory attached to a scene. File trajectories are stored by path; in-memory
+/// models are stored in full.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct SceneTrajectory {
+    pub path: Option<String>,
+    pub models: Vec<Vec<Vec3>>,
+    pub reference_positions: Vec<Vec3>,
+    pub frame: usize,
+    pub playback: crate::molecule::trajectory::PlaybackSettings,
 }
 
 #[derive(Debug, Error)]
@@ -174,6 +186,11 @@ impl wire::SceneV1 {
                 .map(hierarchy_target_to_wire),
             focus_description: document.focus_description.clone(),
             pivot_description: document.pivot_description.clone(),
+            trajectory: document
+                .trajectory
+                .as_ref()
+                .map(|trajectory| trajectory_to_wire(trajectory, atom_count))
+                .transpose()?,
         })
     }
 
@@ -294,6 +311,10 @@ impl wire::SceneV1 {
             hierarchy_selection_anchor,
             focus_description: self.focus_description,
             pivot_description: self.pivot_description,
+            trajectory: self
+                .trajectory
+                .map(|trajectory| trajectory_from_wire(trajectory, atom_count))
+                .transpose()?,
             camera: camera_from_wire(
                 self.camera
                     .ok_or_else(|| invalid("camera section is missing"))?,
@@ -788,6 +809,97 @@ fn display_to_wire(display: &DisplayState) -> Result<wire::DisplayV1, SceneError
     })
 }
 
+fn flatten_positions(positions: &[Vec3]) -> Vec<f32> {
+    positions
+        .iter()
+        .flat_map(|position| position.to_array())
+        .collect()
+}
+
+fn positions_from_flat(
+    values: &[f32],
+    atom_count: usize,
+    what: &str,
+) -> Result<Vec<Vec3>, SceneError> {
+    if values.len() != atom_count * 3 || values.iter().any(|value| !value.is_finite()) {
+        return Err(invalid(format!(
+            "{what} must hold finite x, y, z values for {atom_count} atoms"
+        )));
+    }
+    Ok(values
+        .as_chunks::<3>()
+        .0
+        .iter()
+        .map(|[x, y, z]| Vec3::new(*x, *y, *z))
+        .collect())
+}
+
+fn trajectory_to_wire(
+    trajectory: &SceneTrajectory,
+    atom_count: usize,
+) -> Result<wire::Trajectory, SceneError> {
+    if trajectory
+        .models
+        .iter()
+        .chain(std::iter::once(&trajectory.reference_positions))
+        .any(|positions| positions.len() != atom_count)
+    {
+        return Err(invalid(
+            "trajectory frames do not match molecule atom count",
+        ));
+    }
+    let playback = trajectory.playback.sanitized();
+    Ok(wire::Trajectory {
+        path: trajectory.path.clone().unwrap_or_default(),
+        frame: u32::try_from(trajectory.frame).map_err(|_| invalid("frame index too large"))?,
+        models: trajectory
+            .models
+            .iter()
+            .map(|model| wire::Coordinates {
+                xyz: flatten_positions(model),
+            })
+            .collect(),
+        reference_positions: flatten_positions(&trajectory.reference_positions),
+        fps: playback.fps,
+        loop_mode: playback.loop_mode.code(),
+        stride: playback.stride as u32,
+    })
+}
+
+fn trajectory_from_wire(
+    wire: wire::Trajectory,
+    atom_count: usize,
+) -> Result<SceneTrajectory, SceneError> {
+    let path = (!wire.path.is_empty()).then_some(wire.path);
+    let models = wire
+        .models
+        .iter()
+        .map(|model| positions_from_flat(&model.xyz, atom_count, "trajectory model"))
+        .collect::<Result<Vec<_>, _>>()?;
+    if path.is_none() && models.is_empty() {
+        return Err(invalid("trajectory has neither a path nor models"));
+    }
+    if path.is_none() && wire.frame as usize >= models.len() {
+        return Err(invalid("trajectory frame is out of range"));
+    }
+    Ok(SceneTrajectory {
+        path,
+        models,
+        reference_positions: positions_from_flat(
+            &wire.reference_positions,
+            atom_count,
+            "trajectory reference coordinates",
+        )?,
+        frame: wire.frame as usize,
+        playback: crate::molecule::trajectory::PlaybackSettings {
+            fps: wire.fps,
+            loop_mode: crate::molecule::trajectory::LoopMode::from_code(wire.loop_mode),
+            stride: wire.stride as usize,
+        }
+        .sanitized(),
+    })
+}
+
 fn display_from_wire(
     wire: wire::DisplayV1,
     molecule: &Molecule,
@@ -1263,6 +1375,7 @@ mod tests {
             focus_description: "Atom #10 CA".into(),
             pivot_description: "Residue GLY 1".into(),
             camera,
+            trajectory: None,
         }
     }
 
@@ -1408,6 +1521,46 @@ mod tests {
                 assert_eq!(restored.display.coloring_mode, coloring_mode);
             }
         }
+    }
+
+    #[test]
+    fn trajectories_round_trip_by_path_and_by_models() {
+        let mut original = document();
+        let count = original.molecule.atoms.len();
+        let reference = original.molecule.positions();
+        let shifted: Vec<Vec3> = reference.iter().map(|p| *p + Vec3::X).collect();
+        original.trajectory = Some(SceneTrajectory {
+            path: None,
+            models: vec![reference.clone(), shifted.clone()],
+            reference_positions: reference.clone(),
+            frame: 1,
+            playback: crate::molecule::trajectory::PlaybackSettings {
+                fps: 12.0,
+                loop_mode: crate::molecule::trajectory::LoopMode::Bounce,
+                stride: 2,
+            },
+        });
+        let restored = decode(&encode(&original).unwrap()).unwrap();
+        assert_eq!(restored.trajectory, original.trajectory);
+
+        original.trajectory = Some(SceneTrajectory {
+            path: Some("/data/run.xtc".into()),
+            models: Vec::new(),
+            reference_positions: reference.clone(),
+            frame: 41,
+            playback: Default::default(),
+        });
+        let restored = decode(&encode(&original).unwrap()).unwrap();
+        assert_eq!(restored.trajectory, original.trajectory);
+
+        original.trajectory = Some(SceneTrajectory {
+            path: None,
+            models: vec![vec![Vec3::ZERO; count + 1]],
+            reference_positions: reference,
+            frame: 0,
+            playback: Default::default(),
+        });
+        assert!(encode(&original).is_err());
     }
 
     #[test]

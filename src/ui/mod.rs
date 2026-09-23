@@ -22,6 +22,7 @@ mod mode;
 mod panels;
 mod representations;
 mod selections;
+mod trajectory;
 
 use actions::*;
 use camera::*;
@@ -29,6 +30,7 @@ use hierarchy::*;
 use mode::*;
 pub use representations::RepresentationScope;
 use selections::*;
+pub use trajectory::{TrajectoryAction, TrajectoryInfo};
 
 #[derive(Debug, Default)]
 pub struct UiState {
@@ -358,6 +360,7 @@ pub struct UiActions {
     pub export_image: Option<ExportRequest>,
     pub render_scale: Option<u32>,
     pub structure_request: Option<StructureRequest>,
+    pub trajectory: Option<TrajectoryAction>,
     pub viewport: egui::Rect,
 }
 
@@ -386,6 +389,7 @@ impl Default for UiActions {
             export_image: None,
             render_scale: None,
             structure_request: None,
+            trajectory: None,
             viewport: egui::Rect::NOTHING,
         }
     }
@@ -440,6 +444,7 @@ pub struct UiInfo<'a> {
     pub max_texture_dimension: u32,
     /// Labels of the active document in molecular coordinates.
     pub labels: &'a [astra::labels::LabelItem],
+    pub trajectory: Option<TrajectoryInfo<'a>>,
 }
 
 impl UiState {
@@ -507,6 +512,7 @@ impl UiState {
                     &mut self.rename_editor,
                 );
             });
+        self.trajectory_timeline(root, info, &mut actions);
         if !info.session_tabs.is_empty() {
             egui::Panel::top("document tabs")
                 .exact_size(32.0)

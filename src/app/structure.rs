@@ -167,7 +167,14 @@ impl Runtime {
         let Some(batch) = &self.batch else {
             return;
         };
-        if !self.background_jobs.is_empty() || self.needs_cartoon_refresh {
+        if !self.background_jobs.is_empty()
+            || self.needs_cartoon_refresh
+            || self.frame_geometry_pending
+            || self
+                .trajectory
+                .as_ref()
+                .is_some_and(|player| player.is_busy())
+        {
             return;
         }
         if self.molecule.is_none() {
@@ -191,11 +198,32 @@ impl Runtime {
             }
             BatchStage::Deriving => {
                 let mode = batch.export.mode;
-                let commands = batch.export.commands.clone();
+                let trajectory = batch.export.trajectory.clone();
+                let frame = batch.export.frame;
                 self.set_batch_stage(BatchStage::Configuring);
                 if let Some(mode) = mode {
                     self.handle_manager_action(crate::ui::ManagerAction::SetGlobalMode(mode));
                 }
+                if let Some(path) = trajectory
+                    && let Err(error) = self.load_trajectory(path)
+                {
+                    self.finish_batch(Err(format!("{error:#}")));
+                    return;
+                }
+                if let Some(frame) = frame {
+                    match &mut self.trajectory {
+                        Some(player) => player.seek(frame),
+                        None => {
+                            self.finish_batch(Err(
+                                "--frame needs a trajectory or a file with several models".into(),
+                            ));
+                        }
+                    }
+                }
+            }
+            BatchStage::Configuring => {
+                let commands = batch.export.commands.clone();
+                self.set_batch_stage(BatchStage::Rendering);
                 for command in commands {
                     let result = astra::command::parse_command(&command)
                         .map_err(anyhow::Error::from)
@@ -205,9 +233,18 @@ impl Runtime {
                         return;
                     }
                 }
+                self.flush_cartoon_refresh();
             }
-            BatchStage::Configuring => self.set_batch_stage(BatchStage::Rendering),
             BatchStage::Rendering => {
+                if batch.export.trajectory.is_some() && self.trajectory.is_none() {
+                    let error = self
+                        .ui
+                        .latest_error
+                        .clone()
+                        .unwrap_or_else(|| "the trajectory could not be loaded".into());
+                    self.finish_batch(Err(error));
+                    return;
+                }
                 let (output, request) = (batch.export.output.clone(), batch.export.request);
                 // Frame the structure for the image's aspect ratio rather than the window's.
                 self.camera.aspect =

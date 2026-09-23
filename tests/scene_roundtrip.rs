@@ -13,6 +13,7 @@ fn supplied_4r8p_round_trips_into_a_smaller_self_contained_scene() {
     let molecule = parse_structure(source, "4R8P.pdb").unwrap().molecule;
     let display = DisplayState::for_molecule(&molecule);
     let document = SceneDocument {
+        trajectory: None,
         source_name: "4R8P.pdb".into(),
         molecule: molecule.clone(),
         display: display.clone(),

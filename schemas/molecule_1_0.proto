@@ -18,6 +18,27 @@ message Scene {
   HierarchyTarget hierarchy_selection_anchor = 12;
   string focus_description = 13;
   string pivot_description = 14;
+  // Absent when no trajectory is attached.
+  Trajectory trajectory = 15;
+}
+
+// Frames attached to the structure. The molecule stores the displayed frame.
+message Trajectory {
+  // Trajectory file, re-opened on load; empty for in-memory models.
+  string path = 1;
+  uint32 frame = 2;
+  // In-memory models (for example an NMR ensemble), x y z per atom in Å.
+  repeated Coordinates models = 3;
+  // Structure coordinates before the trajectory was loaded.
+  repeated float reference_positions = 4 [packed = true];
+  float fps = 5;
+  // 0 once, 1 loop, 2 bounce.
+  uint32 loop_mode = 6;
+  uint32 stride = 7;
+}
+
+message Coordinates {
+  repeated float xyz = 1 [packed = true];
 }
 
 message Molecule {

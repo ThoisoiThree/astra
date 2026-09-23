@@ -101,6 +101,20 @@ impl UiState {
                         self.fetch_open = true;
                     }
                     ui.separator();
+                    section(ui, "TRAJECTORY");
+                    if item(ui, "Load trajectory…", "", has_structure, false) {
+                        actions.trajectory = Some(TrajectoryAction::Load);
+                    }
+                    if item(
+                        ui,
+                        "Unload trajectory",
+                        "",
+                        info.trajectory.is_some(),
+                        false,
+                    ) {
+                        actions.trajectory = Some(TrajectoryAction::Unload);
+                    }
+                    ui.separator();
                     section(ui, "SCENE");
                     actions.save |= item(ui, "Save", "", has_structure, false);
                     actions.save_as |= item(ui, "Save as…", "", has_structure, false);

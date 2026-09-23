@@ -168,6 +168,118 @@ impl FrameReader for InMemoryFrames {
     }
 }
 
+/// What happens when playback reaches the last frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LoopMode {
+    /// Stop at the end.
+    Once,
+    /// Jump back to the first frame.
+    #[default]
+    Loop,
+    /// Reverse direction at either end.
+    Bounce,
+}
+
+impl LoopMode {
+    pub const ALL: [Self; 3] = [Self::Once, Self::Loop, Self::Bounce];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Once => "Once",
+            Self::Loop => "Loop",
+            Self::Bounce => "Bounce",
+        }
+    }
+
+    pub const fn code(self) -> u32 {
+        match self {
+            Self::Once => 0,
+            Self::Loop => 1,
+            Self::Bounce => 2,
+        }
+    }
+
+    pub const fn from_code(code: u32) -> Self {
+        match code {
+            0 => Self::Once,
+            2 => Self::Bounce,
+            _ => Self::Loop,
+        }
+    }
+}
+
+/// Playback speed and order.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PlaybackSettings {
+    /// Frames shown per second.
+    pub fps: f32,
+    pub loop_mode: LoopMode,
+    /// Frames advanced per step.
+    pub stride: usize,
+}
+
+impl Default for PlaybackSettings {
+    fn default() -> Self {
+        Self {
+            fps: 24.0,
+            loop_mode: LoopMode::Loop,
+            stride: 1,
+        }
+    }
+}
+
+impl PlaybackSettings {
+    pub const FPS_RANGE: std::ops::RangeInclusive<f32> = 1.0..=120.0;
+
+    pub fn sanitized(self) -> Self {
+        Self {
+            fps: if self.fps.is_finite() {
+                self.fps
+                    .clamp(*Self::FPS_RANGE.start(), *Self::FPS_RANGE.end())
+            } else {
+                Self::default().fps
+            },
+            loop_mode: self.loop_mode,
+            stride: self.stride.clamp(1, 10_000),
+        }
+    }
+
+    /// The frame after `current` when moving in `direction` (+1 or -1), with the new
+    /// direction, or `None` when playback should stop.
+    pub fn next_frame(
+        &self,
+        current: usize,
+        frame_count: usize,
+        direction: i8,
+    ) -> Option<(usize, i8)> {
+        if frame_count < 2 {
+            return None;
+        }
+        let last = frame_count - 1;
+        let stride = self.stride.max(1);
+        let step = |from: usize, direction: i8| -> Option<usize> {
+            if direction >= 0 {
+                from.checked_add(stride).filter(|next| *next <= last)
+            } else {
+                from.checked_sub(stride)
+            }
+        };
+        if let Some(next) = step(current, direction) {
+            return Some((next, direction));
+        }
+        match self.loop_mode {
+            LoopMode::Once => None,
+            LoopMode::Loop => Some(if direction >= 0 { (0, 1) } else { (last, -1) }),
+            LoopMode::Bounce => {
+                let reversed = if direction >= 0 { -1 } else { 1 };
+                step(current, reversed)
+                    .map(|next| (next, reversed))
+                    .or(Some((if reversed > 0 { 0 } else { last }, reversed)))
+            }
+        }
+    }
+}
+
 /// Detects the format from the file contents, falling back to the extension.
 pub fn detect_format(path: &Path) -> Result<TrajectoryFormat, TrajectoryError> {
     let mut magic = [0_u8; 8];
@@ -477,5 +589,35 @@ mod tests {
                 parsed.molecule.positions()
             );
         }
+    }
+
+    #[test]
+    fn playback_advances_loops_and_bounces() {
+        let mut settings = PlaybackSettings::default();
+        assert_eq!(settings.next_frame(0, 5, 1), Some((1, 1)));
+        assert_eq!(settings.next_frame(4, 5, 1), Some((0, 1)));
+        settings.loop_mode = LoopMode::Once;
+        assert_eq!(settings.next_frame(4, 5, 1), None);
+        settings.loop_mode = LoopMode::Bounce;
+        assert_eq!(settings.next_frame(4, 5, 1), Some((3, -1)));
+        assert_eq!(settings.next_frame(0, 5, -1), Some((1, 1)));
+        settings.stride = 3;
+        assert_eq!(settings.next_frame(3, 5, 1), Some((0, -1)));
+        settings.loop_mode = LoopMode::Loop;
+        assert_eq!(settings.next_frame(3, 5, 1), Some((0, 1)));
+        assert_eq!(settings.next_frame(0, 1, 1), None);
+        assert_eq!(
+            PlaybackSettings {
+                fps: f32::NAN,
+                stride: 0,
+                ..settings
+            }
+            .sanitized(),
+            PlaybackSettings {
+                fps: 24.0,
+                stride: 1,
+                ..settings
+            }
+        );
     }
 }

@@ -22,6 +22,9 @@ pub(super) enum JobKind {
     Recover,
     Save,
     Cartoon,
+    /// Ribbons and surfaces for new trajectory coordinates; never cancelled by newer
+    /// frames, so geometry keeps up by skipping frames.
+    FrameGeometry,
     HydrogenBonds,
     Protonation,
 }
@@ -111,6 +114,8 @@ pub(super) enum LoadedPayload {
         secondary_structure: Vec<Vec<SecondaryStructure>>,
         atom_bvh: AtomBvh,
         display: Box<DisplayState>,
+        /// Coordinates of further models in the file.
+        frames: Vec<Vec<Vec3>>,
     },
     Scene {
         filename: String,
@@ -695,6 +700,7 @@ pub(super) fn background_worker(
                             label.clone(),
                             label,
                             derived,
+                            Vec::new(),
                             secondary_source,
                         ))
                     })
@@ -804,7 +810,7 @@ pub(super) fn load_in_background(
         ));
     }
     let parsed = parse_structure(&contents, &filename).map_err(|error| error.to_string())?;
-    let molecule = parsed.molecule;
+    let (molecule, frames) = (parsed.molecule, parsed.frames);
     if cancel.load(Ordering::Relaxed) {
         return Err("background operation canceled".into());
     }
@@ -820,6 +826,7 @@ pub(super) fn load_in_background(
         filename,
         molecule_id,
         molecule,
+        frames,
         astra::molecule::SecondarySource::default(),
     ))
 }
@@ -829,6 +836,7 @@ pub(super) fn structure_payload(
     filename: String,
     molecule_id: String,
     molecule: Molecule,
+    frames: Vec<Vec<Vec3>>,
     secondary_source: astra::molecule::SecondarySource,
 ) -> LoadedPayload {
     let hierarchy = MoleculeHierarchy::from_molecule(&molecule);
@@ -845,6 +853,7 @@ pub(super) fn structure_payload(
         secondary_structure,
         atom_bvh,
         display: Box::new(display),
+        frames,
     }
 }
 

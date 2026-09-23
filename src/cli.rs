@@ -15,6 +15,9 @@ Usage: astra [STRUCTURE] [OPTIONS]
 
 Opens STRUCTURE (PDB, mmCIF, BinaryCIF, PDBML, GRO, XYZ or an Astra .mol scene).
 
+  --trajectory PATH        attach a trajectory (DCD, XTC, TRR, NetCDF, mdcrd or models)
+  --frame N                show frame N of the trajectory or models (1-based, or 'last')
+
 Batch rendering (renders STRUCTURE and exits):
   --export PATH.png        write a PNG image
   --size WIDTHxHEIGHT      image size in pixels (default 1920x1080)
@@ -32,6 +35,9 @@ Batch rendering (renders STRUCTURE and exits):
 #[derive(Debug, Clone, Default)]
 pub struct Options {
     pub path: Option<PathBuf>,
+    pub trajectory: Option<PathBuf>,
+    /// Zero-based frame; `usize::MAX` means the last frame.
+    pub frame: Option<usize>,
     pub batch: Option<BatchExport>,
 }
 
@@ -43,6 +49,9 @@ pub struct BatchExport {
     pub assembly: Option<String>,
     /// Commands such as `show surface, protein`, run in order before rendering.
     pub commands: Vec<String>,
+    pub trajectory: Option<PathBuf>,
+    /// Zero-based frame; `usize::MAX` means the last frame.
+    pub frame: Option<usize>,
 }
 
 pub enum Parsed {
@@ -65,6 +74,8 @@ pub fn parse(arguments: impl IntoIterator<Item = std::ffi::OsString>) -> Result<
     let mut mode = None;
     let mut assembly = None;
     let mut commands = Vec::new();
+    let mut trajectory = None;
+    let mut frame = None;
     let mut batch_option_used = false;
     let mut arguments = arguments.into_iter();
     while let Some(argument) = arguments.next() {
@@ -134,6 +145,22 @@ pub fn parse(arguments: impl IntoIterator<Item = std::ffi::OsString>) -> Result<
                 assembly = Some(value("--assembly")?);
                 batch_option_used = true;
             }
+            "--trajectory" => trajectory = Some(PathBuf::from(value("--trajectory")?)),
+            "--frame" => {
+                let text = value("--frame")?;
+                frame = Some(if text.eq_ignore_ascii_case("last") {
+                    usize::MAX
+                } else {
+                    let number: usize = text
+                        .parse()
+                        .ok()
+                        .filter(|number| *number >= 1)
+                        .with_context(|| {
+                            format!("--frame expects a number from 1 or 'last', not '{text}'")
+                        })?;
+                    number - 1
+                });
+            }
             "--command" => {
                 let command = value("--command")?;
                 astra::command::parse_command(&command)
@@ -150,6 +177,11 @@ pub fn parse(arguments: impl IntoIterator<Item = std::ffi::OsString>) -> Result<
             }
         }
     }
+    if trajectory.is_some() && options.path.is_none() {
+        bail!("--trajectory requires a structure file");
+    }
+    options.trajectory = trajectory.clone();
+    options.frame = frame;
     match output {
         Some(output) => {
             if options.path.is_none() {
@@ -161,6 +193,8 @@ pub fn parse(arguments: impl IntoIterator<Item = std::ffi::OsString>) -> Result<
                 mode,
                 assembly,
                 commands,
+                trajectory,
+                frame,
             });
         }
         None if batch_option_used => bail!("rendering options require --export"),
@@ -208,6 +242,21 @@ mod tests {
         assert_eq!(batch.mode, Some(DisplayMode::Spacefill));
         assert_eq!(batch.assembly.as_deref(), Some("1"));
         assert_eq!(batch.commands, ["show surface, protein"]);
+        let batch = run(&[
+            "a.pdb",
+            "--export",
+            "b.png",
+            "--trajectory",
+            "a.xtc",
+            "--frame",
+            "last",
+        ])
+        .unwrap()
+        .batch
+        .unwrap();
+        assert_eq!(batch.trajectory, Some(PathBuf::from("a.xtc")));
+        assert_eq!(batch.frame, Some(usize::MAX));
+        assert!(run(&["a.pdb", "--export", "b.png", "--frame", "0"]).is_err());
         assert!(
             run(&[
                 "a.pdb",

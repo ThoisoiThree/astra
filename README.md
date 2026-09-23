@@ -180,12 +180,47 @@ to use another location.
 | PDBx/mmCIF | `.cif`, `.mmcif` | Requires atomic coordinates |
 | BinaryCIF | `.bcif` | Binary coordinate input |
 | PDBML | `.xml` | Requires atomic coordinates |
-| Astra project | `.mol` | Embedded structure, display settings, selections, measurements, and camera |
+| GROMACS | `.gro` | Multi-frame files become trajectories |
+| XYZ | `.xyz` | Multi-frame files become trajectories |
+| PQR | `.pqr` | Charges and radii columns are read as occupancy/B-factor |
+| Astra project | `.mol` | Embedded structure, display settings, selections, measurements, camera, and trajectory |
 
 All coordinate formats also support gzip compression. Structure-factor files,
 validation reports, and other files without atomic coordinates cannot be
 displayed as molecular structures. Astra projects use a `MOLECULE` file signature;
 MDL Molfile, which shares the `.mol` extension, is unsupported.
+
+### Trajectories and models
+
+Files with several models (NMR ensembles, multi-model PDB/mmCIF, multi-frame GRO
+or XYZ) open with a timeline below the viewport. **File → Load trajectory…**
+attaches frames from a simulation to the open structure:
+
+| Format | Extensions | Notes |
+| --- | --- | --- |
+| CHARMM/NAMD/X-PLOR DCD | `.dcd` | Either byte order, fixed atoms, unit cells (degrees, cosines, CHARMM c36 box) |
+| GROMACS XTC | `.xtc` | Compressed coordinates, box |
+| GROMACS TRR | `.trr` | Single and double precision; frames without coordinates are skipped |
+| AMBER NetCDF | `.nc`, `.ncdf` | NetCDF-3 classic and 64-bit offset; time and cell |
+| AMBER ASCII | `.mdcrd`, `.trj` | Periodic box lines are detected |
+| Structure models | `.pdb`, `.cif`, `.gro`, `.xyz`, ... | Every model becomes a frame |
+
+The trajectory must have the same atoms in the same order as the structure. Files
+are indexed when opened and read one frame at a time on a background thread, so
+trajectories larger than memory play back smoothly. Playback uploads only atom
+positions to the GPU; ribbons, surfaces and labels are rebuilt in the background
+and skip frames when they cannot keep up. Space plays and pauses, arrow keys step,
+and the timeline sets the frame rate, stride and loop mode (once, loop, bounce).
+
+Scenes save the trajectory path (or in-memory models), the displayed frame and
+playback settings. Unloading a trajectory restores the structure's coordinates.
+From the command line, `astra system.gro --trajectory run.xtc --frame last`
+opens a trajectory directly; batch export accepts the same options.
+
+Coordinates are shown as stored: molecules split across periodic boundaries
+are not made whole, secondary structure is assigned once from the structure,
+and measurements and named selections keep the coordinates of the frame where
+they were created.
 
 ### Navigation and inspection
 
@@ -450,6 +485,13 @@ Core molecular and selection logic does not depend on a GPU or window.
 `DisplayState` owns presentation attributes, and rendering derives its inputs
 from explicit molecular, display, and camera state.
 
+Topology and coordinates are separated: a `Molecule` is the fixed topology
+(atoms, residues, bonds, chemistry) plus the coordinates of the displayed frame,
+and `molecule::trajectory` supplies further frames through the `FrameReader`
+trait. On the GPU, positions live in their own storage buffer next to per-atom
+colors and flags; sphere and bond impostors reference atoms by index, so a new
+frame rewrites only that buffer.
+
 Run the standard checks before submitting changes:
 
 ```sh
@@ -484,11 +526,11 @@ Python development tools described in [AMOEBA validation](docs/amoeba.md).
 
 ## Current limitations
 
-- Structure loading retains only the first model and blank/A alternate locations.
-- Viewer connectivity uses approximate distance-based bond inference and stores
-  no bond orders. AMOEBA builds its own template-based chemical topology.
-- Molecular surfaces, electron-density maps, crystal-symmetry expansion, and
-  trajectory playback are not implemented.
+- Electron-density maps, dynamic (per-frame) measurements and periodic
+  unwrapping of trajectories are not implemented.
+- Transparent surfaces are not supported; surfaces are opaque.
+- Topology-only formats (PSF, PRMTOP, TPR) are not read; load a structure with
+  coordinates (PDB, GRO, mmCIF) and attach the trajectory to it.
 - There is no browser build.
 - AMOEBA requires explicit-H structures; native pH preparation covers complete
   proteins and water. Ligand parameter generation and
