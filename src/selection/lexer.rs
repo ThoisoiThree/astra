@@ -35,7 +35,7 @@ pub(crate) fn lex(input: &str) -> Result<Vec<Token>, SelectionParseError> {
                 TokenKind::RightParen
             }
             _ if character.is_ascii_alphanumeric()
-                || matches!(character, '_' | '-' | '+' | '\'' | '*') =>
+                || matches!(character, '_' | '-' | '+' | '\'' | '*' | '.') =>
             {
                 let start = index;
                 while index < input.len() {
@@ -46,7 +46,7 @@ pub(crate) fn lex(input: &str) -> Result<Vec<Token>, SelectionParseError> {
                         break;
                     }
                     if !(current.is_ascii_alphanumeric()
-                        || matches!(current, '_' | '-' | '+' | '\'' | '*'))
+                        || matches!(current, '_' | '-' | '+' | '\'' | '*' | '.'))
                     {
                         return Err(SelectionParseError::new(
                             index,

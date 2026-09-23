@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::molecule::Molecule;
 
-use super::{Selection, SelectionExpr, evaluate_with_named, parse_selection};
+use super::{Selection, SelectionExpr, ast::format_distance, evaluate_with_named, parse_selection};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SelectionStatus {
@@ -247,18 +247,11 @@ pub fn named_dependencies(expression: &SelectionExpr) -> BTreeSet<String> {
 }
 
 fn collect_dependencies(expression: &SelectionExpr, output: &mut BTreeSet<String>) {
-    match expression {
-        SelectionExpr::Named(name) => {
-            output.insert(name.clone());
-        }
-        SelectionExpr::Not(inner) => collect_dependencies(inner, output),
-        SelectionExpr::And(left, right)
-        | SelectionExpr::Xor(left, right)
-        | SelectionExpr::Or(left, right) => {
-            collect_dependencies(left, output);
-            collect_dependencies(right, output);
-        }
-        _ => {}
+    if let SelectionExpr::Named(name) = expression {
+        output.insert(name.clone());
+    }
+    for child in expression.children() {
+        collect_dependencies(child, output);
     }
 }
 
@@ -273,18 +266,13 @@ pub fn rename_named_reference(
 }
 
 fn rename_in_ast(expression: &mut SelectionExpr, old_name: &str, new_name: &str) {
-    match expression {
-        SelectionExpr::Named(name) if name.eq_ignore_ascii_case(old_name) => {
-            *name = new_name.to_owned();
-        }
-        SelectionExpr::Not(inner) => rename_in_ast(inner, old_name, new_name),
-        SelectionExpr::And(left, right)
-        | SelectionExpr::Xor(left, right)
-        | SelectionExpr::Or(left, right) => {
-            rename_in_ast(left, old_name, new_name);
-            rename_in_ast(right, old_name, new_name);
-        }
-        _ => {}
+    if let SelectionExpr::Named(name) = expression
+        && name.eq_ignore_ascii_case(old_name)
+    {
+        *name = new_name.to_owned();
+    }
+    for child in expression.children_mut() {
+        rename_in_ast(child, old_name, new_name);
     }
 }
 
@@ -309,6 +297,37 @@ fn format_with_precedence(expression: &SelectionExpr, parent: u8) -> String {
         SelectionExpr::Named(value) => (5, format!("selection {value}")),
         SelectionExpr::Hetatm => (5, "hetatm".into()),
         SelectionExpr::Polymer => (5, "polymer".into()),
+        SelectionExpr::Protein => (5, "protein".into()),
+        SelectionExpr::Nucleic => (5, "nucleic".into()),
+        SelectionExpr::Water => (5, "water".into()),
+        SelectionExpr::Ion => (5, "ion".into()),
+        SelectionExpr::Ligand => (5, "ligand".into()),
+        SelectionExpr::Backbone => (5, "backbone".into()),
+        SelectionExpr::Sidechain => (5, "sidechain".into()),
+        SelectionExpr::Hydrogen => (5, "hydrogen".into()),
+        // Prefix operators bind like `not`: their operand extends over one unary term.
+        SelectionExpr::Within(distance, inner) => (
+            4,
+            format!(
+                "within {} of {}",
+                format_distance(*distance),
+                format_with_precedence(inner, 4)
+            ),
+        ),
+        SelectionExpr::Around(distance, inner) => (
+            4,
+            format!(
+                "around {} of {}",
+                format_distance(*distance),
+                format_with_precedence(inner, 4)
+            ),
+        ),
+        SelectionExpr::ByResidue(inner) => {
+            (4, format!("byres {}", format_with_precedence(inner, 4)))
+        }
+        SelectionExpr::ByChain(inner) => {
+            (4, format!("bychain {}", format_with_precedence(inner, 4)))
+        }
         SelectionExpr::Not(inner) => (4, format!("not {}", format_with_precedence(inner, 4))),
         SelectionExpr::And(left, right) => (
             3,

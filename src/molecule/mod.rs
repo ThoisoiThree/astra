@@ -3,6 +3,7 @@ mod bcif;
 mod bonds;
 pub mod ccd;
 mod cif;
+pub mod classify;
 mod coordinates;
 pub mod dssp;
 mod element;

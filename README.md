@@ -253,8 +253,10 @@ its style. Renaming a selection updates stored references to its name.
 
 ### Selection syntax
 
-Keywords are ASCII case-insensitive. Boolean precedence is `not`, `and`, `xor`,
-then `or`; parentheses override that order.
+Keywords are ASCII case-insensitive. Boolean precedence is the prefix operators
+(`not`, `within`, `around`, `byres`, `bychain`), then `and`, `xor`, then `or`;
+parentheses override that order. A prefix operator applies to one term, so
+`within 5 of ligand and protein` means `(within 5 of ligand) and protein`.
 
 | Selector | Example |
 | --- | --- |
@@ -263,6 +265,10 @@ then `or`; parentheses override that order.
 | Residue name or number | `resn ALA`, `resi 42`, `resi 10-30` |
 | Chain or PDB serial | `chain A`, `serial 123` |
 | Record/category | `hetatm`, `polymer` |
+| Chemical class | `protein`, `nucleic`, `water` (`solvent`), `ion`, `ligand` |
+| Atom class | `backbone` (`bb`), `sidechain` (`sc`), `hydrogen` |
+| Distance, Å | `within 4.5 of ligand`, `around 3 of resn HEM` |
+| Whole residues or chains | `byres around 5 of ligand`, `bychain serial 120`, `same residue as name CA` |
 | Named selection | `selection active_site` |
 | Boolean composition | `chain A and (resn ASP or resn GLU)` |
 
@@ -277,6 +283,14 @@ Chain A/LEU*/C*
 
 Path masks are case-insensitive. `*` matches any sequence, `?` matches one
 character, and `..` matches any chain. Bracketed lists support inclusive ranges.
+
+Chemical classes come from the embedded wwPDB Chemical Component Dictionary, so
+modified residues (`MSE`, `SEP`) count as protein and force-field names (`HSD`,
+`SOL`, `SOD`) are recognized. `backbone` covers the protein main chain with its
+hydrogens and the nucleic-acid sugar-phosphate backbone; `sidechain` is the rest
+of each amino acid. `within` includes the reference atoms themselves, `around`
+excludes them. Distance queries use a spatial grid and scale linearly with the
+number of atoms.
 
 ### Commands
 

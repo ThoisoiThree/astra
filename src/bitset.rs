@@ -105,6 +105,63 @@ impl AtomMask {
             .filter_map(|(index, selected)| selected.then_some(index))
     }
 
+    pub fn from_fn(len: usize, mut predicate: impl FnMut(usize) -> bool) -> Self {
+        let mut words = vec![0_u64; len.div_ceil(64)];
+        for index in 0..len {
+            if predicate(index) {
+                words[index / 64] |= 1_u64 << (index % 64);
+            }
+        }
+        Self {
+            len,
+            words: Arc::new(words),
+        }
+    }
+
+    /// Keeps only bits also set in `other`; lengths must match.
+    pub fn intersect_with(&mut self, other: &Self) {
+        debug_assert_eq!(self.len, other.len);
+        for (word, other) in Arc::make_mut(&mut self.words)
+            .iter_mut()
+            .zip(other.words.iter())
+        {
+            *word &= other;
+        }
+    }
+
+    pub fn union_with(&mut self, other: &Self) {
+        debug_assert_eq!(self.len, other.len);
+        for (word, other) in Arc::make_mut(&mut self.words)
+            .iter_mut()
+            .zip(other.words.iter())
+        {
+            *word |= other;
+        }
+    }
+
+    pub fn symmetric_difference_with(&mut self, other: &Self) {
+        debug_assert_eq!(self.len, other.len);
+        for (word, other) in Arc::make_mut(&mut self.words)
+            .iter_mut()
+            .zip(other.words.iter())
+        {
+            *word ^= other;
+        }
+    }
+
+    pub fn invert(&mut self) {
+        let len = self.len;
+        let words = Arc::make_mut(&mut self.words);
+        for word in words.iter_mut() {
+            *word = !*word;
+        }
+        if !len.is_multiple_of(64)
+            && let Some(last) = words.last_mut()
+        {
+            *last &= (1_u64 << (len % 64)) - 1;
+        }
+    }
+
     pub fn packed_words(&self) -> &[u64] {
         &self.words
     }
@@ -128,5 +185,22 @@ mod tests {
         assert!(unchanged.contains(64));
         assert!(!mask.contains(64));
         assert_eq!(mask.estimated_heap_bytes(), 24);
+    }
+
+    #[test]
+    fn set_operations_keep_padding_bits_clear() {
+        let evens = AtomMask::from_fn(70, |index| index % 2 == 0);
+        let mut inverted = evens.clone();
+        inverted.invert();
+        assert_eq!(inverted.count(), 35);
+        let mut all = evens.clone();
+        all.union_with(&inverted);
+        assert_eq!(all, AtomMask::new(70, true));
+        let mut none = evens.clone();
+        none.intersect_with(&inverted);
+        assert_eq!(none.count(), 0);
+        let mut difference = all.clone();
+        difference.symmetric_difference_with(&evens);
+        assert_eq!(difference, inverted);
     }
 }

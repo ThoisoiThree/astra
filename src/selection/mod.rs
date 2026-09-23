@@ -4,7 +4,7 @@ mod lexer;
 mod parser;
 mod registry;
 
-pub use ast::SelectionExpr;
+pub use ast::{MAX_SELECTION_DISTANCE, SelectionExpr, distance_to_milli, milli_to_distance};
 pub use eval::{Selection, SelectionEvaluationError, evaluate, evaluate_with_named};
 pub use parser::{SelectionParseError, parse_selection};
 pub use registry::{

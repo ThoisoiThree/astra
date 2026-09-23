@@ -3,7 +3,7 @@ use std::{fmt, str::FromStr};
 use crate::molecule::Element;
 
 use super::{
-    ast::SelectionExpr,
+    ast::{MAX_SELECTION_DISTANCE, SelectionExpr, distance_to_milli},
     lexer::{Token, TokenKind, lex},
 };
 
@@ -100,12 +100,9 @@ fn parse_mask_expression(
         }
     }
 
-    if let Some(rest) = strip_keyword_prefix(input, "not") {
+    if let Some((operator, rest)) = strip_prefix_operator(input, position)? {
         let rest_position = position + input.len() - rest.len();
-        return Ok(SelectionExpr::Not(Box::new(parse_mask_expression(
-            rest,
-            rest_position,
-        )?)));
+        return Ok(operator.apply(parse_mask_expression(rest, rest_position)?));
     }
 
     if input.starts_with('[') {
@@ -122,6 +119,104 @@ fn parse_mask_expression(
         error.position += position;
         error
     })
+}
+
+/// Unary prefix operators shared by the token parser and the path-mask parser.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrefixOperator {
+    Not,
+    Within(u32),
+    Around(u32),
+    ByResidue,
+    ByChain,
+}
+
+impl PrefixOperator {
+    fn apply(self, operand: SelectionExpr) -> SelectionExpr {
+        let operand = Box::new(operand);
+        match self {
+            Self::Not => SelectionExpr::Not(operand),
+            Self::Within(distance) => SelectionExpr::Within(distance, operand),
+            Self::Around(distance) => SelectionExpr::Around(distance, operand),
+            Self::ByResidue => SelectionExpr::ByResidue(operand),
+            Self::ByChain => SelectionExpr::ByChain(operand),
+        }
+    }
+}
+
+fn parse_distance(value: &str, position: usize) -> Result<u32, SelectionParseError> {
+    match value.parse::<f32>() {
+        Ok(distance)
+            if distance.is_finite() && (0.0..=MAX_SELECTION_DISTANCE).contains(&distance) =>
+        {
+            Ok(distance_to_milli(distance))
+        }
+        _ => Err(SelectionParseError::new(
+            position,
+            format!("a distance in Å between 0 and {MAX_SELECTION_DISTANCE}"),
+            format!("'{value}'"),
+        )),
+    }
+}
+
+/// Splits a leading prefix operator off a path-mask expression.
+fn strip_prefix_operator(
+    input: &str,
+    position: usize,
+) -> Result<Option<(PrefixOperator, &str)>, SelectionParseError> {
+    if let Some(rest) = strip_keyword_prefix(input, "not") {
+        return Ok(Some((PrefixOperator::Not, rest)));
+    }
+    for (keyword, operator) in [
+        ("byres", PrefixOperator::ByResidue),
+        ("bychain", PrefixOperator::ByChain),
+    ] {
+        if let Some(rest) = strip_keyword_prefix(input, keyword) {
+            return Ok(Some((operator, rest)));
+        }
+    }
+    for (phrase, operator) in [
+        (["same", "residue", "as"], PrefixOperator::ByResidue),
+        (["same", "chain", "as"], PrefixOperator::ByChain),
+    ] {
+        let mut rest = input;
+        let mut matched = true;
+        for word in phrase {
+            match strip_keyword_prefix(rest, word) {
+                Some(next) => rest = next,
+                None => {
+                    matched = false;
+                    break;
+                }
+            }
+        }
+        if matched {
+            return Ok(Some((operator, rest)));
+        }
+    }
+    for keyword in ["within", "around"] {
+        let Some(rest) = strip_keyword_prefix(input, keyword) else {
+            continue;
+        };
+        let distance_position = position + input.len() - rest.len();
+        let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        let distance = parse_distance(&rest[..end], distance_position)?;
+        let after = rest[end..].trim_start();
+        let Some(operand) = strip_keyword_prefix(after, "of") else {
+            return Err(SelectionParseError::new(
+                position + input.len() - after.len(),
+                "'of'",
+                after.split_whitespace().next().unwrap_or("end of input"),
+            ));
+        };
+        let operator = if keyword == "within" {
+            PrefixOperator::Within(distance)
+        } else {
+            PrefixOperator::Around(distance)
+        };
+        return Ok(Some((operator, operand)));
+    }
+    Ok(None)
 }
 
 fn strip_keyword_prefix<'a>(input: &'a str, keyword: &str) -> Option<&'a str> {
@@ -190,7 +285,12 @@ fn parse_chain_mask_body(
     position: usize,
 ) -> Result<SelectionExpr, SelectionParseError> {
     let segments: Vec<_> = mask.split('/').map(str::trim).collect();
-    if !(2..=3).contains(&segments.len()) || segments.iter().any(|segment| segment.is_empty()) {
+    if !(2..=3).contains(&segments.len())
+        || segments.iter().any(|segment| {
+            segment.is_empty()
+                || (!segment.starts_with('[') && segment.contains(char::is_whitespace))
+        })
+    {
         return Err(SelectionParseError::new(
             position,
             "Chain <chain>/<residue-mask>[/<atom-mask>]",
@@ -320,12 +420,55 @@ impl Parser {
         Ok(expression)
     }
 
+    /// Unary level: `not`, `within D of`, `around D of`, `byres`, `bychain` and
+    /// `same residue|chain as` all take one unary operand.
     fn parse_not(&mut self) -> Result<SelectionExpr, SelectionParseError> {
-        if self.consume_keyword("not") {
-            Ok(SelectionExpr::Not(Box::new(self.parse_not()?)))
+        let operator = if self.consume_keyword("not") {
+            PrefixOperator::Not
+        } else if self.consume_keyword("byres") {
+            PrefixOperator::ByResidue
+        } else if self.consume_keyword("bychain") {
+            PrefixOperator::ByChain
+        } else if self.peek_keyword(0, "same")
+            && (self.peek_keyword(1, "residue") || self.peek_keyword(1, "chain"))
+        {
+            self.cursor += 1;
+            let chain = self.consume_keyword("chain");
+            if !chain {
+                self.cursor += 1;
+            }
+            if !self.consume_keyword("as") {
+                return Err(self.error_here("'as'"));
+            }
+            if chain {
+                PrefixOperator::ByChain
+            } else {
+                PrefixOperator::ByResidue
+            }
+        } else if self.peek_keyword(0, "within") || self.peek_keyword(0, "around") {
+            let around = self.peek_keyword(0, "around");
+            self.cursor += 1;
+            let (value, position) = self.value("a distance in Å")?;
+            let distance = parse_distance(&value, position)?;
+            if !self.consume_keyword("of") {
+                return Err(self.error_here("'of'"));
+            }
+            if around {
+                PrefixOperator::Around(distance)
+            } else {
+                PrefixOperator::Within(distance)
+            }
         } else {
-            self.parse_primary()
-        }
+            return self.parse_primary();
+        };
+        Ok(operator.apply(self.parse_not()?))
+    }
+
+    fn peek_keyword(&self, offset: usize, keyword: &str) -> bool {
+        matches!(
+            self.tokens.get(self.cursor + offset),
+            Some(Token { kind: TokenKind::Word(word), .. }) if word.eq_ignore_ascii_case(keyword)
+        )
     }
 
     fn parse_primary(&mut self) -> Result<SelectionExpr, SelectionParseError> {
@@ -352,6 +495,14 @@ impl Parser {
             "none" => Ok(SelectionExpr::None),
             "hetatm" => Ok(SelectionExpr::Hetatm),
             "polymer" => Ok(SelectionExpr::Polymer),
+            "protein" => Ok(SelectionExpr::Protein),
+            "nucleic" => Ok(SelectionExpr::Nucleic),
+            "water" | "waters" | "solvent" => Ok(SelectionExpr::Water),
+            "ion" | "ions" => Ok(SelectionExpr::Ion),
+            "ligand" | "ligands" | "organic" => Ok(SelectionExpr::Ligand),
+            "backbone" | "bb" => Ok(SelectionExpr::Backbone),
+            "sidechain" | "sc" => Ok(SelectionExpr::Sidechain),
+            "hydrogen" | "hydrogens" => Ok(SelectionExpr::Hydrogen),
             "element" => {
                 let (value, position) = self.value("an element symbol")?;
                 let element = Element::from_str(&value).map_err(|()| {
@@ -553,5 +704,65 @@ mod tests {
         assert!(error.expected.contains("predicate"));
         assert!(parse_selection("banana A").is_err());
         assert!(parse_selection("(chain A").is_err());
+    }
+
+    #[test]
+    fn parses_spatial_and_expansion_operators() {
+        assert_eq!(
+            parse_selection("within 4.5 of resn HEM and not water").unwrap(),
+            SelectionExpr::And(
+                Box::new(SelectionExpr::Within(
+                    4500,
+                    Box::new(SelectionExpr::ResidueName("HEM".into()))
+                )),
+                Box::new(SelectionExpr::Not(Box::new(SelectionExpr::Water))),
+            )
+        );
+        assert_eq!(
+            parse_selection("byres around 3 of (ligand or ion)").unwrap(),
+            SelectionExpr::ByResidue(Box::new(SelectionExpr::Around(
+                3000,
+                Box::new(SelectionExpr::Or(
+                    Box::new(SelectionExpr::Ligand),
+                    Box::new(SelectionExpr::Ion)
+                ))
+            )))
+        );
+        assert_eq!(
+            parse_selection("same residue as serial 5").unwrap(),
+            SelectionExpr::ByResidue(Box::new(SelectionExpr::Serial(5)))
+        );
+        assert_eq!(
+            parse_selection("same chain as hydrogen").unwrap(),
+            SelectionExpr::ByChain(Box::new(SelectionExpr::Hydrogen))
+        );
+        assert_eq!(
+            parse_selection("bychain within 5 of Chain A/[10:12]").unwrap(),
+            SelectionExpr::ByChain(Box::new(SelectionExpr::Within(
+                5000,
+                Box::new(SelectionExpr::And(
+                    Box::new(SelectionExpr::Chain("A".into())),
+                    Box::new(SelectionExpr::ResidueRange(10, 12))
+                ))
+            )))
+        );
+        assert!(parse_selection("within five of protein").is_err());
+        assert!(parse_selection("within 5 protein").is_err());
+        assert!(parse_selection("within -1 of protein").is_err());
+        assert!(parse_selection("around 5 of Chain A/LEU* and").is_err());
+    }
+
+    #[test]
+    fn formatting_round_trips_through_the_parser() {
+        for source in [
+            "within 4.5 of resn HEM and not water",
+            "byres (within 3 of ligand or ion)",
+            "not around 2.25 of chain A",
+            "bychain (protein and backbone) or sidechain xor hydrogen",
+        ] {
+            let parsed = parse_selection(source).unwrap();
+            let formatted = super::super::format_expression(&parsed);
+            assert_eq!(parse_selection(&formatted).unwrap(), parsed, "{formatted}");
+        }
     }
 }
