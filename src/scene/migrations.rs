@@ -6,7 +6,16 @@ use crate::{
 use super::{SceneDocument, SceneError, validation::invalid};
 
 pub(super) fn minimum_reader_version(document: &SceneDocument) -> u32 {
+    // Reader 4 understands `atomic_numbers`; older readers would silently turn elements
+    // outside the reader-1 enum into unknown atoms.
     if document
+        .molecule
+        .atoms
+        .iter()
+        .any(|a| a.element != Element::Unknown && element_code(a.element) == 0)
+    {
+        4
+    } else if document
         .measurement_lines
         .iter()
         .any(|line| line.hydrogen_bonds.is_some())
@@ -24,62 +33,46 @@ pub(super) fn minimum_reader_version(document: &SceneDocument) -> u32 {
     }
 }
 
+/// Element codes of the reader-1 `Element` wire enum. Other elements are written as
+/// `ELEMENT_UNKNOWN` there and carried exactly by the `atomic_numbers` field.
+const LEGACY_ELEMENTS: [Element; 23] = [
+    Element::Unknown,
+    Element::H,
+    Element::C,
+    Element::N,
+    Element::O,
+    Element::P,
+    Element::S,
+    Element::F,
+    Element::Cl,
+    Element::Br,
+    Element::I,
+    Element::Na,
+    Element::Mg,
+    Element::K,
+    Element::Ca,
+    Element::Fe,
+    Element::Zn,
+    Element::Li,
+    Element::Rb,
+    Element::Cs,
+    Element::Be,
+    Element::Sr,
+    Element::Ba,
+];
+
 pub(super) fn element_code(element: Element) -> i32 {
-    match element {
-        Element::Unknown => 0,
-        Element::H => 1,
-        Element::C => 2,
-        Element::N => 3,
-        Element::O => 4,
-        Element::P => 5,
-        Element::S => 6,
-        Element::F => 7,
-        Element::Cl => 8,
-        Element::Br => 9,
-        Element::I => 10,
-        Element::Na => 11,
-        Element::Mg => 12,
-        Element::K => 13,
-        Element::Ca => 14,
-        Element::Fe => 15,
-        Element::Zn => 16,
-        Element::Li => 17,
-        Element::Rb => 18,
-        Element::Cs => 19,
-        Element::Be => 20,
-        Element::Sr => 21,
-        Element::Ba => 22,
-    }
+    LEGACY_ELEMENTS
+        .iter()
+        .position(|candidate| *candidate == element)
+        .unwrap_or(0) as i32
 }
 
 pub(super) fn element_from_code(code: i32) -> Result<Element, SceneError> {
-    match code {
-        0 => Ok(Element::Unknown),
-        1 => Ok(Element::H),
-        2 => Ok(Element::C),
-        3 => Ok(Element::N),
-        4 => Ok(Element::O),
-        5 => Ok(Element::P),
-        6 => Ok(Element::S),
-        7 => Ok(Element::F),
-        8 => Ok(Element::Cl),
-        9 => Ok(Element::Br),
-        10 => Ok(Element::I),
-        11 => Ok(Element::Na),
-        12 => Ok(Element::Mg),
-        13 => Ok(Element::K),
-        14 => Ok(Element::Ca),
-        15 => Ok(Element::Fe),
-        16 => Ok(Element::Zn),
-        17 => Ok(Element::Li),
-        18 => Ok(Element::Rb),
-        19 => Ok(Element::Cs),
-        20 => Ok(Element::Be),
-        21 => Ok(Element::Sr),
-        22 => Ok(Element::Ba),
-
-        value => Err(invalid(format!("unknown element code {value}"))),
-    }
+    usize::try_from(code)
+        .ok()
+        .and_then(|index| LEGACY_ELEMENTS.get(index).copied())
+        .ok_or_else(|| invalid(format!("unknown element code {code}")))
 }
 
 pub(super) fn display_mode_code(mode: DisplayMode) -> i32 {

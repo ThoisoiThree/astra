@@ -232,7 +232,18 @@ pub(super) fn restore_selected(
         }
         output.report.residues.push(row);
     }
-    output.molecule.bonds = bonds.into_iter().map(|(a, b)| Bond { a, b }).collect();
+    let original: std::collections::HashMap<(usize, usize), Bond> = mol
+        .bonds
+        .iter()
+        .map(|bond| ((bond.a, bond.b), *bond))
+        .collect();
+    output.molecule.bonds = bonds
+        .into_iter()
+        .filter_map(|(a, b)| match original.get(&(a, b)) {
+            Some(bond) => Some(*bond),
+            None => Bond::new(a, b),
+        })
+        .collect();
     Ok(output)
 }
 struct Distance {
@@ -672,11 +683,14 @@ mod tests {
                 occupancy: 1.,
                 b_factor: 0.,
                 hetero: false,
+                alt_loc: None,
+                formal_charge: 0,
             })
             .collect();
         Molecule {
             atoms,
             bonds: Vec::new(),
+            info: Default::default(),
         }
     }
     #[test]

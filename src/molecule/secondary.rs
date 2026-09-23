@@ -1,6 +1,6 @@
 use glam::Vec3;
 
-use super::{Molecule, MoleculeHierarchy, ResidueGroup};
+use super::{AnnotatedStructure, Molecule, MoleculeHierarchy, ResidueGroup, dssp::DsspCode};
 
 /// Three-state protein assignment plus turns and nucleic-acid backbones for rendering.
 /// Helix combines DSSP H/G/I and strand combines E/B; coils and turns remain visually distinct.
@@ -20,16 +20,132 @@ struct ProteinBackbone {
     c: Option<Vec3>,
 }
 
-/// Assigns secondary structure directly from backbone geometry, so the result is consistent
-/// across PDB, mmCIF, BinaryCIF, PDBML, and scene files even when annotations are absent.
+/// Where the displayed secondary structure comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SecondarySource {
+    /// DSSP from backbone hydrogen bonds, consistent across every file format.
+    #[default]
+    Dssp,
+    /// HELIX/SHEET or struct_conf/struct_sheet_range records deposited with the file.
+    File,
+}
+
+impl SecondarySource {
+    pub const ALL: [Self; 2] = [Self::Dssp, Self::File];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Dssp => "DSSP (computed)",
+            Self::File => "From file",
+        }
+    }
+}
+
+/// Assigns secondary structure with DSSP. Chains without complete backbones (Cα traces) use a
+/// P-SEA-style geometric method so that coarse models still show helices and strands.
 pub fn assign_secondary_structure(
+    molecule: &Molecule,
+    hierarchy: &MoleculeHierarchy,
+) -> Vec<Vec<SecondaryStructure>> {
+    assign_secondary_structure_from(molecule, hierarchy, SecondarySource::Dssp)
+}
+
+/// Assigns secondary structure from the requested source. `File` falls back to DSSP when the
+/// structure carries no annotations.
+pub fn assign_secondary_structure_from(
+    molecule: &Molecule,
+    hierarchy: &MoleculeHierarchy,
+    source: SecondarySource,
+) -> Vec<Vec<SecondaryStructure>> {
+    if source == SecondarySource::File && !molecule.info.secondary.is_empty() {
+        return from_annotations(molecule, hierarchy);
+    }
+    let dssp = super::dssp::assign(molecule, hierarchy);
+    hierarchy
+        .chains
+        .iter()
+        .zip(dssp)
+        .map(|(chain, codes)| {
+            let complete = codes.iter().filter(|code| code.is_some()).count();
+            let with_ca = chain
+                .residues
+                .iter()
+                .filter(|residue| protein_backbone(molecule, residue).ca.is_some())
+                .count();
+            if with_ca > 0 && complete * 2 < with_ca {
+                return assign_chain(molecule, &chain.residues);
+            }
+            chain
+                .residues
+                .iter()
+                .zip(codes)
+                .map(|(residue, code)| match code {
+                    Some(DsspCode::AlphaHelix | DsspCode::Helix310 | DsspCode::PiHelix) => {
+                        SecondaryStructure::Helix
+                    }
+                    Some(DsspCode::Strand) => SecondaryStructure::Strand,
+                    Some(DsspCode::Turn) => SecondaryStructure::Turn,
+                    Some(DsspCode::Bridge | DsspCode::Loop) => SecondaryStructure::Coil,
+                    None if has_nucleic_anchor(molecule, residue) => SecondaryStructure::Nucleic,
+                    None => SecondaryStructure::Coil,
+                })
+                .collect()
+        })
+        .collect()
+}
+
+fn from_annotations(
     molecule: &Molecule,
     hierarchy: &MoleculeHierarchy,
 ) -> Vec<Vec<SecondaryStructure>> {
     hierarchy
         .chains
         .iter()
-        .map(|chain| assign_chain(molecule, &chain.residues))
+        .map(|chain| {
+            let mut states: Vec<SecondaryStructure> = chain
+                .residues
+                .iter()
+                .map(|residue| {
+                    if has_nucleic_anchor(molecule, residue) {
+                        SecondaryStructure::Nucleic
+                    } else {
+                        SecondaryStructure::Coil
+                    }
+                })
+                .collect();
+            let position = |(number, code): (i32, Option<char>)| {
+                chain.residues.iter().position(|residue| {
+                    residue.id.number == number && residue.id.insertion_code == code
+                })
+            };
+            for annotation in molecule
+                .info
+                .secondary
+                .iter()
+                .filter(|annotation| annotation.chain == chain.id)
+            {
+                let (Some(start), Some(end)) =
+                    (position(annotation.start), position(annotation.end))
+                else {
+                    continue;
+                };
+                let state = match annotation.kind {
+                    AnnotatedStructure::Helix
+                    | AnnotatedStructure::Helix310
+                    | AnnotatedStructure::HelixPi => SecondaryStructure::Helix,
+                    AnnotatedStructure::Strand => SecondaryStructure::Strand,
+                    AnnotatedStructure::Turn => SecondaryStructure::Turn,
+                };
+                for slot in &mut states[start.min(end)..=start.max(end)] {
+                    if *slot != SecondaryStructure::Nucleic
+                        && !(state == SecondaryStructure::Turn && *slot != SecondaryStructure::Coil)
+                    {
+                        *slot = state;
+                    }
+                }
+            }
+            states
+        })
         .collect()
 }
 
@@ -131,7 +247,6 @@ fn protein_backbone(molecule: &Molecule, residue: &ResidueGroup) -> ProteinBackb
         .atom_indices
         .iter()
         .filter_map(|index| molecule.atoms.get(*index))
-        .filter(|atom| !atom.hetero)
     {
         match atom.name.as_str() {
             "N" => result.n = Some(atom.position),

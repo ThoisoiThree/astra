@@ -70,3 +70,36 @@ fn supplied_4r8p_builds_expected_hierarchy() -> Result<(), Box<dyn Error>> {
     }));
     Ok(())
 }
+
+/// DSSP must agree with the deposited HELIX/SHEET records for most residues.
+#[test]
+fn dssp_matches_deposited_secondary_structure() -> Result<(), Box<dyn Error>> {
+    use astra::molecule::{SecondarySource, assign_secondary_structure_from};
+
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/4R8P.pdb");
+    let molecule = parse_pdb(&fs::read_to_string(path)?)?;
+    let hierarchy = MoleculeHierarchy::from_molecule(&molecule);
+    let computed = assign_secondary_structure_from(&molecule, &hierarchy, SecondarySource::Dssp);
+    let deposited = assign_secondary_structure_from(&molecule, &hierarchy, SecondarySource::File);
+    let regular = |state: &SecondaryStructure| match state {
+        SecondaryStructure::Helix => 'H',
+        SecondaryStructure::Strand => 'E',
+        _ => '-',
+    };
+    let (mut total, mut agree) = (0, 0);
+    for (chain_a, chain_b) in computed.iter().zip(&deposited) {
+        for (a, b) in chain_a.iter().zip(chain_b) {
+            if *b == SecondaryStructure::Nucleic {
+                continue;
+            }
+            total += 1;
+            agree += usize::from(regular(a) == regular(b));
+        }
+    }
+    let agreement = agree as f64 / total as f64;
+    assert!(
+        agreement > 0.88,
+        "DSSP agreement {agreement:.3} over {total} residues"
+    );
+    Ok(())
+}

@@ -1075,7 +1075,7 @@ impl Runtime {
                     self.loaded_filename = Some(filename);
                     self.molecule_id = Some(molecule_id);
                     self.scene_path = None;
-                    self.molecule = Some(molecule);
+                    self.molecule = Some(*molecule);
                     self.hierarchy = Some(hierarchy);
                     self.secondary_structure = Some(secondary_structure);
                     self.atom_bvh = Some(atom_bvh);
@@ -1820,6 +1820,8 @@ mod tests {
             occupancy: 1.0,
             b_factor: 0.0,
             hetero: false,
+            alt_loc: None,
+            formal_charge: 0,
         };
         Molecule {
             atoms: vec![
@@ -1828,6 +1830,7 @@ mod tests {
                 atom(3, 2, Vec3::new(5.0, 0.0, 0.0)),
             ],
             bonds: Vec::new(),
+            info: Default::default(),
         }
     }
 
@@ -2008,7 +2011,7 @@ mod tests {
         let directory = env::temp_dir().join(format!("astra-fetch-test-{}", std::process::id()));
         let path = download_pdb("4R8P", &directory).unwrap();
         let contents = fs::read(&path).unwrap();
-        let (molecule, _) = parse_structure(&contents, "4R8P.cif").unwrap();
+        let molecule = parse_structure(&contents, "4R8P.cif").unwrap().molecule;
         assert!(!molecule.atoms.is_empty());
         fs::remove_file(path).unwrap();
         fs::remove_dir(directory).unwrap();

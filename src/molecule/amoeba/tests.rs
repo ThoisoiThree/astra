@@ -53,9 +53,21 @@ impl Oracle {
                     occupancy: 1.,
                     b_factor: 0.,
                     hetero: false,
+                    alt_loc: None,
+                    formal_charge: 0,
                 })
                 .collect(),
-            bonds: self.bonds.iter().map(|&[a, b]| Bond { a, b }).collect(),
+            bonds: self
+                .bonds
+                .iter()
+                .map(|&[a, b]| Bond {
+                    a,
+                    b,
+                    order: Default::default(),
+                    kind: Default::default(),
+                })
+                .collect(),
+            info: Default::default(),
         }
     }
 }
@@ -163,8 +175,11 @@ fn interleaving_preserves_indices_groups_and_environment_score() {
             .map(|b| Bond {
                 a: inverse[b.a],
                 b: inverse[b.b],
+                order: Default::default(),
+                kind: Default::default(),
             })
             .collect(),
+        info: Default::default(),
     };
     let actual = analyze(
         &reordered,
@@ -293,7 +308,12 @@ fn ion_coordination_is_not_covalent_and_unknown_boundaries_are_excluded() {
         .iter()
         .position(|a| a.element == Element::Cl)
         .unwrap();
-    mol.bonds.push(Bond { a: 0, b: chloride });
+    mol.bonds.push(Bond {
+        a: 0,
+        b: chloride,
+        order: Default::default(),
+        kind: Default::default(),
+    });
     let r = analyze(
         &mol,
         "water chloride",
@@ -392,9 +412,12 @@ fn heavy_only(mol: &Molecule) -> Molecule {
                 Some(Bond {
                     a: map[b.a]?,
                     b: map[b.b]?,
+                    order: Default::default(),
+                    kind: Default::default(),
                 })
             })
             .collect(),
+        info: Default::default(),
     }
 }
 #[test]
@@ -602,9 +625,12 @@ fn repairs_real_protein_sidechain_before_protonation_and_preserves_original_indi
                 Some(Bond {
                     a: map[b.a]?,
                     b: map[b.b]?,
+                    order: Default::default(),
+                    kind: Default::default(),
                 })
             })
             .collect(),
+        info: Default::default(),
     };
     let selected = damaged
         .atoms

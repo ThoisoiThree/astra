@@ -444,7 +444,10 @@ fn prepare_hydrogens(
         }
         reports.push(row);
     }
-    let mut molecule = Molecule::default();
+    let mut molecule = Molecule {
+        info: mol.info.clone(),
+        ..Molecule::default()
+    };
     let mut old_to_new = vec![None; mol.atoms.len()];
     for (i, a) in mol.atoms.iter().enumerate() {
         if replacements.contains_key(&g.atom_res[i]) && a.element == Element::H {
@@ -489,7 +492,21 @@ fn prepare_hydrogens(
             added_parents.push((i, parent));
         }
     }
-    molecule.bonds = bonds.into_iter().map(|(a, b)| Bond { a, b }).collect();
+    let original: std::collections::HashMap<(usize, usize), Bond> = mol
+        .bonds
+        .iter()
+        .filter_map(|bond| {
+            let (a, b) = (old_to_new[bond.a]?, old_to_new[bond.b]?);
+            Some(((a.min(b), a.max(b)), *bond))
+        })
+        .collect();
+    molecule.bonds = bonds
+        .into_iter()
+        .filter_map(|(a, b)| match original.get(&(a, b)) {
+            Some(bond) => Bond::with_order(a, b, bond.order, bond.kind),
+            None => Bond::new(a, b),
+        })
+        .collect();
     let report = Report {
         repair: None,
         ph: settings.ph,

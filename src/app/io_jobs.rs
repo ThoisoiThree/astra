@@ -98,7 +98,7 @@ pub(super) enum LoadedPayload {
     Structure {
         filename: String,
         molecule_id: String,
-        molecule: Molecule,
+        molecule: Box<Molecule>,
         hierarchy: MoleculeHierarchy,
         secondary_structure: Vec<Vec<SecondaryStructure>>,
         atom_bvh: AtomBvh,
@@ -749,7 +749,8 @@ pub(super) fn load_in_background(
             path.display()
         ));
     }
-    let (molecule, _) = parse_structure(&contents, &filename).map_err(|error| error.to_string())?;
+    let parsed = parse_structure(&contents, &filename).map_err(|error| error.to_string())?;
+    let molecule = parsed.molecule;
     if cancel.load(Ordering::Relaxed) {
         return Err("background operation canceled".into());
     }
@@ -768,7 +769,7 @@ pub(super) fn load_in_background(
     Ok(LoadedPayload::Structure {
         filename,
         molecule_id,
-        molecule,
+        molecule: Box::new(molecule),
         hierarchy,
         secondary_structure,
         atom_bvh,

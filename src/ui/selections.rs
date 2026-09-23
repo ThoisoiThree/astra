@@ -606,11 +606,14 @@ mod tests {
                 occupancy: 1.0,
                 b_factor: 0.0,
                 hetero: false,
+                alt_loc: None,
+                formal_charge: 0,
             })
             .collect();
         let hierarchy = MoleculeHierarchy::from_molecule(&Molecule {
             atoms,
             bonds: Vec::new(),
+            info: Default::default(),
         });
         let selections = BTreeMap::from([("all".into(), Selection::from_flags(vec![true, true]))]);
         (hierarchy, selections)

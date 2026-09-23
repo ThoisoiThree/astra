@@ -192,6 +192,7 @@ mod tests {
                 atom(4, "H1", Element::H, "HOH", 20, "B", true),
             ],
             bonds: Vec::new(),
+            info: Default::default(),
         }
     }
 
@@ -216,6 +217,8 @@ mod tests {
             occupancy: 1.0,
             b_factor: 0.0,
             hetero,
+            alt_loc: None,
+            formal_charge: 0,
         }
     }
 

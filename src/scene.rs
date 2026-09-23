@@ -18,18 +18,23 @@ use crate::{
     RepresentationMask, VisibilityOverride,
     camera::{DepthOfField, OrbitCamera},
     measurement::{MeasurementEndpoint, MeasurementLine},
-    molecule::{Atom, Bond, Molecule, MoleculeHierarchy},
+    molecule::{
+        AnnotatedStructure, Assembly, AssemblyGenerator, Atom, Bond, BondKind, BondOrder,
+        CrystalInfo, Molecule, MoleculeHierarchy, SecondaryAnnotation, StructureInfo,
+        SymmetryOperator, UnitCell,
+    },
     selection::Selection,
 };
 
+use crate::molecule::Element;
 #[cfg(test)]
-use crate::{AmbientOcclusionQuality, ColoringMode, DisplayMode, molecule::Element};
+use crate::{AmbientOcclusionQuality, ColoringMode, DisplayMode};
 
 pub const SCENE_EXTENSION: &str = "mol";
 pub const SCENE_FORMAT_NAME: &str = "Molecule 1.0";
 pub const SCENE_MIME_TYPE: &str = "application/vnd.astra.molecule";
 pub const SCENE_SCHEMA_VERSION: u32 = 1;
-pub const SCENE_READER_VERSION: u32 = 3;
+pub const SCENE_READER_VERSION: u32 = 4;
 
 mod container;
 #[cfg(test)]
@@ -373,6 +378,238 @@ fn molecule_to_wire(molecule: &Molecule) -> Result<wire::MoleculeV1, SceneError>
                 .collect::<Vec<_>>(),
         ),
         bond_endpoints,
+        atomic_numbers: molecule
+            .atoms
+            .iter()
+            .map(|atom| u32::from(atom.element.atomic_number()))
+            .collect(),
+        alt_locs: if molecule.atoms.iter().any(|atom| atom.alt_loc.is_some()) {
+            molecule
+                .atoms
+                .iter()
+                .map(|atom| atom.alt_loc.map_or(0, |label| u32::from(label) + 1))
+                .collect()
+        } else {
+            Vec::new()
+        },
+        formal_charges: if molecule.atoms.iter().any(|atom| atom.formal_charge != 0) {
+            molecule
+                .atoms
+                .iter()
+                .map(|atom| i32::from(atom.formal_charge))
+                .collect()
+        } else {
+            Vec::new()
+        },
+        bond_types: if molecule
+            .bonds
+            .iter()
+            .any(|bond| bond.order != BondOrder::Single || bond.kind != BondKind::Covalent)
+        {
+            molecule
+                .bonds
+                .iter()
+                .map(|bond| bond.order.code() | (bond.kind.code() << 4))
+                .collect()
+        } else {
+            Vec::new()
+        },
+        info: Some(structure_info_to_wire(&molecule.info)),
+    })
+}
+
+fn structure_info_to_wire(info: &StructureInfo) -> wire::StructureInfo {
+    wire::StructureInfo {
+        id: info.id.clone(),
+        title: info.title.clone(),
+        operators: info
+            .operators
+            .iter()
+            .map(|operator| wire::SymmetryOperator {
+                id: operator.id.clone(),
+                name: operator.name.clone(),
+                rotation: operator.rotation.iter().flatten().copied().collect(),
+                translation: operator.translation.to_vec(),
+            })
+            .collect(),
+        assemblies: info
+            .assemblies
+            .iter()
+            .map(|assembly| wire::Assembly {
+                id: assembly.id.clone(),
+                details: assembly.details.clone(),
+                oligomeric_count: assembly.oligomeric_count,
+                generators: assembly
+                    .generators
+                    .iter()
+                    .map(|generator| wire::AssemblyGenerator {
+                        chains: generator.chains.clone(),
+                        products: generator
+                            .products
+                            .iter()
+                            .map(|product| wire::OperatorProduct {
+                                operators: product.iter().map(|&index| index as u32).collect(),
+                            })
+                            .collect(),
+                    })
+                    .collect(),
+            })
+            .collect(),
+        crystal: info.crystal.as_ref().map(|crystal| wire::CrystalInfo {
+            a: crystal.cell.a,
+            b: crystal.cell.b,
+            c: crystal.cell.c,
+            alpha: crystal.cell.alpha,
+            beta: crystal.cell.beta,
+            gamma: crystal.cell.gamma,
+            space_group: crystal.space_group.clone(),
+        }),
+        secondary: info
+            .secondary
+            .iter()
+            .map(|annotation| wire::SecondaryAnnotation {
+                kind: match annotation.kind {
+                    AnnotatedStructure::Helix => 0,
+                    AnnotatedStructure::Helix310 => 1,
+                    AnnotatedStructure::HelixPi => 2,
+                    AnnotatedStructure::Strand => 3,
+                    AnnotatedStructure::Turn => 4,
+                },
+                chain: annotation.chain.clone(),
+                start_number: annotation.start.0,
+                start_insertion: annotation.start.1.map_or(0, |code| u32::from(code) + 1),
+                end_number: annotation.end.0,
+                end_insertion: annotation.end.1.map_or(0, |code| u32::from(code) + 1),
+            })
+            .collect(),
+        model_count: info.model_count as u32,
+        notes: info.notes.clone(),
+    }
+}
+
+fn structure_info_from_wire(info: wire::StructureInfo) -> Result<StructureInfo, SceneError> {
+    let operator_count = info.operators.len();
+    let optional_char = |value: u32, label: &str| -> Result<Option<char>, SceneError> {
+        match value {
+            0 => Ok(None),
+            value => char::from_u32(value - 1)
+                .map(Some)
+                .ok_or_else(|| invalid(format!("invalid {label}"))),
+        }
+    };
+    Ok(StructureInfo {
+        id: info.id,
+        title: info.title,
+        operators: info
+            .operators
+            .into_iter()
+            .map(|operator| {
+                if operator.rotation.len() != 9 || operator.translation.len() != 3 {
+                    return Err(invalid("symmetry operator must have 9 + 3 values"));
+                }
+                if operator
+                    .rotation
+                    .iter()
+                    .chain(&operator.translation)
+                    .any(|value| !value.is_finite())
+                {
+                    return Err(invalid("symmetry operator contains a non-finite number"));
+                }
+                let r = &operator.rotation;
+                Ok(SymmetryOperator {
+                    id: operator.id,
+                    name: operator.name,
+                    rotation: [[r[0], r[1], r[2]], [r[3], r[4], r[5]], [r[6], r[7], r[8]]],
+                    translation: [
+                        operator.translation[0],
+                        operator.translation[1],
+                        operator.translation[2],
+                    ],
+                })
+            })
+            .collect::<Result<_, _>>()?,
+        assemblies: info
+            .assemblies
+            .into_iter()
+            .map(|assembly| {
+                Ok(Assembly {
+                    id: assembly.id,
+                    details: assembly.details,
+                    oligomeric_count: assembly.oligomeric_count,
+                    generators: assembly
+                        .generators
+                        .into_iter()
+                        .map(|generator| {
+                            Ok(AssemblyGenerator {
+                                chains: generator.chains,
+                                products: generator
+                                    .products
+                                    .into_iter()
+                                    .map(|product| {
+                                        product
+                                            .operators
+                                            .into_iter()
+                                            .map(|index| {
+                                                let index = index as usize;
+                                                (index < operator_count)
+                                                    .then_some(index)
+                                                    .ok_or_else(|| {
+                                                        invalid(
+                                                            "assembly refers to a missing operator",
+                                                        )
+                                                    })
+                                            })
+                                            .collect::<Result<Vec<_>, _>>()
+                                    })
+                                    .collect::<Result<_, _>>()?,
+                            })
+                        })
+                        .collect::<Result<_, SceneError>>()?,
+                })
+            })
+            .collect::<Result<_, SceneError>>()?,
+        crystal: info.crystal.map(|crystal| CrystalInfo {
+            cell: UnitCell {
+                a: crystal.a,
+                b: crystal.b,
+                c: crystal.c,
+                alpha: crystal.alpha,
+                beta: crystal.beta,
+                gamma: crystal.gamma,
+            },
+            space_group: crystal.space_group,
+        }),
+        secondary: info
+            .secondary
+            .into_iter()
+            .map(|annotation| {
+                Ok(SecondaryAnnotation {
+                    kind: match annotation.kind {
+                        0 => AnnotatedStructure::Helix,
+                        1 => AnnotatedStructure::Helix310,
+                        2 => AnnotatedStructure::HelixPi,
+                        3 => AnnotatedStructure::Strand,
+                        4 => AnnotatedStructure::Turn,
+                        other => {
+                            return Err(invalid(format!(
+                                "unknown secondary structure kind {other}"
+                            )));
+                        }
+                    },
+                    chain: annotation.chain,
+                    start: (
+                        annotation.start_number,
+                        optional_char(annotation.start_insertion, "insertion code")?,
+                    ),
+                    end: (
+                        annotation.end_number,
+                        optional_char(annotation.end_insertion, "insertion code")?,
+                    ),
+                })
+            })
+            .collect::<Result<_, SceneError>>()?,
+        model_count: info.model_count as usize,
+        notes: info.notes,
     })
 }
 
@@ -389,6 +626,15 @@ fn molecule_from_wire(molecule: wire::MoleculeV1) -> Result<Molecule, SceneError
     require_len(&molecule.positions, atom_count * 3, "atom positions")?;
     require_len(&molecule.occupancies, atom_count, "atom occupancies")?;
     require_len(&molecule.b_factors, atom_count, "atom B-factors")?;
+    for (values, label) in [
+        (molecule.atomic_numbers.len(), "atomic numbers"),
+        (molecule.alt_locs.len(), "alternate locations"),
+        (molecule.formal_charges.len(), "formal charges"),
+    ] {
+        if values != 0 && values != atom_count {
+            return Err(invalid(format!("{label} do not match the atom count")));
+        }
+    }
     let hetero_flags = unpack_flags(&molecule.hetero_flags, atom_count, "hetero")?;
 
     let mut atoms = Vec::with_capacity(atom_count);
@@ -416,7 +662,11 @@ fn molecule_from_wire(molecule: wire::MoleculeV1) -> Result<Molecule, SceneError
         atoms.push(Atom {
             serial: molecule.serials[index],
             name: table_string(&molecule.strings, molecule.name_indices[index], "atom name")?,
-            element: element_from_code(molecule.elements[index])?,
+            element: match molecule.atomic_numbers.get(index) {
+                Some(&number) => Element::from_atomic_number(number)
+                    .ok_or_else(|| invalid(format!("unknown atomic number {number}")))?,
+                None => element_from_code(molecule.elements[index])?,
+            },
             residue_name: table_string(
                 &molecule.strings,
                 molecule.residue_name_indices[index],
@@ -429,6 +679,16 @@ fn molecule_from_wire(molecule: wire::MoleculeV1) -> Result<Molecule, SceneError
             occupancy: molecule.occupancies[index],
             b_factor: molecule.b_factors[index],
             hetero,
+            alt_loc: match molecule.alt_locs.get(index).copied().unwrap_or(0) {
+                0 => None,
+                value => Some(char::from_u32(value - 1).ok_or_else(|| {
+                    invalid(format!("invalid alternate location at atom {index}"))
+                })?),
+            },
+            formal_charge: i8::try_from(molecule.formal_charges.get(index).copied().unwrap_or(0))
+                .map_err(|_| {
+                invalid(format!("formal charge out of range at atom {index}"))
+            })?,
         });
     }
 
@@ -436,16 +696,32 @@ fn molecule_from_wire(molecule: wire::MoleculeV1) -> Result<Molecule, SceneError
     if !remainder.is_empty() {
         return Err(invalid("bond endpoint list has an odd length"));
     }
+    if !molecule.bond_types.is_empty() && molecule.bond_types.len() != pairs.len() {
+        return Err(invalid("bond type list does not match the bond count"));
+    }
     let mut bonds = Vec::with_capacity(pairs.len());
-    for &[a, b] in pairs {
+    for (index, &[a, b]) in pairs.iter().enumerate() {
         let a = a as usize;
         let b = b as usize;
         if a >= atom_count || b >= atom_count {
             return Err(invalid("bond refers to an atom outside the molecule"));
         }
-        bonds.push(Bond::new(a, b).ok_or_else(|| invalid("bond connects an atom to itself"))?);
+        let code = molecule.bond_types.get(index).copied().unwrap_or(1);
+        let order = BondOrder::from_code(code & 0x0f)
+            .ok_or_else(|| invalid(format!("unknown bond order at bond {index}")))?;
+        let kind = BondKind::from_code(code >> 4)
+            .ok_or_else(|| invalid(format!("unknown bond kind at bond {index}")))?;
+        bonds.push(
+            Bond::with_order(a, b, order, kind)
+                .ok_or_else(|| invalid("bond connects an atom to itself"))?,
+        );
     }
-    Ok(Molecule { atoms, bonds })
+    let info = molecule
+        .info
+        .map(structure_info_from_wire)
+        .transpose()?
+        .unwrap_or_default();
+    Ok(Molecule { atoms, bonds, info })
 }
 
 fn display_to_wire(display: &DisplayState) -> Result<wire::DisplayV1, SceneError> {
@@ -848,6 +1124,8 @@ mod tests {
                     occupancy: 1.0,
                     b_factor: 12.5,
                     hetero: false,
+                    alt_loc: None,
+                    formal_charge: 0,
                 },
                 Atom {
                     serial: 11,
@@ -861,9 +1139,12 @@ mod tests {
                     occupancy: 0.75,
                     b_factor: 18.0,
                     hetero: true,
+                    alt_loc: None,
+                    formal_charge: 0,
                 },
             ],
             bonds: vec![Bond::new(0, 1).unwrap()],
+            info: Default::default(),
         };
         let mut display = DisplayState::for_molecule(&molecule);
         display.set_coloring_mode(&molecule, ColoringMode::SecondaryStructure);

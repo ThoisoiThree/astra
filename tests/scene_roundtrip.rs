@@ -10,7 +10,7 @@ use astra::{
 #[test]
 fn supplied_4r8p_round_trips_into_a_smaller_self_contained_scene() {
     let source = include_bytes!("../examples/4R8P.pdb");
-    let (molecule, _) = parse_structure(source, "4R8P.pdb").unwrap();
+    let molecule = parse_structure(source, "4R8P.pdb").unwrap().molecule;
     let display = DisplayState::for_molecule(&molecule);
     let document = SceneDocument {
         source_name: "4R8P.pdb".into(),

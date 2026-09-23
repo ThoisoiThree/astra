@@ -1300,6 +1300,8 @@ mod display_tests {
                     occupancy: 1.0,
                     b_factor: 10.0,
                     hetero: false,
+                    alt_loc: None,
+                    formal_charge: 0,
                 },
                 Atom {
                     serial: 2,
@@ -1313,9 +1315,12 @@ mod display_tests {
                     occupancy: 1.0,
                     b_factor: 20.0,
                     hetero: false,
+                    alt_loc: None,
+                    formal_charge: 0,
                 },
             ],
             bonds: Vec::new(),
+            info: Default::default(),
         }
     }
 
@@ -1359,6 +1364,8 @@ mod display_tests {
                     occupancy: 1.0,
                     b_factor: 0.0,
                     hetero: false,
+                    alt_loc: None,
+                    formal_charge: 0,
                 }
             })
             .collect::<Vec<_>>();
@@ -1374,10 +1381,13 @@ mod display_tests {
             occupancy: 1.0,
             b_factor: 0.0,
             hetero: true,
+            alt_loc: None,
+            formal_charge: 0,
         });
         let molecule = Molecule {
             atoms,
             bonds: Vec::new(),
+            info: Default::default(),
         };
         let mut display = DisplayState::for_molecule(&molecule);
         display.set_coloring_mode(&molecule, ColoringMode::SecondaryStructure);

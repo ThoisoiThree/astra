@@ -235,6 +235,8 @@ mod tests {
             occupancy: 1.0,
             b_factor: 0.0,
             hetero: false,
+            alt_loc: None,
+            formal_charge: 0,
         }
     }
 
@@ -247,6 +249,7 @@ mod tests {
                 atom(Vec3::new(4.0, 0.0, -1.0)),
             ],
             bonds: Vec::new(),
+            info: Default::default(),
         };
         let picked = pick_atom(
             &molecule,
@@ -263,6 +266,7 @@ mod tests {
         let molecule = Molecule {
             atoms: vec![atom(Vec3::new(3.0, 0.0, -2.0))],
             bonds: Vec::new(),
+            info: Default::default(),
         };
         assert_eq!(
             pick_atom(
@@ -284,6 +288,7 @@ mod tests {
                 atom(Vec3::new(0.0, 0.0, -4.0)),
             ],
             bonds: Vec::new(),
+            info: Default::default(),
         };
         let picked = pick_atom_filtered(
             &molecule,
@@ -303,6 +308,7 @@ mod tests {
                 .map(|index| atom(Vec3::new(index as f32 * 0.2 - 10.0, 0.0, -4.0)))
                 .collect(),
             bonds: Vec::new(),
+            info: Default::default(),
         };
         let ray = Ray {
             origin: Vec3::ZERO,

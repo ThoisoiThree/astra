@@ -38,6 +38,76 @@ message Molecule {
   bytes hetero_flags = 13;
   // ab ab... contiguous atom indices.
   repeated uint32 bond_endpoints = 14 [packed = true];
+  // Exact element per atom by atomic number (0 = unknown). When present it takes
+  // precedence over `elements`, which only encodes the reader-1 element subset.
+  repeated uint32 atomic_numbers = 15 [packed = true];
+  // Alternate-location label of each atom: zero means none, otherwise scalar value + 1.
+  // Empty means no labels.
+  repeated uint32 alt_locs = 16 [packed = true];
+  // Empty means every formal charge is zero.
+  repeated sint32 formal_charges = 17 [packed = true];
+  // One byte per bond: order code (1 single, 2 double, 3 triple, 4 aromatic) in the low
+  // nibble and kind (0 covalent, 1 disulfide, 2 metal coordination) in the high nibble.
+  // Empty means every bond is a single covalent bond.
+  bytes bond_types = 18;
+  StructureInfo info = 19;
+}
+
+message StructureInfo {
+  optional string id = 1;
+  optional string title = 2;
+  repeated SymmetryOperator operators = 3;
+  repeated Assembly assemblies = 4;
+  CrystalInfo crystal = 5;
+  repeated SecondaryAnnotation secondary = 6;
+  uint32 model_count = 7;
+  repeated string notes = 8;
+}
+
+message SymmetryOperator {
+  string id = 1;
+  string name = 2;
+  // Row-major 3x3 rotation followed by a translation in Å.
+  repeated double rotation = 3 [packed = true];
+  repeated double translation = 4 [packed = true];
+}
+
+message Assembly {
+  string id = 1;
+  string details = 2;
+  optional uint32 oligomeric_count = 3;
+  repeated AssemblyGenerator generators = 4;
+}
+
+message AssemblyGenerator {
+  repeated string chains = 1;
+  repeated OperatorProduct products = 2;
+}
+
+message OperatorProduct {
+  // Indices into StructureInfo.operators; the last one is applied first.
+  repeated uint32 operators = 1 [packed = true];
+}
+
+message CrystalInfo {
+  double a = 1;
+  double b = 2;
+  double c = 3;
+  double alpha = 4;
+  double beta = 5;
+  double gamma = 6;
+  string space_group = 7;
+}
+
+message SecondaryAnnotation {
+  // 0 helix, 1 3-10 helix, 2 pi helix, 3 strand, 4 turn.
+  uint32 kind = 1;
+  string chain = 2;
+  sint32 start_number = 3;
+  // Zero means absent; otherwise scalar value + 1.
+  uint32 start_insertion = 4;
+  sint32 end_number = 5;
+  uint32 end_insertion = 6;
 }
 
 message Display {

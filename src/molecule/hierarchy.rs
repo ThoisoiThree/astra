@@ -123,6 +123,8 @@ mod tests {
             occupancy: 1.0,
             b_factor: 0.0,
             hetero: false,
+            alt_loc: None,
+            formal_charge: 0,
         }
     }
 
@@ -136,6 +138,7 @@ mod tests {
                 atom("B", "HOH", 1, None),
             ],
             bonds: Vec::new(),
+            info: Default::default(),
         };
         let hierarchy = MoleculeHierarchy::from_molecule(&molecule);
         assert_eq!(hierarchy.chains.len(), 2);

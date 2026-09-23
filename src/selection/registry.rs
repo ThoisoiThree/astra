@@ -363,8 +363,11 @@ mod tests {
                 occupancy: 1.0,
                 b_factor: 0.0,
                 hetero: false,
+                alt_loc: None,
+                formal_charge: 0,
             }],
             bonds: Vec::new(),
+            info: Default::default(),
         }
     }
 

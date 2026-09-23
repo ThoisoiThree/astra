@@ -19,10 +19,13 @@ fn molecule(atom_count: usize) -> Molecule {
         occupancy: 1.0,
         b_factor: 0.0,
         hetero: false,
+        alt_loc: None,
+        formal_charge: 0,
     };
     Molecule {
         atoms: vec![template; atom_count],
         bonds: Vec::new(),
+        info: Default::default(),
     }
 }
 
