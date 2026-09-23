@@ -79,7 +79,12 @@ pub fn parse_pdb_document(input: &str) -> Result<PdbDocument, PdbError> {
             }
             "ATOM" | "HETATM" => {
                 let atom = parse_atom(line, line_number, record == "HETATM", records.len())?;
-                records.push(AtomRecord { atom, model });
+                let element_inferred = Element::from_str(field(line, 76, 78)).is_err();
+                records.push(AtomRecord {
+                    atom,
+                    model,
+                    element_inferred,
+                });
             }
             "CONECT" => {
                 if let Some(source) = hybrid36(field(line, 6, 11), 5) {
@@ -151,7 +156,11 @@ pub fn parse_pdb_document(input: &str) -> Result<PdbDocument, PdbError> {
                             beta,
                             gamma,
                         },
-                        space_group: field(line, 55, 66).trim().to_string(),
+                        // A cell without a space group is taken as P 1.
+                        space_group: Some(field(line, 55, 66).trim())
+                            .filter(|group| !group.is_empty())
+                            .unwrap_or("P 1")
+                            .to_string(),
                     });
                 }
             }
@@ -169,6 +178,102 @@ pub fn parse_pdb_document(input: &str) -> Result<PdbDocument, PdbError> {
     remark350.finish(&mut info);
     bonds.extend(serial_bond_records(&conect));
     let assembled = assemble(records, &bonds, info).ok_or(PdbError::NoAtoms)?;
+    Ok(PdbDocument {
+        molecule: assembled.molecule,
+        frames: assembled.frames,
+    })
+}
+
+/// Parses a PQR file (PDB2PQR, APBS): whitespace-separated ATOM records ending with the
+/// partial charge and radius. Charges are stored as B-factors so they can be colored.
+pub fn parse_pqr_document(input: &str) -> Result<PdbDocument, PdbError> {
+    let mut records = Vec::new();
+    let mut model: i64 = 1;
+    for (line_index, line) in input.lines().enumerate() {
+        let line_number = line_index + 1;
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        match tokens.first().copied() {
+            Some("MODEL") => {
+                model = tokens
+                    .get(1)
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(model + 1);
+            }
+            Some(record @ ("ATOM" | "HETATM")) => {
+                if tokens.len() < 10 {
+                    return Err(PdbError::MissingField {
+                        line: line_number,
+                        field: "PQR atom fields",
+                    });
+                }
+                let number = |index: usize, field: &'static str| -> Result<f32, PdbError> {
+                    tokens[index].parse().map_err(|_| PdbError::InvalidField {
+                        line: line_number,
+                        field,
+                        value: tokens[index].to_string(),
+                    })
+                };
+                let n = tokens.len();
+                let position = Vec3::new(
+                    number(n - 5, "x coordinate")?,
+                    number(n - 4, "y coordinate")?,
+                    number(n - 3, "z coordinate")?,
+                );
+                let charge = number(n - 2, "charge")?;
+                // Between the residue name and x: [chain] residue number [insertion code].
+                let middle = &tokens[4..n - 5];
+                let residue_token = match middle {
+                    [chain, residue, ..] if chain.parse::<i32>().is_err() => *residue,
+                    [residue, ..] => *residue,
+                    [] => {
+                        return Err(PdbError::MissingField {
+                            line: line_number,
+                            field: "residue number",
+                        });
+                    }
+                };
+                let chain = match middle {
+                    [chain, _, ..] if chain.parse::<i32>().is_err() => *chain,
+                    _ => "",
+                };
+                let digits = residue_token.trim_end_matches(|c: char| c.is_ascii_alphabetic());
+                let residue_number = digits.parse().map_err(|_| PdbError::InvalidField {
+                    line: line_number,
+                    field: "residue number",
+                    value: residue_token.to_string(),
+                })?;
+                let insertion_code = residue_token[digits.len()..].chars().next();
+                let name = tokens[2].to_ascii_uppercase();
+                records.push(AtomRecord {
+                    atom: Atom {
+                        serial: tokens[1].parse().unwrap_or(records.len() as u32 + 1),
+                        element: infer_element(&format!(" {name:<3}")),
+                        name,
+                        residue_name: tokens[3].to_ascii_uppercase(),
+                        residue_number,
+                        insertion_code,
+                        chain_id: chain.to_string(),
+                        position,
+                        occupancy: 1.0,
+                        b_factor: charge,
+                        hetero: record == "HETATM",
+                        ..Atom::default()
+                    },
+                    model,
+                    element_inferred: true,
+                });
+            }
+            _ => {}
+        }
+    }
+    if records.is_empty() {
+        return Err(PdbError::NoAtoms);
+    }
+    let info = StructureInfo {
+        notes: vec!["PQR partial charges are stored as B-factors".into()],
+        ..StructureInfo::default()
+    };
+    let assembled = assemble(records, &[], info).ok_or(PdbError::NoAtoms)?;
     Ok(PdbDocument {
         molecule: assembled.molecule,
         frames: assembled.frames,
@@ -423,8 +528,19 @@ fn parse_atom(
     let z = required::<f32>(line, line_number, 46, 54, "z coordinate")?;
     let occupancy = optional_number(line, line_number, 54, 60, "occupancy", 1.0)?;
     let b_factor = optional_number(line, line_number, 60, 66, "B-factor", 0.0)?;
-    let element =
-        Element::from_str(field(line, 76, 78)).unwrap_or_else(|()| infer_element(raw_name));
+    let element = Element::from_str(field(line, 76, 78)).unwrap_or_else(|()| {
+        let guess = infer_element(raw_name);
+        // Polymer (ATOM) records never hold metal ions, which come as HETATM residues named
+        // after their element; "CA  " in an ATOM record is an alpha carbon.
+        if guess.is_metal() && !hetero && residue_name != name.to_ascii_uppercase() {
+            name.chars()
+                .next()
+                .and_then(|first| Element::from_str(&first.to_string()).ok())
+                .unwrap_or(guess)
+        } else {
+            guess
+        }
+    });
     let formal_charge = parse_charge(field(line, 78, 80));
 
     Ok(Atom {
@@ -727,6 +843,22 @@ mod tests {
             .unwrap();
         assert_eq!(metal.kind, BondKind::MetalCoordination);
         assert_eq!(metal.order, BondOrder::Single);
+    }
+
+    #[test]
+    fn reads_whitespace_separated_pqr() {
+        let pqr = concat!(
+            "ATOM      1  N    ILE    16       5.007   -9.234   18.432 -0.3000 1.8500
+",
+            "ATOM      2  CA   ILE A  17A      4.405   -8.908   19.756  0.2100 2.2750
+",
+        );
+        let molecule = parse_pqr_document(pqr).unwrap().molecule;
+        assert_eq!(molecule.atoms[0].residue_number, 16);
+        assert_eq!(molecule.atoms[0].b_factor, -0.3);
+        assert_eq!(molecule.atoms[1].chain_id, "A");
+        assert_eq!(molecule.atoms[1].insertion_code, Some('A'));
+        assert_eq!(molecule.atoms[1].element, Element::C);
     }
 
     #[test]

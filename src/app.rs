@@ -1578,8 +1578,9 @@ impl Runtime {
     }
 
     fn fit(&mut self) {
-        if let Some((minimum, maximum)) = self.molecule.as_ref().and_then(Molecule::bounds) {
-            self.camera.fit_bounds(minimum, maximum);
+        if let Some(molecule) = &self.molecule {
+            self.camera
+                .fit_points(molecule.atoms.iter().map(|atom| atom.position));
         }
     }
 

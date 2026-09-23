@@ -212,6 +212,34 @@ impl OrbitCamera {
         })
     }
 
+    /// Frames a set of points by their bounding sphere around the box center, which is
+    /// tighter than the box diagonal for elongated or sparse structures.
+    pub fn fit_points(&mut self, points: impl IntoIterator<Item = Vec3> + Clone) {
+        let (minimum, maximum) = points.clone().into_iter().fold(
+            (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)),
+            |(low, high), point| (low.min(point), high.max(point)),
+        );
+        if minimum.x > maximum.x {
+            return;
+        }
+        let center = (minimum + maximum) * 0.5;
+        let radius = points
+            .into_iter()
+            .map(|point| point.distance(center))
+            .fold(0.0_f32, f32::max)
+            .max(0.8);
+        self.target = center;
+        self.distance = (radius / (self.limiting_fov() * 0.5).sin() * 1.08).max(2.0);
+    }
+
+    fn limiting_fov(&self) -> f32 {
+        if self.aspect < 1.0 {
+            2.0 * ((self.field_of_view_y * 0.5).tan() * self.aspect).atan()
+        } else {
+            self.field_of_view_y
+        }
+    }
+
     pub fn fit_bounds(&mut self, minimum: Vec3, maximum: Vec3) {
         self.target = (minimum + maximum) * 0.5;
         let radius = ((maximum - minimum).length() * 0.5).max(0.8);

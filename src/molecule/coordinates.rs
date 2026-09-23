@@ -53,20 +53,22 @@ pub(crate) fn parse_gro(input: &str) -> Result<Parsed, StructureError> {
             ));
         }
         let mut atoms = Vec::with_capacity(count);
-        let mut previous_residue: Option<i32> = None;
+        let mut previous_residue: Option<(i32, u8)> = None;
         let mut chain_index = 0_usize;
         for offset in 0..count {
             let line_number = cursor + 2 + offset;
             let line = lines[line_number];
             let atom = parse_gro_atom(line, line_number + 1, atoms.len())?;
-            // GRO has no chain identifiers: a new chain starts whenever numbering restarts,
-            // which also keeps residues distinct after the 99999 wrap.
-            if let Some(previous) = previous_residue
-                && atom.residue_number < previous
+            // GRO has no chain identifiers: a new chain starts whenever numbering restarts
+            // (which also keeps residues distinct after the 99999 wrap) and where solvent or
+            // ions follow the solute.
+            let category = residue_category(&atom.residue_name);
+            if let Some((number, previous_category)) = previous_residue
+                && (atom.residue_number < number || category != previous_category)
             {
                 chain_index += 1;
             }
-            previous_residue = Some(atom.residue_number);
+            previous_residue = Some((atom.residue_number, category));
             atoms.push(Atom {
                 chain_id: chain_name(chain_index),
                 ..atom
@@ -100,10 +102,26 @@ pub(crate) fn parse_gro(input: &str) -> Result<Parsed, StructureError> {
             }
         }
     }
-    let atoms = topology.ok_or(StructureError::NoCoordinates("GRO file"))?;
+    let mut atoms = topology.ok_or(StructureError::NoCoordinates("GRO file"))?;
+    let mut cache = super::ccd::ComponentCache::default();
+    for atom in &mut atoms {
+        super::records::resolve_element(atom, &mut cache);
+    }
     info.model_count = frames.len() + 1;
     let bonds = build_bonds(&atoms, &[]);
     Ok((Molecule { atoms, bonds, info }, frames))
+}
+
+/// 0 solute, 1 water, 2 ions.
+fn residue_category(residue: &str) -> u8 {
+    let trimmed = residue.trim_end_matches(['+', '-']);
+    if SOLVENT_RESIDUES.contains(&residue) {
+        1
+    } else if ION_RESIDUES.contains(&trimmed) {
+        2
+    } else {
+        0
+    }
 }
 
 fn chain_name(index: usize) -> String {
@@ -279,6 +297,8 @@ mod tests {
     fn reads_gro_frames_in_angstrom() {
         let (molecule, frames) = parse_gro(GRO).unwrap();
         assert_eq!(molecule.atoms.len(), 4);
+        assert_eq!(molecule.atoms[0].chain_id, "A");
+        assert_eq!(molecule.atoms[3].chain_id, "B");
         assert_eq!(molecule.atoms[0].element, Element::O);
         assert_eq!(molecule.atoms[1].element, Element::H);
         assert_eq!(molecule.atoms[3].element, Element::Na);

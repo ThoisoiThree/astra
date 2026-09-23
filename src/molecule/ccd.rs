@@ -282,3 +282,91 @@ mod tests {
         assert!(component("NOT_A_COMPONENT").is_none());
     }
 }
+
+/// Maps force-field and legacy residue names to their Chemical Component Dictionary entry:
+/// CHARMM/AMBER protonation variants, water models, ions and terminal nucleotide names.
+pub fn canonical_component(name: &str) -> &str {
+    match name {
+        "HSD" | "HSE" | "HSP" | "HID" | "HIE" | "HIP" | "HIS1" | "HISA" | "HISB" | "HISD"
+        | "HISE" | "HISH" => "HIS",
+        "CYX" | "CYM" | "CYS2" => "CYS",
+        "ASH" | "ASPH" => "ASP",
+        "GLH" | "GLUH" => "GLU",
+        "LYN" | "LSN" | "LYSN" => "LYS",
+        "ARN" => "ARG",
+        "TYM" => "TYR",
+        "WAT" | "SOL" | "TIP" | "TIP3" | "TIP4" | "TIP5" | "T3P" | "T4P" | "TP3" | "SPC"
+        | "SPCE" | "H2O" => "HOH",
+        "NA+" | "SOD" | "Na+" => "NA",
+        "CL-" | "CLA" | "Cl-" => "CL",
+        "K+" | "POT" => "K",
+        "MG2+" | "MG+2" => "MG",
+        "CA2+" | "CAL" => "CA",
+        "ZN2+" => "ZN",
+        "DA5" | "DA3" | "DAN" => "DA",
+        "DC5" | "DC3" | "DCN" => "DC",
+        "DG5" | "DG3" | "DGN" => "DG",
+        "DT5" | "DT3" | "DTN" | "THY" => "DT",
+        "RA" | "RA5" | "RA3" | "RAN" | "ADE" => "A",
+        "RC" | "RC5" | "RC3" | "RCN" | "CYT" => "C",
+        "RG" | "RG5" | "RG3" | "RGN" | "GUA" => "G",
+        "RU" | "RU5" | "RU3" | "RUN" | "URA" => "U",
+        // AMBER terminal residues: NALA, CALA, ...
+        _ if name.len() == 4 && (name.starts_with('N') || name.starts_with('C')) => {
+            match &name[1..] {
+                standard @ ("ALA" | "ARG" | "ASN" | "ASP" | "CYS" | "GLN" | "GLU" | "GLY"
+                | "HIS" | "ILE" | "LEU" | "LYS" | "MET" | "PHE" | "PRO" | "SER"
+                | "THR" | "TRP" | "TYR" | "VAL") => standard,
+                "HID" | "HIE" | "HIP" => "HIS",
+                "CYX" => "CYS",
+                _ => name,
+            }
+        }
+        _ => name,
+    }
+}
+
+/// Maps force-field atom names to Chemical Component Dictionary names within a residue.
+pub fn canonical_atom_name<'a>(component: &str, name: &'a str) -> std::borrow::Cow<'a, str> {
+    use std::borrow::Cow;
+    let mapped = match (component, name) {
+        (_, "OT1" | "O1") if component != "HOH" => Some("O"),
+        (_, "OT2" | "O2" | "OC2") if component != "HOH" => Some("OXT"),
+        (_, "OC1") => Some("O"),
+        ("ILE", "CD") => Some("CD1"),
+        ("DT", "C5M" | "C7M") => Some("C7"),
+        (_, "O1P") => Some("OP1"),
+        (_, "O2P") => Some("OP2"),
+        (_, "O3P") => Some("OP3"),
+        ("HOH", "OW" | "OH2" | "OW1") => Some("O"),
+        _ => None,
+    };
+    if let Some(mapped) = mapped {
+        return Cow::Borrowed(mapped);
+    }
+    if name.contains('*') {
+        return Cow::Owned(name.replace('*', "'"));
+    }
+    Cow::Borrowed(name)
+}
+
+#[cfg(test)]
+mod alias_tests {
+    use super::*;
+
+    #[test]
+    fn maps_force_field_names_to_components() {
+        assert_eq!(canonical_component("HSD"), "HIS");
+        assert_eq!(canonical_component("NALA"), "ALA");
+        assert_eq!(canonical_component("CHIE"), "HIS");
+        assert_eq!(canonical_component("SOL"), "HOH");
+        assert_eq!(canonical_component("DA5"), "DA");
+        assert_eq!(canonical_component("CALA"), "ALA");
+        assert_eq!(canonical_component("CLA"), "CL");
+        assert_eq!(canonical_component("LIG"), "LIG");
+        assert_eq!(canonical_atom_name("ILE", "CD"), "CD1");
+        assert_eq!(canonical_atom_name("DA", "C1*"), "C1'");
+        assert_eq!(canonical_atom_name("GLY", "OT2"), "OXT");
+        assert_eq!(canonical_atom_name("HOH", "OW"), "O");
+    }
+}

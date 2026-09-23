@@ -5,8 +5,9 @@ use std::collections::HashMap;
 use glam::Vec3;
 
 use super::{
-    Atom, BondKind, BondOrder, Molecule, StructureInfo,
+    Atom, BondKind, BondOrder, Element, Molecule, StructureInfo,
     bonds::{ExplicitBond, build_bonds},
+    ccd::{ComponentCache, canonical_atom_name, canonical_component},
 };
 
 /// One atom site as read from a file, before alternate locations are resolved.
@@ -15,6 +16,8 @@ pub(crate) struct AtomRecord {
     pub atom: Atom,
     /// Model identifier as written in the file; models are ordered by first appearance.
     pub model: i64,
+    /// The element was guessed from the atom name rather than read from the file.
+    pub element_inferred: bool,
 }
 
 /// Identifies an atom by its residue and name, as LINK, SSBOND and `struct_conn` do.
@@ -50,6 +53,11 @@ pub(crate) fn assemble(
     bond_records: &[BondRecord],
     mut info: StructureInfo,
 ) -> Option<Assembled> {
+    let mut records = records;
+    let mut cache = ComponentCache::default();
+    for record in records.iter_mut().filter(|record| record.element_inferred) {
+        resolve_element(&mut record.atom, &mut cache);
+    }
     let mut model_order = Vec::<i64>::new();
     let mut by_model = HashMap::<i64, Vec<Atom>>::new();
     for record in records {
@@ -90,6 +98,33 @@ pub(crate) fn assemble(
         molecule: Molecule { atoms, bonds, info },
         frames,
     })
+}
+
+/// Replaces a name-based element guess with the element of the named atom in the residue's
+/// chemical component; hydrogens of polymer residues and water are recognized by name.
+pub(crate) fn resolve_element(atom: &mut Atom, cache: &mut ComponentCache) {
+    let residue = canonical_component(&atom.residue_name);
+    let Some(component) = cache.get(residue) else {
+        return;
+    };
+    let name = canonical_atom_name(residue, &atom.name);
+    if let Some(index) = component.atom_index(&name) {
+        atom.element = component.atoms[index].element;
+        return;
+    }
+    // The dictionary export has no hydrogens; in residues whose heavy atoms are all
+    // standard, remaining names starting with H (or a digit then H) are hydrogens.
+    let bare = name.trim_start_matches(|c: char| c.is_ascii_digit());
+    let polymer = component.kind.is_amino_acid() || component.kind.is_nucleotide();
+    if (polymer || residue == "HOH") && (bare.starts_with('H') || bare.starts_with('D')) {
+        atom.element = Element::H;
+    } else if polymer
+        && let Some(first) = bare.chars().next()
+        && let Ok(element) = first.to_string().parse::<Element>()
+    {
+        // Heavy atoms of polymer residues are C, N, O, S or P; never a metal.
+        atom.element = element;
+    }
 }
 
 fn abbreviate(values: &[String]) -> String {
@@ -328,11 +363,13 @@ mod tests {
             records.push(AtomRecord {
                 atom: atom("CA", 1, None, 1.0, model as f32),
                 model,
+                element_inferred: false,
             });
             if model != 3 {
                 records.push(AtomRecord {
                     atom: atom("CB", 1, None, 1.0, 10.0 + model as f32),
                     model,
+                    element_inferred: false,
                 });
             }
         }
@@ -342,6 +379,29 @@ mod tests {
         assert_eq!(assembled.frames[0][1], Vec3::new(12.0, 0.0, 0.0));
         assert_eq!(assembled.molecule.info.model_count, 3);
         assert_eq!(assembled.molecule.info.notes.len(), 1);
+    }
+
+    #[test]
+    fn charmm_names_take_their_elements_from_the_component() {
+        let mut cache = ComponentCache::default();
+        for (residue, name, expected) in [
+            ("ARG", "HG1", Element::H),
+            ("HSD", "CD2", Element::C),
+            ("ARG", "CA", Element::C),
+            ("ILE", "CD", Element::C),
+            ("SOL", "HW1", Element::H),
+            ("CA", "CA", Element::Ca),
+            ("LIG", "HG1", Element::Hg),
+        ] {
+            let mut atom = Atom {
+                name: name.into(),
+                residue_name: residue.into(),
+                element: crate::molecule::pdb::infer_element(&format!("{name:<4}")),
+                ..Atom::default()
+            };
+            resolve_element(&mut atom, &mut cache);
+            assert_eq!(atom.element, expected, "{residue} {name}");
+        }
     }
 
     #[test]

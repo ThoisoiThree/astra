@@ -24,6 +24,7 @@ pub enum StructureFormat {
     Pdbml,
     Gro,
     Xyz,
+    Pqr,
 }
 
 impl StructureFormat {
@@ -35,6 +36,7 @@ impl StructureFormat {
             Self::Pdbml => "PDBML/XML",
             Self::Gro => "GROMACS GRO",
             Self::Xyz => "XYZ",
+            Self::Pqr => "PQR",
         }
     }
 }
@@ -120,6 +122,10 @@ pub fn parse_structure(bytes: &[u8], filename: &str) -> Result<ParsedStructure, 
             let structure = cif::structure_from_cif(&document, "PDBML/XML")?;
             (structure.molecule, structure.frames)
         }
+        StructureFormat::Pqr => {
+            let document = pdb::parse_pqr_document(text(&bytes, format)?)?;
+            (document.molecule, document.frames)
+        }
         StructureFormat::Gro => coordinates::parse_gro(text(&bytes, format)?)?,
         StructureFormat::Xyz => coordinates::parse_xyz(text(&bytes, format)?)?,
     };
@@ -171,12 +177,14 @@ fn filename_hint(filename: &str) -> Option<StructureFormat> {
     let lower = lower.strip_suffix(".gz").unwrap_or(&lower);
     if lower.ends_with(".bcif") {
         Some(StructureFormat::BinaryCif)
-    } else if lower.ends_with(".cif") || lower.ends_with(".mmcif") {
+    } else if lower.ends_with(".cif") || lower.ends_with(".mmcif") || lower.ends_with(".pdbx") {
         Some(StructureFormat::Mmcif)
     } else if lower.ends_with(".xml") {
         Some(StructureFormat::Pdbml)
-    } else if lower.ends_with(".pdb") || lower.ends_with(".ent") || lower.ends_with(".pqr") {
+    } else if lower.ends_with(".pdb") || lower.ends_with(".ent") {
         Some(StructureFormat::Pdb)
+    } else if lower.ends_with(".pqr") {
+        Some(StructureFormat::Pqr)
     } else if lower.ends_with(".gro") {
         Some(StructureFormat::Gro)
     } else if lower.ends_with(".xyz") {
@@ -197,7 +205,13 @@ fn sniff_format(bytes: &[u8]) -> Option<StructureFormat> {
         .ok()
         .map(|text| text.trim_start_matches('\u{feff}').trim_start());
     if let Some(text) = text {
-        if text.starts_with("data_") || text.starts_with("global_") {
+        // CIF files may open with comment lines before the first data block.
+        let first_content = text
+            .lines()
+            .map(str::trim_start)
+            .find(|line| !line.is_empty() && !line.starts_with('#'))
+            .unwrap_or_default();
+        if first_content.starts_with("data_") || first_content.starts_with("global_") {
             return Some(StructureFormat::Mmcif);
         }
         if text.starts_with("<?xml") || text.starts_with('<') {

@@ -177,6 +177,11 @@ impl Runtime {
             BatchStage::Configuring => self.set_batch_stage(BatchStage::Rendering),
             BatchStage::Rendering => {
                 let (output, request) = (batch.export.output.clone(), batch.export.request);
+                // Frame the structure for the image's aspect ratio rather than the window's.
+                self.camera.aspect =
+                    request.image.width as f32 / request.image.height.max(1) as f32;
+                self.fit();
+                self.camera.depth_of_field.focus_point = self.camera.target;
                 let result = self
                     .export_image_to(&output, request)
                     .map(|()| output)

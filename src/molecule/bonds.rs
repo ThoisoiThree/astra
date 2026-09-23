@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 
 use super::{
     Atom, Bond, BondKind, BondOrder, Element,
-    ccd::{ComponentCache, ComponentKind},
+    ccd::{ComponentCache, ComponentKind, canonical_atom_name, canonical_component},
 };
 
 const CELL_SIZE: f32 = 3.0;
@@ -49,15 +49,17 @@ pub fn build_bonds(atoms: &[Atom], explicit: &[ExplicitBond]) -> Vec<Bond> {
         for &atom in residue {
             residue_of[atom] = residue_index;
         }
-        let name = &atoms[residue[0]].residue_name;
+        let name = canonical_component(&atoms[residue[0]].residue_name);
         let component = cache.get(name);
         polymer[residue_index] = classify(atoms, residue, component.as_ref().map(|c| c.kind));
         let Some(component) = component else {
             continue;
         };
-        let mut by_name = HashMap::<&str, usize>::new();
+        let mut by_name = HashMap::<std::borrow::Cow<'_, str>, usize>::new();
         for &atom in residue {
-            by_name.entry(atoms[atom].name.as_str()).or_insert(atom);
+            by_name
+                .entry(canonical_atom_name(name, &atoms[atom].name))
+                .or_insert(atom);
         }
         let mut template_atoms = Vec::with_capacity(component.atoms.len());
         for template in &component.atoms {
@@ -209,7 +211,9 @@ fn infer_remaining(
         cells.entry(cell_for(atom)).or_default().push(index);
     }
     for (index, atom) in atoms.iter().enumerate() {
-        if atom.element.is_metal() {
+        // Metals bond only through explicit records; atoms of unknown element are usually
+        // virtual sites (TIP4P M, lone pairs) and never bond.
+        if atom.element.is_metal() || atom.element == Element::Unknown {
             continue;
         }
         let cell = cell_for(atom);
@@ -229,7 +233,7 @@ fn infer_remaining(
                             continue;
                         }
                         let partner = &atoms[other];
-                        if partner.element.is_metal() {
+                        if partner.element.is_metal() || partner.element == Element::Unknown {
                             continue;
                         }
                         let distance = atom.position.distance(partner.position);

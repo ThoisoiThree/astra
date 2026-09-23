@@ -194,10 +194,11 @@ fn read_atom_site(
                 .entry(label.trim().to_string())
                 .or_insert_with(|| chain_id.clone());
         }
-        let element = table
+        let given = table
             .text(symbol, row)
-            .and_then(|value| value.parse::<Element>().ok())
-            .unwrap_or_else(|| infer_element(&name));
+            .and_then(|value| value.parse::<Element>().ok());
+        let element_inferred = given.is_none();
+        let element = given.unwrap_or_else(|| infer_element(&name));
         let alt_loc = table
             .text(alt, row)
             .and_then(|value| value.trim().chars().next());
@@ -230,7 +231,11 @@ fn read_atom_site(
                 .map_or(0, |value| value.clamp(-128.0, 127.0) as i8),
         };
         let model = table.number(model, row).map_or(1, |value| value as i64);
-        records.push(AtomRecord { atom, model });
+        records.push(AtomRecord {
+            atom,
+            model,
+            element_inferred,
+        });
     }
     Ok((records, label_chains))
 }
@@ -256,7 +261,8 @@ fn read_symmetry(document: &dyn CifDocument, info: &mut StructureInfo) {
             Table::new(document, "space_group")
                 .and_then(|table| table.string(&["name_h-m_alt", "it_number"], 0))
         })
-        .unwrap_or_default();
+        .filter(|group| !group.is_empty())
+        .unwrap_or_else(|| "P 1".into());
     info.crystal = Some(CrystalInfo {
         cell: UnitCell {
             a,
