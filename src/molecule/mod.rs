@@ -15,6 +15,7 @@ mod records;
 mod secondary;
 mod structure;
 pub mod symmetry;
+pub mod trajectory;
 
 pub use bonds::{ExplicitBond, build_bonds, infer_bonds};
 pub use element::Element;
