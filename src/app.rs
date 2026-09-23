@@ -360,6 +360,7 @@ impl Runtime {
     fn redraw(&mut self, event_loop: &ActiveEventLoop) {
         let trace = StartupTrace::new("redraw");
         trace.mark("BEGIN UI frame");
+        self.ui.log_new_error();
         let raw_input = self.egui_state.take_egui_input(&self.window);
         let session_tabs = self.session_tabs();
         let background_job = self

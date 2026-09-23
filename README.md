@@ -49,10 +49,12 @@ Experimental AMOEBA 2018 interaction analysis is available through
 
 ### Common requirements
 
-Install the current stable Rust toolchain using the
+Install `rustup` using the
 [official Rust installation guide](https://doc.rust-lang.org/book/ch01-01-installation.html).
-The project uses Rust edition 2024. Build commands below should be executed from
-the repository root.
+`rust-toolchain.toml` pins the compiler used by CI and releases; rustup installs it
+automatically on the first build. The minimum supported Rust version is 1.95 and the
+project uses Rust edition 2024. Build commands below should be executed from the
+repository root.
 
 Cargo resolves Rust dependencies from `Cargo.lock`. The build supplies its own
 Protocol Buffers compiler and generates application icons from the included SVG;
@@ -168,7 +170,9 @@ See [AMOEBA preparation, energy definition, and validation](docs/amoeba.md).
 Use **File → Open**, drag a file into the window, or pass a path to the executable.
 Multiple files can be opened together; each structure or project receives its
 own tab. **File → Fetch from PDB** downloads a structure by its RCSB PDB ID, with
-progress reporting and cancellation. Downloads are stored in `~/downloads/pdb/`.
+progress reporting and cancellation. Downloads are stored in the `pdb` folder of the
+user's Downloads directory (`XDG_DOWNLOAD_DIR` on Linux); set `ASTRA_DOWNLOAD_DIR`
+to use another location.
 
 | Format | Extensions | Notes |
 | --- | --- | --- |
@@ -398,10 +402,29 @@ Run the standard checks before submitting changes:
 
 ```sh
 cargo fmt --check
-cargo check
-cargo test
-cargo clippy --all-targets --all-features -- -D warnings
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked
+cargo deny check
 ```
+
+CI (`.github/workflows/ci.yml`) runs the same checks on Linux, Windows and macOS,
+builds release executables, and audits dependencies against the RustSec database
+with [cargo-deny](https://github.com/EmbarkStudios/cargo-deny) (`deny.toml`).
+
+### Logs and diagnostics
+
+Astra writes a rotating log (`astra.log`, up to 4 MiB, three previous files kept),
+including panics with backtraces and errors shown in the interface:
+
+| Platform | Location |
+| --- | --- |
+| Windows | `%LOCALAPPDATA%\astra\logs` |
+| macOS | `~/Library/Logs/Astra` |
+| Linux | `$XDG_STATE_HOME/astra/logs` (default `~/.local/state/astra/logs`) |
+
+`ASTRA_LOG` sets the level (`error`, `warn`, `info`, `debug`, `trace`; default
+`info`), `ASTRA_LOG_STDERR=1` mirrors the log to the terminal, and `ASTRA_LOG_DIR`
+or `ASTRA_STATE_DIR` redirect the log and recovery files.
 
 Native AMOEBA numerical regressions run in the standard test suite against
 committed OpenMM Reference fixtures. Regenerating those fixtures uses optional

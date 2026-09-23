@@ -105,7 +105,7 @@ impl GpuProfiler {
                 pending.active_mask & dof_mask,
                 self.timestamp_period_ns,
             );
-            for (index, pair) in timestamps.chunks_exact(2).enumerate() {
+            for (index, pair) in timestamps.as_chunks::<2>().0.iter().enumerate() {
                 self.latest_ms[index] = if pending.active_mask & (1 << index) != 0 {
                     pair[1].saturating_sub(pair[0]) as f32 * self.timestamp_period_ns / 1_000_000.0
                 } else {
@@ -164,7 +164,7 @@ impl GpuProfiler {
 fn timestamp_span_ms(timestamps: &[u64], mask: u16, period_ns: f32) -> f32 {
     let mut first = u64::MAX;
     let mut last = 0;
-    for (index, pair) in timestamps.chunks_exact(2).enumerate() {
+    for (index, pair) in timestamps.as_chunks::<2>().0.iter().enumerate() {
         if mask & (1 << index) != 0 {
             first = first.min(pair[0]);
             last = last.max(pair[1]);

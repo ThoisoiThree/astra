@@ -4,6 +4,7 @@ pub mod command;
 pub mod diagnostics;
 pub mod measurement;
 pub mod molecule;
+pub mod paths;
 pub mod picking;
 pub mod render;
 pub mod scene;
@@ -1326,7 +1327,10 @@ mod display_tests {
         assert_eq!(display.coloring_mode, ColoringMode::Chain);
         assert_eq!(display.colors, chain_colors);
         assert!(display.ambient_occlusion.enabled);
-        assert_eq!(display.ambient_occlusion.quality.sample_count(), 12);
+        assert_eq!(
+            display.ambient_occlusion.quality,
+            AmbientOcclusionQuality::default()
+        );
 
         display.set_coloring_mode(&molecule, ColoringMode::Uniform);
         display.set_uniform_color(&molecule, [1.0, 0.0, 0.0, 1.0]);

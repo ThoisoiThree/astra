@@ -194,10 +194,7 @@ pub(super) fn normalize_pdb_id(value: &str) -> Result<String> {
 }
 
 pub(super) fn pdb_download_directory() -> Result<PathBuf> {
-    let home = env::var_os("HOME")
-        .or_else(|| env::var_os("USERPROFILE"))
-        .context("could not determine the home directory")?;
-    Ok(PathBuf::from(home).join("downloads").join("pdb"))
+    astra::paths::pdb_download_dir().context("could not determine the download directory")
 }
 
 #[cfg(test)]
@@ -838,23 +835,10 @@ pub(super) fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
 }
 
 pub(super) fn recovery_directory() -> Result<PathBuf> {
-    #[cfg(target_os = "macos")]
-    let base = env::var_os("HOME")
-        .map(PathBuf::from)
-        .map(|home| home.join("Library/Application Support"));
-    #[cfg(target_os = "windows")]
-    let base = env::var_os("LOCALAPPDATA").map(PathBuf::from);
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    let base = env::var_os("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| {
-            env::var_os("HOME")
-                .map(PathBuf::from)
-                .map(|home| home.join(".local/state"))
-        });
+    let base = astra::paths::state_dir();
     let directory = base
         .context("could not determine the user data directory")?
-        .join("astra/recovery");
+        .join("recovery");
     fs::create_dir_all(&directory)
         .with_context(|| format!("could not create {}", directory.display()))?;
     Ok(directory)

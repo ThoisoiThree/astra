@@ -33,6 +33,7 @@ pub struct UiState {
     experimental_features: bool,
     pub command_input: String,
     pub latest_error: Option<String>,
+    logged_error: Option<String>,
     history: Vec<String>,
     history_cursor: Option<usize>,
     fetch_open: bool,
@@ -365,6 +366,16 @@ pub struct UiInfo<'a> {
 }
 
 impl UiState {
+    /// Records each newly shown error once in the application log.
+    pub fn log_new_error(&mut self) {
+        if self.latest_error != self.logged_error {
+            if let Some(error) = &self.latest_error {
+                log::warn!("{error}");
+            }
+            self.logged_error = self.latest_error.clone();
+        }
+    }
+
     pub fn show(&mut self, root: &mut egui::Ui, info: UiInfo<'_>) -> UiActions {
         let mut actions = UiActions::default();
         egui::Panel::top("toolbar").show(root, |ui| {

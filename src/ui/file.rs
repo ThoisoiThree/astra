@@ -135,8 +135,9 @@ impl UiState {
                             .animate(info.fetch_total_bytes.is_none()),
                     );
                     ui.label(format!(
-                        "{} · saved to ~/downloads/pdb/",
-                        format_speed(info.fetch_bytes_per_second)
+                        "{} · saved to {}",
+                        format_speed(info.fetch_bytes_per_second),
+                        pdb_download_label()
                     ));
                     ui.add_space(6.0);
                     if ui.button("Cancel").clicked() {
@@ -151,7 +152,10 @@ impl UiState {
                     );
                     let enter = edit.lost_focus()
                         && context.input(|input| input.key_pressed(egui::Key::Enter));
-                    ui.small("The downloaded file will be saved to ~/downloads/pdb/");
+                    ui.small(format!(
+                        "The downloaded file will be saved to {}",
+                        pdb_download_label()
+                    ));
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
                         let can_fetch = !self.fetch_id.trim().is_empty();
@@ -185,4 +189,10 @@ impl UiState {
         self.named_expression_editor = None;
         self.rename_editor = None;
     }
+}
+
+fn pdb_download_label() -> String {
+    astra::paths::pdb_download_dir()
+        .map(|path| astra::paths::display_path(&path))
+        .unwrap_or_else(|| "the Downloads folder".into())
 }

@@ -813,19 +813,23 @@ fn decode_run_length(value: Decoded) -> Result<Decoded, StructureError> {
             "RunLength data has an incomplete pair".into(),
         ));
     }
-    let total = packed.chunks_exact(2).try_fold(0_usize, |total, pair| {
-        let count = usize::try_from(pair[1])
-            .map_err(|_| StructureError::BinaryCif("negative RunLength count".into()))?;
-        total
-            .checked_add(count)
-            .ok_or_else(|| StructureError::BinaryCif("RunLength size overflow".into()))
-    })?;
+    let total = packed
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .try_fold(0_usize, |total, pair| {
+            let count = usize::try_from(pair[1])
+                .map_err(|_| StructureError::BinaryCif("negative RunLength count".into()))?;
+            total
+                .checked_add(count)
+                .ok_or_else(|| StructureError::BinaryCif("RunLength size overflow".into()))
+        })?;
     check_binary_value_count(total, "RunLength output")?;
     let mut values = Vec::new();
     values.try_reserve_exact(total).map_err(|_| {
         StructureError::BinaryCif("RunLength output allocation is too large".into())
     })?;
-    for pair in packed.chunks_exact(2) {
+    for pair in packed.as_chunks::<2>().0 {
         let count = usize::try_from(pair[1])
             .map_err(|_| StructureError::BinaryCif("negative RunLength count".into()))?;
         values.extend(std::iter::repeat_n(pair[0], count));

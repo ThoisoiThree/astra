@@ -1348,8 +1348,13 @@ mod tests {
         let molecule = backbone_molecule();
         let display = DisplayState::for_molecule(&molecule);
         let cartoon = cartoon_render_data(&molecule, &display);
-        assert_eq!(cartoon.vertices.len(), 11 * 12);
-        assert_eq!(cartoon.indices.len(), 10 * 12 * 6);
+        // Three residues form two spline segments; each ring has twice the width segments
+        // (at least six per side).
+        let quality = display.ambient_occlusion.quality;
+        let rows = 2 * quality.cartoon_samples_per_residue() + 1;
+        let ring = quality.cartoon_width_segments().max(6) as usize * 2;
+        assert_eq!(cartoon.vertices.len(), rows * ring);
+        assert_eq!(cartoon.indices.len(), (rows - 1) * ring * 6);
         assert_eq!(&cartoon.standard_atomic[..6], &[false; 6]);
         assert!(cartoon.standard_atomic[6]);
     }

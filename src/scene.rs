@@ -432,14 +432,14 @@ fn molecule_from_wire(molecule: wire::MoleculeV1) -> Result<Molecule, SceneError
         });
     }
 
-    let chunks = molecule.bond_endpoints.chunks_exact(2);
-    if !chunks.remainder().is_empty() {
+    let (pairs, remainder) = molecule.bond_endpoints.as_chunks::<2>();
+    if !remainder.is_empty() {
         return Err(invalid("bond endpoint list has an odd length"));
     }
-    let mut bonds = Vec::with_capacity(molecule.bond_endpoints.len() / 2);
-    for pair in chunks {
-        let a = pair[0] as usize;
-        let b = pair[1] as usize;
+    let mut bonds = Vec::with_capacity(pairs.len());
+    for &[a, b] in pairs {
+        let a = a as usize;
+        let b = b as usize;
         if a >= atom_count || b >= atom_count {
             return Err(invalid("bond refers to an atom outside the molecule"));
         }
