@@ -13,6 +13,7 @@ use astra::{
 mod actions;
 mod camera;
 mod coloring;
+mod export;
 mod file;
 mod hierarchy;
 mod info;
@@ -60,6 +61,58 @@ pub struct UiState {
     focus_residue_number: String,
     focus_base_name: String,
     focus_atom_serial: String,
+    export_open: bool,
+    export: ExportForm,
+}
+
+/// Settings of the image export window, kept between exports.
+#[derive(Debug, Clone, Copy)]
+struct ExportForm {
+    width: u32,
+    height: u32,
+    supersampling: u32,
+    background: astra::render::ExportBackground,
+    dots_per_inch: u32,
+    /// Size follows the viewport until the user edits it.
+    customized: bool,
+}
+
+impl Default for ExportForm {
+    fn default() -> Self {
+        Self {
+            width: 1920,
+            height: 1080,
+            supersampling: 3,
+            background: astra::render::ExportBackground::Scene,
+            dots_per_inch: 300,
+            customized: false,
+        }
+    }
+}
+
+/// A structure derived from the active one, opened in a new tab.
+#[derive(Debug, Clone, PartialEq)]
+pub enum StructureRequest {
+    Assembly(String),
+    UnitCell,
+    SymmetryMates(f64),
+}
+
+impl StructureRequest {
+    pub fn label(&self) -> String {
+        match self {
+            Self::Assembly(id) => format!("assembly {id}"),
+            Self::UnitCell => "unit cell".into(),
+            Self::SymmetryMates(radius) => format!("symmetry mates {radius:.0} Å"),
+        }
+    }
+}
+
+/// Image export requested from the UI or the command line.
+#[derive(Debug, Clone, Copy)]
+pub struct ExportRequest {
+    pub image: astra::render::ImageExport,
+    pub dots_per_inch: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -212,6 +265,8 @@ pub enum ManagerAction {
     },
     SetColoringMode(ColoringMode),
     SetGlobalMode(DisplayMode),
+    SetBondOrders(bool),
+    SetSecondarySource(astra::molecule::SecondarySource),
     SetAmbientOcclusion(AmbientOcclusionSettings),
     SetUniformColor(DisplayColor),
     ActivateNamed(String),
@@ -289,6 +344,9 @@ pub struct UiActions {
     pub camera_update: Option<CameraUpdate>,
     pub focus_request: Option<FocusRequest>,
     pub pivot_request: Option<PivotRequest>,
+    pub export_image: Option<ExportRequest>,
+    pub render_scale: Option<u32>,
+    pub structure_request: Option<StructureRequest>,
     pub viewport: egui::Rect,
 }
 
@@ -314,6 +372,9 @@ impl Default for UiActions {
             camera_update: None,
             focus_request: None,
             pivot_request: None,
+            export_image: None,
+            render_scale: None,
+            structure_request: None,
             viewport: egui::Rect::NOTHING,
         }
     }
@@ -363,6 +424,9 @@ pub struct UiInfo<'a> {
     pub background_stage: Option<&'a str>,
     pub background_progress: f32,
     pub render_stats: RenderStats,
+    /// Molecular viewport size in physical pixels.
+    pub viewport_pixels: [u32; 2],
+    pub max_texture_dimension: u32,
 }
 
 impl UiState {
@@ -481,6 +545,7 @@ impl UiState {
         self.named_expression_editor_window(root.ctx(), &mut actions);
         self.rename_window(root.ctx(), &mut actions);
         self.info_window(root.ctx(), info, &mut actions);
+        self.export_window(root.ctx(), info, &mut actions);
         if info.close_pending {
             self.close_window(root.ctx(), info, &mut actions);
         } else {
@@ -523,6 +588,8 @@ fn mode_button(ui: &mut egui::Ui, effective: DisplayMode, direct: ModeOverride) 
     let label = match effective {
         DisplayMode::Cartoon => "C",
         DisplayMode::BallAndStick => "B",
+        DisplayMode::Licorice => "L",
+        DisplayMode::Spacefill => "S",
         DisplayMode::Toon => "T",
     };
     let color = if direct == ModeOverride::Inherit {
@@ -530,20 +597,24 @@ fn mode_button(ui: &mut egui::Ui, effective: DisplayMode, direct: ModeOverride) 
     } else {
         egui::Color32::from_rgb(255, 172, 55)
     };
+    let hint = if direct == ModeOverride::Inherit {
+        format!(
+            "Mode: inherited {} (click → {} override)",
+            effective.label(),
+            effective.next().label()
+        )
+    } else {
+        format!(
+            "Mode override: {} (click → {})",
+            effective.label(),
+            effective.next().label()
+        )
+    };
     ui.add(
         egui::Button::new(egui::RichText::new(label).strong().color(color))
             .min_size(egui::vec2(20.0, 17.0)),
     )
-    .on_hover_text(match (effective, direct) {
-        (mode, ModeOverride::Inherit) => match mode {
-            DisplayMode::Cartoon => "Mode: inherited Cartoon (click → Ball & stick override)",
-            DisplayMode::BallAndStick => "Mode: inherited Ball & stick (click → Toon override)",
-            DisplayMode::Toon => "Mode: inherited Toon (click → Cartoon override)",
-        },
-        (DisplayMode::Cartoon, _) => "Mode override: Cartoon (click → Ball & stick)",
-        (DisplayMode::BallAndStick, _) => "Mode override: Ball & stick (click → Toon)",
-        (DisplayMode::Toon, _) => "Mode override: Toon (click → Cartoon/inherit)",
-    })
+    .on_hover_text(hint)
 }
 
 fn color_square(ui: &mut egui::Ui, color: DisplayColor, overridden: bool) -> egui::Response {
@@ -673,13 +744,23 @@ mod tests {
     }
 
     #[test]
-    fn hierarchy_mode_button_cycles_through_toon_and_back_to_inherit() {
+    fn hierarchy_mode_button_cycles_through_every_mode_and_back_to_inherit() {
         let global = DisplayMode::Cartoon;
-        let ball = next_mode_override(ModeOverride::Inherit, global);
-        let toon = next_mode_override(ball, global);
-        let inherited = next_mode_override(toon, global);
-        assert_eq!(ball, ModeOverride::BallAndStick);
-        assert_eq!(toon, ModeOverride::Toon);
-        assert_eq!(inherited, ModeOverride::Inherit);
+        let mut state = ModeOverride::Inherit;
+        let mut visited = Vec::new();
+        for _ in 0..DisplayMode::ALL.len() {
+            state = next_mode_override(state, global);
+            visited.push(state);
+        }
+        assert_eq!(
+            visited,
+            vec![
+                ModeOverride::BallAndStick,
+                ModeOverride::Licorice,
+                ModeOverride::Spacefill,
+                ModeOverride::Toon,
+                ModeOverride::Inherit,
+            ]
+        );
     }
 }

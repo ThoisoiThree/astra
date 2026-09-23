@@ -59,6 +59,10 @@ pub(super) fn performance_overlay(
                     "Cartoon {} tris · toon {} quads",
                     stats.cartoon_triangles, stats.toon_triangles
                 ));
+                ui.monospace(format!(
+                    "Surface {} tris · scale {}×",
+                    stats.surface_triangles, stats.render_scale
+                ));
             });
         });
 }
@@ -95,6 +99,11 @@ impl UiState {
                 if mode != display.global_mode {
                     actions.manager = Some(ManagerAction::SetGlobalMode(mode));
                 }
+                if mode == DisplayMode::Spacefill {
+                    ui.small("Van der Waals spheres");
+                } else if mode == DisplayMode::Licorice {
+                    ui.small("Uniform sticks with rounded joints");
+                }
                 if mode == DisplayMode::Toon {
                     ui.small(
                         "Analytic space-filling spheres · atom/residue/chain outlines · paper background",
@@ -118,6 +127,34 @@ impl UiState {
                         }
                     });
                 ui.small("Controls AO samples, DOF resolution/layers, and cartoon tessellation");
+                let current_scale = info.render_stats.render_scale.max(1);
+                let label = |scale: u32| {
+                    if scale == 1 {
+                        "FXAA".to_string()
+                    } else {
+                        format!("Supersampling {scale}×")
+                    }
+                };
+                let mut scale = current_scale;
+                egui::ComboBox::from_label("Antialiasing")
+                    .selected_text(label(scale))
+                    .show_ui(ui, |ui| {
+                        for candidate in 1..=astra::render::MAX_RENDER_SCALE {
+                            ui.selectable_value(&mut scale, candidate, label(candidate));
+                        }
+                    });
+                if scale != current_scale {
+                    actions.render_scale = Some(scale);
+                }
+                ui.small("Supersampling renders N×N samples per pixel; use it for presentation");
+                let mut bond_orders = display.bond_orders;
+                if ui
+                    .checkbox(&mut bond_orders, "Show bond orders")
+                    .on_hover_text("Double, triple and aromatic bonds in stick representations")
+                    .changed()
+                {
+                    actions.manager = Some(ManagerAction::SetBondOrders(bond_orders));
+                }
                 ui.checkbox(&mut self.performance_overlay, "Performance overlay");
                 ui.separator();
                 ui.heading("Ambient occlusion");

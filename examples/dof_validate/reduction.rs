@@ -29,6 +29,7 @@ pub(super) fn validate(
             quality: [5.0, 1.0, size as f32, size as f32],
             background: [0.0; 4],
             viewport: [0.0, 0.0, 1.0, 1.0],
+            output: [1.0, 0.0, 1.0, 0.0],
         };
         queue.write_buffer(&post.uniform, 0, bytemuck::bytes_of(&uniform));
         let mut encoder = device.create_command_encoder(&Default::default());

@@ -24,7 +24,7 @@ use astra::{
     measurement::{MeasurementEndpoint, MeasurementLine},
     molecule::{
         MAX_DECOMPRESSED_STRUCTURE_SIZE, Molecule, MoleculeHierarchy, SecondaryStructure,
-        assign_secondary_structure, parse_structure,
+        assign_secondary_structure_from, parse_structure,
     },
     picking::AtomBvh,
     render::{PreparedCartoon, RenderError, Renderer, SurfaceIssue, prepare_cartoon_cached},
@@ -55,6 +55,7 @@ mod protonation;
 mod recovery;
 mod runtime;
 mod session;
+mod structure;
 use actions::*;
 use history::*;
 use io_jobs::*;
@@ -87,7 +88,9 @@ struct PendingPick {
 }
 
 impl Runtime {
-    fn new(event_loop: &ActiveEventLoop, initial_path: Option<PathBuf>) -> Result<Self> {
+    fn new(event_loop: &ActiveEventLoop, options: crate::cli::Options) -> Result<Self> {
+        let initial_path = options.path;
+        let batch = options.batch.map(structure::BatchState::new);
         let trace = StartupTrace::new("startup");
         trace.mark("BEGIN window creation");
         let attributes = WindowAttributes::default()
@@ -101,6 +104,7 @@ impl Runtime {
                 .context("could not decode the embedded Astra icon")?,
             ))
             .with_inner_size(LogicalSize::new(1280.0, 800.0))
+            .with_visible(batch.is_none())
             .with_min_inner_size(LogicalSize::new(720.0, 480.0));
         let window = Arc::new(
             event_loop
@@ -189,8 +193,10 @@ impl Runtime {
             #[cfg(target_os = "windows")]
             windows_backend: astra::render::backend::WindowsBackend::load(),
             exit_ready: false,
-            recovery_scan_pending: true,
+            recovery_scan_pending: batch.is_none(),
             recovery_candidates: VecDeque::new(),
+            batch,
+            batch_failure: None,
         };
         if let Some(path) = initial_path
             && let Err(error) = runtime.start_load_path(&path)
@@ -418,6 +424,11 @@ impl Runtime {
                 .as_ref()
                 .is_some_and(closing::ClosePlan::is_busy),
             recovery_file: self.recovery_candidates.front().map(PathBuf::as_path),
+            viewport_pixels: [
+                self.viewport.width.round() as u32,
+                self.viewport.height.round() as u32,
+            ],
+            max_texture_dimension: self.renderer.max_texture_dimension(),
         };
         let context = self.egui_context.clone();
         let mut actions = UiActions::default();
@@ -564,6 +575,25 @@ impl Runtime {
         if actions.fit {
             self.fit();
             self.mark_camera_dirty();
+        }
+        if let Some(scale) = actions.render_scale {
+            self.renderer.set_render_scale(scale);
+            self.window.request_redraw();
+        }
+        if let Some(request) = actions.export_image {
+            match self.export_image_dialog(request) {
+                Ok(Some(path)) => {
+                    log::info!("Exported image {}", path.display());
+                    self.ui.latest_error = None;
+                }
+                Ok(None) => {}
+                Err(error) => self.ui.latest_error = Some(format!("{error:#}")),
+            }
+        }
+        if let Some(request) = actions.structure_request
+            && let Err(error) = self.start_derived_structure(request)
+        {
+            self.ui.latest_error = Some(format!("{error:#}"));
         }
         if actions.reset_colors {
             let before = self.begin_edit();
@@ -804,16 +834,8 @@ impl Runtime {
         self.ui.latest_error = None;
     }
 
-    fn start_load_path(&mut self, path: &Path) -> Result<()> {
-        self.start_load_path_with_kind(path, JobKind::Load)
-    }
-
-    fn start_load_path_with_kind(&mut self, path: &Path, kind: JobKind) -> Result<()> {
-        let filename = path.file_name().map_or_else(
-            || path.display().to_string(),
-            |name| name.to_string_lossy().into_owned(),
-        );
-        self.begin_new_session();
+    /// Empties the active tab's document before a new structure is loaded into it.
+    fn clear_active_document(&mut self) {
         self.molecule = None;
         self.hierarchy = None;
         self.secondary_structure = None;
@@ -828,6 +850,22 @@ impl Runtime {
         self.inspection = None;
         self.hierarchy_selection.clear();
         self.hierarchy_selection_anchor = None;
+        self.scene_path = None;
+        self.dirty = false;
+        self.renderer.update_measurements(&[]);
+    }
+
+    fn start_load_path(&mut self, path: &Path) -> Result<()> {
+        self.start_load_path_with_kind(path, JobKind::Load)
+    }
+
+    fn start_load_path_with_kind(&mut self, path: &Path, kind: JobKind) -> Result<()> {
+        let filename = path.file_name().map_or_else(
+            || path.display().to_string(),
+            |name| name.to_string_lossy().into_owned(),
+        );
+        self.begin_new_session();
+        self.clear_active_document();
         self.loaded_filename = Some(filename);
         self.molecule_id = Some("Loading…".into());
         self.scene_path = None;

@@ -1,18 +1,45 @@
 use crate::{
-    AmbientOcclusionQuality, ColoringMode, DisplayMode, ModeOverride, VisibilityOverride,
-    molecule::Element,
+    AmbientOcclusionQuality, ColoringMode, DisplayLevel, DisplayMode, ModeOverride,
+    VisibilityOverride, molecule::Element,
 };
 
 use super::{SceneDocument, SceneError, validation::invalid};
 
 pub(super) fn minimum_reader_version(document: &SceneDocument) -> u32 {
-    // Reader 4 understands `atomic_numbers`; older readers would silently turn elements
-    // outside the reader-1 enum into unknown atoms.
+    // Reader 4 understands `atomic_numbers` and the Spacefill and Licorice modes; older
+    // readers would silently turn other elements into unknown atoms or reject the modes.
+    let new_mode =
+        |mode: ModeOverride| matches!(mode, ModeOverride::Spacefill | ModeOverride::Licorice);
+    let display = &document.display;
     if document
         .molecule
         .atoms
         .iter()
         .any(|a| a.element != Element::Unknown && element_code(a.element) == 0)
+        || matches!(
+            display.global_mode,
+            DisplayMode::Spacefill | DisplayMode::Licorice
+        )
+        || [
+            DisplayLevel::Chain,
+            DisplayLevel::Residue,
+            DisplayLevel::Atom,
+        ]
+        .into_iter()
+        .any(|level| {
+            display
+                .mode_override_values(level)
+                .into_iter()
+                .any(new_mode)
+        })
+        || document
+            .named_selection_styles
+            .values()
+            .any(|style| new_mode(style.mode))
+        || display
+            .representations
+            .iter()
+            .any(|mask| mask.bits() & !0b11 != 0)
     {
         4
     } else if document
@@ -80,6 +107,8 @@ pub(super) fn display_mode_code(mode: DisplayMode) -> i32 {
         DisplayMode::Cartoon => 0,
         DisplayMode::BallAndStick => 1,
         DisplayMode::Toon => 2,
+        DisplayMode::Spacefill => 3,
+        DisplayMode::Licorice => 4,
     }
 }
 
@@ -88,6 +117,8 @@ pub(super) fn display_mode_from_code(code: i32) -> Result<DisplayMode, SceneErro
         0 => Ok(DisplayMode::Cartoon),
         1 => Ok(DisplayMode::BallAndStick),
         2 => Ok(DisplayMode::Toon),
+        3 => Ok(DisplayMode::Spacefill),
+        4 => Ok(DisplayMode::Licorice),
         value => Err(invalid(format!("unknown display mode {value}"))),
     }
 }
@@ -140,6 +171,8 @@ pub(super) fn mode_override_code(state: ModeOverride) -> u32 {
         ModeOverride::Cartoon => 1,
         ModeOverride::BallAndStick => 2,
         ModeOverride::Toon => 3,
+        ModeOverride::Spacefill => 4,
+        ModeOverride::Licorice => 5,
     }
 }
 
@@ -149,6 +182,8 @@ pub(super) fn mode_override_from_code(code: u32) -> Result<ModeOverride, SceneEr
         1 => Ok(ModeOverride::Cartoon),
         2 => Ok(ModeOverride::BallAndStick),
         3 => Ok(ModeOverride::Toon),
+        4 => Ok(ModeOverride::Spacefill),
+        5 => Ok(ModeOverride::Licorice),
         value => Err(invalid(format!("unknown mode override {value}"))),
     }
 }

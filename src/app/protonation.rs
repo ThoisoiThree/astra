@@ -59,7 +59,13 @@ impl Runtime {
         }
         self.pending_pick = None;
         let hierarchy = MoleculeHierarchy::from_molecule(&molecule);
-        self.secondary_structure = Some(assign_secondary_structure(&molecule, &hierarchy));
+        self.secondary_structure = Some(assign_secondary_structure_from(
+            &molecule,
+            &hierarchy,
+            self.display
+                .as_ref()
+                .map_or_else(Default::default, |display| display.secondary_source),
+        ));
         self.atom_bvh = Some(AtomBvh::build(&molecule));
         self.hierarchy = Some(hierarchy);
         self.display = Some(DisplayState::for_molecule(&molecule));

@@ -1,25 +1,31 @@
 use super::*;
 
-pub fn run(initial_path: Option<PathBuf>) -> Result<()> {
+pub fn run(options: crate::cli::Options) -> Result<()> {
     let event_loop = EventLoop::new().context("could not create the native event loop")?;
     let mut application = AstraApplication {
         runtime: None,
-        initial_path,
+        options: Some(options),
         startup_error: None,
     };
     event_loop
         .run_app(&mut application)
         .context("native event loop failed")?;
     if let Some(error) = application.startup_error {
-        Err(error)
-    } else {
-        Ok(())
+        return Err(error);
     }
+    if let Some(error) = application
+        .runtime
+        .as_mut()
+        .and_then(|runtime| runtime.batch_failure.take())
+    {
+        anyhow::bail!(error);
+    }
+    Ok(())
 }
 
 struct AstraApplication {
     runtime: Option<Runtime>,
-    initial_path: Option<PathBuf>,
+    options: Option<crate::cli::Options>,
     startup_error: Option<anyhow::Error>,
 }
 
@@ -28,7 +34,7 @@ impl ApplicationHandler for AstraApplication {
         if self.runtime.is_some() {
             return;
         }
-        match Runtime::new(event_loop, self.initial_path.take()) {
+        match Runtime::new(event_loop, self.options.take().unwrap_or_default()) {
             Ok(runtime) => self.runtime = Some(runtime),
             Err(error) => {
                 self.startup_error = Some(error);
@@ -54,6 +60,18 @@ impl ApplicationHandler for AstraApplication {
         if let Some(runtime) = &mut self.runtime {
             runtime.poll_background_jobs();
             runtime.poll_pick_result();
+            if runtime.batch.is_some() {
+                runtime.advance_batch();
+                if runtime.batch.is_none() {
+                    event_loop.exit();
+                    return;
+                }
+                // Background work completes on another thread; poll while rendering in batch.
+                event_loop.set_control_flow(ControlFlow::WaitUntil(
+                    Instant::now() + Duration::from_millis(20),
+                ));
+                return;
+            }
             if runtime.exit_ready {
                 event_loop.exit();
                 return;
@@ -148,4 +166,7 @@ pub(super) struct Runtime {
     pub(super) exit_ready: bool,
     pub(super) recovery_scan_pending: bool,
     pub(super) recovery_candidates: VecDeque<PathBuf>,
+    /// Command-line batch rendering in progress.
+    pub(super) batch: Option<super::structure::BatchState>,
+    pub(super) batch_failure: Option<String>,
 }

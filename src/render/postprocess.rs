@@ -21,11 +21,15 @@ pub(super) struct PostUniform {
     pub(super) quality: [f32; 4],
     pub(super) background: [f32; 4],
     pub(super) viewport: [f32; 4],
+    /// Supersampling factor, transparent background flag, FXAA flag, unused.
+    pub(super) output: [f32; 4],
 }
 
 pub(super) struct PostProcess {
     pub(super) scene: ColorTarget,
     pub(super) semantic: SemanticTarget,
+    /// Measurement annotations, depth-tested against the scene and composited last.
+    pub(super) overlay: ColorTarget,
     pub(super) ao_raw: ColorTarget,
     pub(super) ao_filtered: ColorTarget,
     pub(super) dof_color: ColorTarget,
@@ -36,7 +40,7 @@ pub(super) struct PostProcess {
     pub(super) bind_group: wgpu::BindGroup,
     pub(super) pipeline: wgpu::RenderPipeline,
     pub(super) dof_shade_pipeline: wgpu::RenderPipeline,
-    pub(super) ao_bind_group_layout: wgpu::BindGroupLayout,
+    _ao_bind_group_layout: wgpu::BindGroupLayout,
     pub(super) ao_raw_bind_group: wgpu::BindGroup,
     pub(super) ao_blur_bind_group: wgpu::BindGroup,
     pub(super) ao_raw_pipeline: wgpu::RenderPipeline,
@@ -53,6 +57,7 @@ impl PostProcess {
     ) -> Self {
         let scene = ColorTarget::new(device, "molecule scene color", width, height, SCENE_FORMAT);
         let semantic = SemanticTarget::new(device, width, height);
+        let overlay = ColorTarget::new(device, "annotation overlay", width, height, SCENE_FORMAT);
         let ao_raw = ColorTarget::new(device, "raw ambient occlusion", width, height, AO_FORMAT);
         let ao_filtered = ColorTarget::new(
             device,
@@ -151,6 +156,16 @@ impl PostProcess {
                     },
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 7,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
         let bind_group = create_post_bind_group(
@@ -163,6 +178,7 @@ impl PostProcess {
             &ao_filtered.view,
             &semantic.view,
             &dof_color.view,
+            &overlay.view,
         );
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("DOF postprocess shader"),
@@ -296,6 +312,7 @@ impl PostProcess {
         Self {
             scene,
             semantic,
+            overlay,
             ao_raw,
             ao_filtered,
             dof_color,
@@ -306,63 +323,12 @@ impl PostProcess {
             bind_group,
             pipeline,
             dof_shade_pipeline,
-            ao_bind_group_layout,
+            _ao_bind_group_layout: ao_bind_group_layout,
             ao_raw_bind_group,
             ao_blur_bind_group,
             ao_raw_pipeline,
             ao_blur_pipeline,
         }
-    }
-
-    pub(super) fn resize(
-        &mut self,
-        device: &wgpu::Device,
-        width: u32,
-        height: u32,
-        depth_view: &wgpu::TextureView,
-    ) {
-        self.scene = ColorTarget::new(device, "molecule scene color", width, height, SCENE_FORMAT);
-        self.semantic = SemanticTarget::new(device, width, height);
-        self.ao_raw = ColorTarget::new(device, "raw ambient occlusion", width, height, AO_FORMAT);
-        self.ao_filtered = ColorTarget::new(
-            device,
-            "filtered ambient occlusion",
-            width,
-            height,
-            AO_FORMAT,
-        );
-        self.dof_color = ColorTarget::new_storage(
-            device,
-            "depth of field color",
-            scaled_dimension(width, self.dof_scale),
-            scaled_dimension(height, self.dof_scale),
-            SCENE_FORMAT,
-        );
-        self.bind_group = create_post_bind_group(
-            device,
-            &self.bind_group_layout,
-            &self.scene.view,
-            &self.sampler,
-            depth_view,
-            &self.uniform,
-            &self.ao_filtered.view,
-            &self.semantic.view,
-            &self.dof_color.view,
-        );
-        self.ao_raw_bind_group = create_ao_bind_group(
-            device,
-            &self.ao_bind_group_layout,
-            depth_view,
-            &self.uniform,
-            &self.ao_filtered.view,
-        );
-        self.ao_blur_bind_group = create_ao_bind_group(
-            device,
-            &self.ao_bind_group_layout,
-            depth_view,
-            &self.uniform,
-            &self.ao_raw.view,
-        );
     }
 
     pub(super) fn set_dof_scale(
@@ -395,6 +361,7 @@ impl PostProcess {
             &self.ao_filtered.view,
             &self.semantic.view,
             &self.dof_color.view,
+            &self.overlay.view,
         );
     }
 }
@@ -414,6 +381,7 @@ pub(super) fn create_post_bind_group(
     ao_view: &wgpu::TextureView,
     semantic_view: &wgpu::TextureView,
     dof_view: &wgpu::TextureView,
+    overlay_view: &wgpu::TextureView,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("DOF postprocess bind group"),
@@ -446,6 +414,10 @@ pub(super) fn create_post_bind_group(
             wgpu::BindGroupEntry {
                 binding: 6,
                 resource: wgpu::BindingResource::TextureView(dof_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 7,
+                resource: wgpu::BindingResource::TextureView(overlay_view),
             },
         ],
     })

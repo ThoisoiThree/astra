@@ -24,7 +24,36 @@ pub(super) fn molecule_summary(ui: &mut egui::Ui, info: UiInfo<'_>) {
                 ui.monospace(value.to_string());
                 ui.end_row();
             }
+            if let Some(structure) = info.molecule.map(|molecule| &molecule.info) {
+                if structure.model_count > 1 {
+                    ui.label("Models");
+                    ui.monospace(structure.model_count.to_string());
+                    ui.end_row();
+                }
+                if !structure.assemblies.is_empty() {
+                    ui.label("Assemblies");
+                    ui.monospace(structure.assemblies.len().to_string());
+                    ui.end_row();
+                }
+                if let Some(crystal) = structure
+                    .crystal
+                    .as_ref()
+                    .filter(|crystal| crystal.cell.is_crystallographic())
+                {
+                    ui.label("Space group");
+                    ui.monospace(&crystal.space_group);
+                    ui.end_row();
+                }
+            }
         });
+    if let Some(structure) = info.molecule.map(|molecule| &molecule.info) {
+        if let Some(title) = &structure.title {
+            ui.add(egui::Label::new(egui::RichText::new(title).small()).wrap());
+        }
+        for note in &structure.notes {
+            ui.add(egui::Label::new(egui::RichText::new(note).small().weak()).wrap());
+        }
+    }
 }
 
 pub(super) fn focus_chain_number_fields(

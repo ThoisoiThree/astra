@@ -3,11 +3,12 @@ use glam::Vec3;
 use crate::{
     DisplayMode, DisplayState,
     molecule::{
-        Molecule, MoleculeHierarchy, ResidueGroup, SecondaryStructure, assign_secondary_structure,
+        Element, Molecule, MoleculeHierarchy, ResidueGroup, SecondaryStructure,
+        assign_secondary_structure_from,
     },
 };
 
-use super::instances::{CartoonVertex, semantic_ids_from_hierarchy};
+use super::instances::{MeshVertex, semantic_ids_from_hierarchy};
 
 #[derive(Clone, Copy)]
 
@@ -22,9 +23,9 @@ struct BackboneAnchor {
 
 #[derive(Default)]
 pub(super) struct CartoonRenderData {
-    pub(super) vertices: Vec<CartoonVertex>,
+    pub(super) vertices: Vec<MeshVertex>,
     pub(super) indices: Vec<u32>,
-    pub(super) standard_atomic: Vec<bool>,
+    pub(super) atomic: Vec<bool>,
     pub(super) semantic_ids: Vec<[u32; 4]>,
 }
 
@@ -33,7 +34,8 @@ pub(super) fn cartoon_render_data(
     display: &DisplayState,
 ) -> CartoonRenderData {
     let hierarchy = MoleculeHierarchy::from_molecule(molecule);
-    let assignments = assign_secondary_structure(molecule, &hierarchy);
+    let assignments =
+        assign_secondary_structure_from(molecule, &hierarchy, display.secondary_source);
     cartoon_render_data_cached(molecule, display, &hierarchy, &assignments)
 }
 
@@ -106,7 +108,6 @@ pub(super) fn cartoon_render_data_cached(
             if !drawable || !continuous {
                 append_ribbon_run(
                     &run,
-                    display,
                     samples_per_residue,
                     width_segments,
                     ring_segments,
@@ -116,12 +117,20 @@ pub(super) fn cartoon_render_data_cached(
                 run.clear();
             }
             if drawable {
+                if anchor.nucleic {
+                    append_nucleic_base(
+                        molecule,
+                        &chain.residues[anchor.residue_index],
+                        ring_segments,
+                        &mut vertices,
+                        &mut indices,
+                    );
+                }
                 run.push(anchor);
             }
         }
         append_ribbon_run(
             &run,
-            display,
             samples_per_residue,
             width_segments,
             ring_segments,
@@ -130,58 +139,202 @@ pub(super) fn cartoon_render_data_cached(
         );
     }
 
-    let standard_atomic = display
+    // Atoms of ribbon residues in Cartoon mode are represented by the ribbon; every other
+    // atom is drawn atomically in its mode (ligands stay visible as ball and stick).
+    let atomic = display
         .modes
         .iter()
         .enumerate()
-        .map(|(index, mode)| match mode {
-            DisplayMode::BallAndStick => true,
-            DisplayMode::Cartoon => !cartoon_residue_atoms[index],
-            DisplayMode::Toon => false,
-        })
+        .map(|(index, mode)| *mode != DisplayMode::Cartoon || !cartoon_residue_atoms[index])
         .collect();
     CartoonRenderData {
         vertices,
         indices,
-        standard_atomic,
+        atomic,
         semantic_ids,
     }
 }
 
-fn backbone_atom(molecule: &Molecule, residue: &ResidueGroup) -> Option<(usize, bool)> {
-    residue
-        .atom_indices
+const PURINE_RING: [&str; 9] = ["N9", "C8", "N7", "C5", "C6", "N1", "C2", "N3", "C4"];
+const PYRIMIDINE_RING: [&str; 6] = ["N1", "C2", "N3", "C4", "C5", "C6"];
+const BASE_HALF_THICKNESS: f32 = 0.22;
+const BASE_LINK_RADIUS: f32 = 0.24;
+
+/// Nucleotide base as a slab over its ring outline, joined to the backbone by a rod from
+/// C4' to the glycosidic nitrogen.
+fn append_nucleic_base(
+    molecule: &Molecule,
+    residue: &ResidueGroup,
+    ring_segments: u32,
+    vertices: &mut Vec<MeshVertex>,
+    indices: &mut Vec<u32>,
+) {
+    let find = |name: &str| {
+        residue.atom_indices.iter().copied().find(|&index| {
+            let atom = &molecule.atoms[index];
+            atom.name == name || atom.name.replace('*', "'") == name
+        })
+    };
+    let (ring, glycosidic) = if find("N9").is_some() && find("C8").is_some() {
+        (&PURINE_RING[..], "N9")
+    } else {
+        (&PYRIMIDINE_RING[..], "N1")
+    };
+    let Some(outline) = ring
         .iter()
-        .copied()
-        .find(|index| {
+        .map(|name| find(name).map(|index| molecule.atoms[index].position))
+        .collect::<Option<Vec<Vec3>>>()
+    else {
+        return;
+    };
+    let Some(base_atom) = find(glycosidic) else {
+        return;
+    };
+    let center = outline.iter().copied().sum::<Vec3>() / outline.len() as f32;
+    // Newell's method gives a robust plane normal for slightly puckered rings.
+    let mut normal = Vec3::ZERO;
+    for (index, current) in outline.iter().enumerate() {
+        let next = outline[(index + 1) % outline.len()];
+        normal += Vec3::new(
+            (current.y - next.y) * (current.z + next.z),
+            (current.z - next.z) * (current.x + next.x),
+            (current.x - next.x) * (current.y + next.y),
+        );
+    }
+    let normal = normal.normalize_or_zero();
+    if normal == Vec3::ZERO {
+        return;
+    }
+    let offset = normal * BASE_HALF_THICKNESS;
+    for (face, sign) in [(normal, 1.0_f32), (-normal, -1.0)] {
+        let base = vertices.len() as u32;
+        vertices.push(MeshVertex::new(center + offset * sign, face, base_atom));
+        for point in &outline {
+            vertices.push(MeshVertex::new(*point + offset * sign, face, base_atom));
+        }
+        let count = outline.len() as u32;
+        for index in 0..count {
+            let (a, b) = (base + 1 + index, base + 1 + (index + 1) % count);
+            if sign > 0.0 {
+                indices.extend_from_slice(&[base, a, b]);
+            } else {
+                indices.extend_from_slice(&[base, b, a]);
+            }
+        }
+    }
+    for (index, current) in outline.iter().enumerate() {
+        let next = outline[(index + 1) % outline.len()];
+        let edge_normal = (next - *current).cross(normal).normalize_or_zero();
+        let edge_normal = if edge_normal.dot(*current - center) < 0.0 {
+            -edge_normal
+        } else {
+            edge_normal
+        };
+        let base = vertices.len() as u32;
+        for point in [
+            *current - offset,
+            next - offset,
+            next + offset,
+            *current + offset,
+        ] {
+            vertices.push(MeshVertex::new(point, edge_normal, base_atom));
+        }
+        indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+    }
+    if let Some(sugar) = find("C4'") {
+        append_rod(
+            molecule.atoms[sugar].position,
+            molecule.atoms[base_atom].position,
+            BASE_LINK_RADIUS,
+            ring_segments,
+            base_atom,
+            vertices,
+            indices,
+        );
+    }
+}
+
+fn append_rod(
+    start: Vec3,
+    end: Vec3,
+    radius: f32,
+    segments: u32,
+    atom: usize,
+    vertices: &mut Vec<MeshVertex>,
+    indices: &mut Vec<u32>,
+) {
+    let axis = (end - start).normalize_or_zero();
+    if axis == Vec3::ZERO {
+        return;
+    }
+    let side = fallback_side(axis);
+    let up = axis.cross(side);
+    let base = vertices.len() as u32;
+    for point in [start, end] {
+        for segment in 0..segments {
+            let angle = segment as f32 / segments as f32 * std::f32::consts::TAU;
+            let radial = side * angle.cos() + up * angle.sin();
+            vertices.push(MeshVertex::new(point + radial * radius, radial, atom));
+        }
+    }
+    for segment in 0..segments {
+        let following = (segment + 1) % segments;
+        indices.extend_from_slice(&[
+            base + segment,
+            base + following,
+            base + segments + segment,
+            base + segments + segment,
+            base + following,
+            base + segments + following,
+        ]);
+    }
+}
+
+/// The spline anchor of a polymer residue: Cα for amino acids, P (or C4' at a 5' end) for
+/// nucleotides. HETATM residues qualify when their backbone is complete, so modified residues
+/// such as selenomethionine do not break the ribbon, while ions named CA or P never do.
+fn backbone_atom(molecule: &Molecule, residue: &ResidueGroup) -> Option<(usize, bool)> {
+    let find = |name: &str| {
+        residue.atom_indices.iter().copied().find(|index| {
             molecule
                 .atoms
                 .get(*index)
-                .is_some_and(|atom| !atom.hetero && atom.name == "CA")
+                .is_some_and(|atom| atom.name == name)
         })
-        .map(|index| (index, false))
-        .or_else(|| {
-            residue
-                .atom_indices
-                .iter()
-                .copied()
-                .find(|index| {
-                    molecule
-                        .atoms
-                        .get(*index)
-                        .is_some_and(|atom| !atom.hetero && atom.name == "P")
-                })
-                .map(|index| (index, true))
+    };
+    let polymer_atom = |index: usize, backbone: [&str; 2]| {
+        let atom = &molecule.atoms[index];
+        !atom.hetero || backbone.iter().all(|name| find(name).is_some())
+    };
+    if let Some(index) = find("CA")
+        && molecule.atoms[index].element == Element::C
+        && polymer_atom(index, ["N", "C"])
+    {
+        return Some((index, false));
+    }
+    let sugar = find("C4'").or_else(|| find("C4*"));
+    if let Some(index) = find("P")
+        && sugar.is_some()
+        && polymer_atom(index, ["O5'", "C4'"])
+    {
+        return Some((index, true));
+    }
+    // A 5'-terminal nucleotide without phosphate still continues the backbone.
+    sugar
+        .filter(|&index| {
+            find("C1'").is_some()
+                && (find("N1").is_some() || find("N9").is_some())
+                && polymer_atom(index, ["C3'", "C1'"])
         })
+        .map(|index| (index, true))
 }
 
 fn append_ribbon_run(
     run: &[BackboneAnchor],
-    display: &DisplayState,
     samples_per_residue: usize,
     width_segments: u32,
     ring_segments: u32,
-    vertices: &mut Vec<CartoonVertex>,
+    vertices: &mut Vec<MeshVertex>,
     indices: &mut Vec<u32>,
 ) {
     if run.len() < 2 {
@@ -282,16 +435,6 @@ fn append_ribbon_run(
         if structure == SecondaryStructure::Strand {
             width *= strand_arrow_scale(run, segment, t);
         }
-        let left = display.colors[run[segment].atom_index];
-        let right = display.colors[run[segment + 1].atom_index];
-        let color = [
-            left[0] + (right[0] - left[0]) * t,
-            left[1] + (right[1] - left[1]) * t,
-            left[2] + (right[2] - left[2]) * t,
-            1.0,
-        ];
-        let selected = display.selection[run[segment].atom_index]
-            || display.selection[run[segment + 1].atom_index];
         let atom_index = if t < 0.5 {
             run[segment].atom_index
         } else {
@@ -305,8 +448,6 @@ fn append_ribbon_run(
             normal,
             width,
             thickness,
-            color,
-            selected,
             tube: matches!(
                 structure,
                 SecondaryStructure::Coil | SecondaryStructure::Turn
@@ -342,15 +483,13 @@ struct CartoonSample {
     normal: Vec3,
     width: f32,
     thickness: f32,
-    color: [f32; 4],
-    selected: bool,
     tube: bool,
 }
 
 fn append_rectangular_strip(
     samples: &[CartoonSample],
     width_segments: u32,
-    vertices: &mut Vec<CartoonVertex>,
+    vertices: &mut Vec<MeshVertex>,
     indices: &mut Vec<u32>,
 ) {
     // A single quad across the full ribbon width becomes strongly non-planar on tight
@@ -380,13 +519,7 @@ fn append_rectangular_strip(
                 } else if surface_normal.dot(expected) < 0.0 {
                     surface_normal = -surface_normal;
                 }
-                vertices.push(CartoonVertex::new(
-                    position,
-                    surface_normal,
-                    sample.color,
-                    sample.selected,
-                    sample.atom_index,
-                ));
+                vertices.push(MeshVertex::new(position, surface_normal, sample.atom_index));
             }
         }
 
@@ -395,34 +528,10 @@ fn append_rectangular_strip(
         let right_top = ribbon_surface_position(sample, 0.5, true);
         let right_bottom = ribbon_surface_position(sample, 0.5, false);
         vertices.extend_from_slice(&[
-            CartoonVertex::new(
-                left_bottom,
-                -sample.side,
-                sample.color,
-                sample.selected,
-                sample.atom_index,
-            ),
-            CartoonVertex::new(
-                left_top,
-                -sample.side,
-                sample.color,
-                sample.selected,
-                sample.atom_index,
-            ),
-            CartoonVertex::new(
-                right_top,
-                sample.side,
-                sample.color,
-                sample.selected,
-                sample.atom_index,
-            ),
-            CartoonVertex::new(
-                right_bottom,
-                sample.side,
-                sample.color,
-                sample.selected,
-                sample.atom_index,
-            ),
+            MeshVertex::new(left_bottom, -sample.side, sample.atom_index),
+            MeshVertex::new(left_top, -sample.side, sample.atom_index),
+            MeshVertex::new(right_top, sample.side, sample.atom_index),
+            MeshVertex::new(right_bottom, sample.side, sample.atom_index),
         ]);
     }
     for ring in 0..samples.len().saturating_sub(1) as u32 {
@@ -478,7 +587,7 @@ fn ribbon_surface_position(sample: CartoonSample, across: f32, top: bool) -> Vec
 fn append_rectangular_cap(
     sample: CartoonSample,
     cap_normal: Vec3,
-    vertices: &mut Vec<CartoonVertex>,
+    vertices: &mut Vec<MeshVertex>,
     indices: &mut Vec<u32>,
 ) {
     let base = vertices.len() as u32;
@@ -490,13 +599,7 @@ fn append_rectangular_cap(
         sample.position + half_side + half_normal,
         sample.position - half_side + half_normal,
     ] {
-        vertices.push(CartoonVertex::new(
-            position,
-            cap_normal,
-            sample.color,
-            sample.selected,
-            sample.atom_index,
-        ));
+        vertices.push(MeshVertex::new(position, cap_normal, sample.atom_index));
     }
     indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
 }
@@ -504,7 +607,7 @@ fn append_rectangular_cap(
 fn append_tube_strip(
     samples: &[CartoonSample],
     ring_segments: u32,
-    vertices: &mut Vec<CartoonVertex>,
+    vertices: &mut Vec<MeshVertex>,
     indices: &mut Vec<u32>,
 ) {
     let base = vertices.len() as u32;
@@ -513,11 +616,9 @@ fn append_tube_strip(
         for segment in 0..ring_segments {
             let angle = segment as f32 / ring_segments as f32 * std::f32::consts::TAU;
             let radial = (sample.side * angle.cos() + sample.normal * angle.sin()).normalize();
-            vertices.push(CartoonVertex::new(
+            vertices.push(MeshVertex::new(
                 sample.position + radial * radius,
                 radial,
-                sample.color,
-                sample.selected,
                 sample.atom_index,
             ));
         }

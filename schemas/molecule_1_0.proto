@@ -130,6 +130,10 @@ message Display {
   repeated StateRun chain_modes = 30;
   repeated StateRun residue_modes = 31;
   repeated StateRun atom_modes = 32;
+  // Absent means true.
+  optional bool bond_orders = 33;
+  // 0 DSSP, 1 deposited annotations.
+  uint32 secondary_source = 34;
 }
 
 message AmbientOcclusion {
@@ -256,6 +260,9 @@ enum DisplayMode {
   DISPLAY_MODE_CARTOON = 0;
   DISPLAY_MODE_BALL_AND_STICK = 1;
   DISPLAY_MODE_TOON = 2;
+  // Requires Molecule reader version 4.
+  DISPLAY_MODE_SPACEFILL = 3;
+  DISPLAY_MODE_LICORICE = 4;
 }
 
 enum ColoringMode {
@@ -280,6 +287,9 @@ enum ModeOverride {
   MODE_CARTOON = 1;
   MODE_BALL_AND_STICK = 2;
   MODE_TOON = 3;
+  // Requires Molecule reader version 4.
+  MODE_SPACEFILL = 4;
+  MODE_LICORICE = 5;
 }
 
 enum AmbientOcclusionQuality {

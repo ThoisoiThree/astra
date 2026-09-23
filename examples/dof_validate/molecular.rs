@@ -38,18 +38,10 @@ pub(super) fn validate(
         let mut display = DisplayState::for_molecule(&molecule);
         display.set_global_mode(mode);
         let data = cartoon::cartoon_render_data(&molecule, &display);
-        let topology = instances::display_topology(
-            &molecule,
-            &display,
-            &data.standard_atomic,
-            &data.semantic_ids,
-        );
-        let attributes = instances::display_attributes(&molecule, &display, &data.standard_atomic);
+        let styles = instances::atomic_styles(&display, &data.atomic);
+        let spheres = instances::sphere_instances(&molecule, &display, &styles);
+        let bonds = instances::bond_instances(&molecule, &display, &styles);
         let vertices = vertex_buffer(device, &data.vertices);
-        let colors = vertex_buffer(
-            device,
-            &instances::cartoon_display_attributes(&data.vertices, &display),
-        );
         let indices = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("molecular regression indices"),
             contents: if data.indices.is_empty() {
@@ -59,14 +51,11 @@ pub(super) fn validate(
             },
             usage: wgpu::BufferUsages::INDEX,
         });
-        let atoms = vertex_buffer(device, &topology.atom_topology);
-        let atom_colors = vertex_buffer(device, &attributes.atom_display);
-        let bonds = vertex_buffer(device, &topology.bond_topology);
-        let bond_colors = vertex_buffer(device, &attributes.bond_display);
-        let toon = vertex_buffer(device, &topology.toon_topology);
-        let toon_colors = vertex_buffer(device, &attributes.toon_display);
-        let sphere = instances::GpuMesh::new(device, "regression sphere", mesh::uv_sphere(16, 24));
-        let cylinder = instances::GpuMesh::new(device, "regression cylinder", mesh::cylinder(16));
+        let sphere_buffer = vertex_buffer(device, &spheres);
+        let bond_buffer = vertex_buffer(device, &bonds);
+        let positions = storage_buffer(device, &instances::atom_positions(&molecule));
+        let colors = storage_buffer(device, &instances::atom_colors(&display));
+        let meta = storage_buffer(device, &instances::atom_meta(&display, &data.semantic_ids));
         let (width, height) = (641, 513);
         let depth = targets::DepthTarget::new(device, width, height);
         let mut post = PostProcess::new(device, renderer::SCENE_FORMAT, width, height, &depth.view);
@@ -77,15 +66,16 @@ pub(super) fn validate(
             bind_group_layouts: &[Some(camera_layout)],
             immediate_size: 0,
         });
-        let shader = dof::scene_shader(device, include_str!("../../src/render/shader.wgsl"));
-        let toon_shader =
-            dof::scene_shader(device, include_str!("../../src/render/toon_sphere.wgsl"));
-        let scene_cartoon =
-            pipelines::create_cartoon_pipeline(device, &layout, &shader, false, false);
-        let scene_geometry =
-            pipelines::create_scene_geometry_pipeline(device, &layout, &shader, false, false);
-        let scene_toon =
-            pipelines::create_toon_pipeline(device, &layout, &toon_shader, false, false);
+        let mesh_shader = dof::scene_shader(device, include_str!("../../src/render/shader.wgsl"));
+        let impostor_shader =
+            dof::scene_shader(device, include_str!("../../src/render/impostor.wgsl"));
+        let scene_pipelines = pipelines::ScenePipelines::new(
+            device,
+            &layout,
+            &impostor_shader,
+            &mesh_shader,
+            pipelines::SceneTarget::Scene,
+        );
         let composed = targets::ColorTarget::new_storage(
             device,
             "molecular regression composition",
@@ -120,14 +110,12 @@ pub(super) fn validate(
             contents: bytemuck::cast_slice(&camera_data),
             usage: wgpu::BufferUsages::UNIFORM,
         });
-        let binding = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: camera_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: camera_buffer.as_entire_binding(),
-            }],
-        });
+        let binding = scene_binding(
+            device,
+            camera_layout,
+            &camera_buffer,
+            [&positions, &colors, &meta],
+        );
         let background = wgpu::Color {
             r: 0.012286,
             g: 0.015209,
@@ -167,6 +155,7 @@ pub(super) fn validate(
                     viewport[2] / width as f32,
                     viewport[3] / height as f32,
                 ],
+                output: [1.0, 0.0, 1.0, 0.0],
             };
             queue.write_buffer(&post.uniform, 0, bytemuck::bytes_of(&uniform));
             let mut encoder = device.create_command_encoder(&Default::default());
@@ -255,49 +244,23 @@ pub(super) fn validate(
                 if layer > 0 {
                     pass.set_bind_group(1, dof.peel_binding(layer as u32), &[]);
                 }
-                pass.set_pipeline(if layer < 0 {
-                    &scene_cartoon
+                let pipelines = if layer < 0 {
+                    &scene_pipelines
                 } else if layer == 0 {
-                    &dof.first_cartoon_pipeline
+                    &dof.first_pipelines
                 } else {
-                    &dof.cartoon_pipeline
-                });
+                    &dof.peel_pipelines
+                };
+                pass.set_pipeline(&pipelines.meshes);
                 pass.set_vertex_buffer(0, vertices.slice(..));
-                pass.set_vertex_buffer(1, colors.slice(..));
                 pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..data.indices.len() as u32, 0, 0..1);
-                pass.set_pipeline(if layer < 0 {
-                    &scene_geometry
-                } else if layer == 0 {
-                    &dof.first_geometry_pipeline
-                } else {
-                    &dof.geometry_pipeline
-                });
-                for (mesh, positions, colors, count) in [
-                    (&sphere, &atoms, &atom_colors, attributes.atom_display.len()),
-                    (
-                        &cylinder,
-                        &bonds,
-                        &bond_colors,
-                        attributes.bond_display.len(),
-                    ),
-                ] {
-                    pass.set_vertex_buffer(0, mesh.vertices.slice(..));
-                    pass.set_vertex_buffer(1, positions.slice(..));
-                    pass.set_vertex_buffer(2, colors.slice(..));
-                    pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
-                    pass.draw_indexed(0..mesh.index_count, 0, 0..count as u32);
-                }
-                pass.set_pipeline(if layer < 0 {
-                    &scene_toon
-                } else if layer == 0 {
-                    &dof.first_toon_pipeline
-                } else {
-                    &dof.toon_pipeline
-                });
-                pass.set_vertex_buffer(0, toon.slice(..));
-                pass.set_vertex_buffer(1, toon_colors.slice(..));
-                pass.draw(0..6, 0..attributes.toon_display.len() as u32);
+                pass.set_pipeline(&pipelines.bonds);
+                pass.set_vertex_buffer(0, bond_buffer.slice(..));
+                pass.draw(0..36, 0..bonds.len() as u32);
+                pass.set_pipeline(&pipelines.spheres);
+                pass.set_vertex_buffer(0, sphere_buffer.slice(..));
+                pass.draw(0..6, 0..spheres.len() as u32);
                 drop(pass);
                 if layer == 0 {
                     dof.encode_mask(&mut encoder);

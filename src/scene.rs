@@ -20,8 +20,8 @@ use crate::{
     measurement::{MeasurementEndpoint, MeasurementLine},
     molecule::{
         AnnotatedStructure, Assembly, AssemblyGenerator, Atom, Bond, BondKind, BondOrder,
-        CrystalInfo, Molecule, MoleculeHierarchy, SecondaryAnnotation, StructureInfo,
-        SymmetryOperator, UnitCell,
+        CrystalInfo, Molecule, MoleculeHierarchy, SecondaryAnnotation, SecondarySource,
+        StructureInfo, SymmetryOperator, UnitCell,
     },
     selection::Selection,
 };
@@ -764,6 +764,11 @@ fn display_to_wire(display: &DisplayState) -> Result<wire::DisplayV1, SceneError
             &display.mode_override_values(DisplayLevel::Atom),
             mode_override_code,
         )?,
+        bond_orders: Some(display.bond_orders),
+        secondary_source: match display.secondary_source {
+            SecondarySource::Dssp => 0,
+            SecondarySource::File => 1,
+        },
     })
 }
 
@@ -778,6 +783,16 @@ fn display_from_wire(
         "representation masks",
     )?;
     let mut display = DisplayState::for_molecule(molecule);
+    display.bond_orders = wire.bond_orders.unwrap_or(true);
+    display.secondary_source = match wire.secondary_source {
+        0 => SecondarySource::Dssp,
+        1 => SecondarySource::File,
+        other => {
+            return Err(invalid(format!(
+                "unknown secondary structure source {other}"
+            )));
+        }
+    };
     display.global_mode = display_mode_from_code(wire.global_mode)?;
     display.uniform_color = checked_color(&wire.uniform_color, "uniform color")?;
     display.set_coloring_mode(molecule, coloring_mode_from_code(wire.coloring_mode)?);
@@ -790,7 +805,7 @@ fn display_from_wire(
         .representation_masks
         .into_iter()
         .map(|bits| {
-            if bits & !0b11 != 0 {
+            if bits & !u32::from(RepresentationMask::ALL_BITS) != 0 {
                 Err(invalid(format!(
                     "unknown atom representation mask bits {bits:#x}"
                 )))

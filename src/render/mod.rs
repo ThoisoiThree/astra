@@ -12,8 +12,8 @@ mod targets;
 mod viewport_cache;
 
 pub use renderer::{
-    PreparedCartoon, RenderError, RenderStats, Renderer, SurfaceIssue, prepare_cartoon,
-    prepare_cartoon_cached,
+    ExportBackground, ImageExport, MAX_RENDER_SCALE, PreparedCartoon, RenderError, RenderStats,
+    RenderedImage, Renderer, SurfaceIssue, prepare_cartoon, prepare_cartoon_cached,
 };
 
 #[cfg(test)]
@@ -24,18 +24,19 @@ mod shader_tests {
     fn bundled_wgsl_modules_parse_and_validate() {
         let optics = include_str!("optics.wgsl");
         let peel = include_str!("peel.wgsl");
+        let common = include_str!("scene_common.wgsl");
         let dof_constants = format!(
             "const HOST_MAX_DOF_LAYERS: u32 = {}u;\n",
             super::dof::MAX_DOF_LAYERS
         );
         for (name, source) in [
             (
-                "geometry",
-                [optics, peel, include_str!("shader.wgsl")].concat(),
+                "meshes",
+                [optics, peel, common, include_str!("shader.wgsl")].concat(),
             ),
             (
-                "toon",
-                [optics, peel, include_str!("toon_sphere.wgsl")].concat(),
+                "impostors",
+                [optics, peel, common, include_str!("impostor.wgsl")].concat(),
             ),
             (
                 "postprocess",
@@ -81,6 +82,7 @@ mod shader_tests {
                 std::mem::offset_of!(super::postprocess::PostUniform, quality),
                 std::mem::offset_of!(super::postprocess::PostUniform, background),
                 std::mem::offset_of!(super::postprocess::PostUniform, viewport),
+                std::mem::offset_of!(super::postprocess::PostUniform, output),
             ]) {
                 assert_eq!(member.offset as usize, offset, "{name}: {:?}", member.name);
             }

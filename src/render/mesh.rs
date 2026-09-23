@@ -25,40 +25,6 @@ pub struct Mesh {
     pub indices: Vec<u32>,
 }
 
-pub fn uv_sphere(latitude_segments: u32, longitude_segments: u32) -> Mesh {
-    let mut vertices = Vec::new();
-    let mut indices = Vec::new();
-    for latitude in 0..=latitude_segments {
-        let v = latitude as f32 / latitude_segments as f32;
-        let phi = v * std::f32::consts::PI;
-        for longitude in 0..=longitude_segments {
-            let u = longitude as f32 / longitude_segments as f32;
-            let theta = u * std::f32::consts::TAU;
-            let normal = [phi.sin() * theta.cos(), phi.cos(), phi.sin() * theta.sin()];
-            vertices.push(Vertex {
-                position: normal,
-                normal,
-            });
-        }
-    }
-    let row = longitude_segments + 1;
-    for latitude in 0..latitude_segments {
-        for longitude in 0..longitude_segments {
-            let top_left = latitude * row + longitude;
-            let bottom_left = (latitude + 1) * row + longitude;
-            indices.extend_from_slice(&[
-                top_left,
-                bottom_left,
-                top_left + 1,
-                top_left + 1,
-                bottom_left,
-                bottom_left + 1,
-            ]);
-        }
-    }
-    Mesh { vertices, indices }
-}
-
 pub fn cylinder(segments: u32) -> Mesh {
     let mut vertices = Vec::new();
     let mut indices = Vec::new();

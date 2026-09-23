@@ -45,19 +45,7 @@ async fn run() -> Result<()> {
     let (device, queue) = adapter
         .request_device(&wgpu::DeviceDescriptor::default())
         .await?;
-    let camera_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: None,
-        entries: &[wgpu::BindGroupLayoutEntry {
-            binding: 0,
-            visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-            ty: wgpu::BindingType::Buffer {
-                ty: wgpu::BufferBindingType::Uniform,
-                has_dynamic_offset: false,
-                min_binding_size: None,
-            },
-            count: None,
-        }],
-    });
+    let camera_layout = scene_layout(&device);
     if std::env::var_os("ASTRA_DOF_MOLECULAR_ONLY").is_some() {
         return molecular::validate(&device, &queue, &camera_layout);
     }
@@ -95,6 +83,7 @@ async fn run() -> Result<()> {
             ],
             background: [0.0, 1.0, 0.0, 1.0],
             viewport: [0.0, 0.0, 1.0, 1.0],
+            output: [1.0, 0.0, 1.0, 0.0],
         };
         for mode in 0..6 {
             uniform.lens[0] = if matches!(mode, 2 | 3 | 5) { 20.0 } else { 5.0 };
@@ -107,14 +96,13 @@ async fn run() -> Result<()> {
                 contents: &[0u8; 176],
                 usage: wgpu::BufferUsages::UNIFORM,
             });
-            let camera_binding = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: None,
-                layout: &camera_layout,
-                entries: &[wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: dummy_camera.as_entire_binding(),
-                }],
-            });
+            let empty = storage_buffer(&device, &[0u8; 256]);
+            let camera_binding = scene_binding(
+                &device,
+                &camera_layout,
+                &dummy_camera,
+                [&empty, &empty, &empty],
+            );
             let mut encoder = device.create_command_encoder(&Default::default());
             for layer in 0..5 {
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -482,7 +470,7 @@ fn peel_fixture_pipeline(
         label: None,
         bind_group_layouts: &[
             Some(camera),
-            Some(&dof.geometry_pipeline.get_bind_group_layout(1)),
+            Some(&dof.peel_pipelines.spheres.get_bind_group_layout(1)),
         ],
         immediate_size: 0,
     });
@@ -558,4 +546,78 @@ fn aperture_distance(dx: f32, dy: f32, post: &PostUniform) -> f32 {
     let local = angle - sector * (angle / sector + 0.5).floor();
     let boundary = (std::f32::consts::PI / post.aperture[1]).cos() / local.cos();
     dx.hypot(dy) / boundary
+}
+
+/// The application's scene bind group layout: camera plus per-atom storage buffers.
+fn scene_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    let storage = |binding| wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only: true },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    };
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: None,
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            storage(1),
+            storage(2),
+            storage(3),
+        ],
+    })
+}
+
+fn scene_binding(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    camera: &wgpu::Buffer,
+    storage: [&wgpu::Buffer; 3],
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: camera.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: storage[0].as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: storage[1].as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: storage[2].as_entire_binding(),
+            },
+        ],
+    })
+}
+
+fn storage_buffer<T: bytemuck::Pod>(device: &wgpu::Device, values: &[T]) -> wgpu::Buffer {
+    device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("regression storage"),
+        contents: if values.is_empty() {
+            &[0; 256]
+        } else {
+            bytemuck::cast_slice(values)
+        },
+        usage: wgpu::BufferUsages::STORAGE,
+    })
 }

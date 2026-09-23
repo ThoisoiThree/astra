@@ -321,6 +321,23 @@ impl Runtime {
                 }
                 self.rebuild_named_display_layers();
             }
+            ManagerAction::SetBondOrders(enabled) => {
+                if let Some(display) = &mut self.display {
+                    display.bond_orders = enabled;
+                }
+                self.refresh_instances();
+            }
+            ManagerAction::SetSecondarySource(source) => {
+                if let (Some(molecule), Some(display), Some(hierarchy)) =
+                    (&self.molecule, &mut self.display, &self.hierarchy)
+                {
+                    display.set_secondary_source(molecule, source);
+                    self.secondary_structure =
+                        Some(assign_secondary_structure_from(molecule, hierarchy, source));
+                }
+                self.refresh_instances();
+                self.refresh_display_attributes();
+            }
             ManagerAction::SetAmbientOcclusion(settings) => {
                 let quality_changed = self
                     .display

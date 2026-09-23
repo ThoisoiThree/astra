@@ -61,6 +61,14 @@ pub(super) enum JobRequest {
         document: Box<SceneDocument>,
         cancel: Arc<AtomicBool>,
     },
+    Derive {
+        id: u64,
+        molecule: Box<Molecule>,
+        request: crate::ui::StructureRequest,
+        label: String,
+        secondary_source: astra::molecule::SecondarySource,
+        cancel: Arc<AtomicBool>,
+    },
     Cartoon {
         id: u64,
         molecule: Box<Molecule>,
@@ -662,6 +670,37 @@ pub(super) fn background_worker(
                 };
                 (id, result)
             }
+            JobRequest::Derive {
+                id,
+                molecule,
+                request,
+                label,
+                secondary_source,
+                cancel,
+            } => {
+                send_job_progress(&events, &window, id, "Applying symmetry operators", 0.2);
+                let result = super::structure::derive_structure(&molecule, &request)
+                    .and_then(|derived| {
+                        if cancel.load(Ordering::Relaxed) {
+                            return Err("background operation canceled".into());
+                        }
+                        send_job_progress(
+                            &events,
+                            &window,
+                            id,
+                            "Building hierarchy and spatial index",
+                            0.7,
+                        );
+                        Ok(structure_payload(
+                            label.clone(),
+                            label,
+                            derived,
+                            secondary_source,
+                        ))
+                    })
+                    .map(|payload| JobOutput::Loaded(Box::new(payload)));
+                (id, result)
+            }
             JobRequest::Cartoon {
                 id,
                 molecule,
@@ -729,7 +768,11 @@ pub(super) fn load_in_background(
             0.82,
         );
         let hierarchy = MoleculeHierarchy::from_molecule(&document.molecule);
-        let secondary_structure = assign_secondary_structure(&document.molecule, &hierarchy);
+        let secondary_structure = assign_secondary_structure_from(
+            &document.molecule,
+            &hierarchy,
+            document.display.secondary_source,
+        );
         let atom_bvh = AtomBvh::build(&document.molecule);
         return Ok(LoadedPayload::Scene {
             filename,
@@ -761,12 +804,29 @@ pub(super) fn load_in_background(
         "Building hierarchy and spatial index",
         0.82,
     );
-    let hierarchy = MoleculeHierarchy::from_molecule(&molecule);
-    let secondary_structure = assign_secondary_structure(&molecule, &hierarchy);
-    let atom_bvh = AtomBvh::build(&molecule);
-    let display = DisplayState::for_molecule(&molecule);
     let molecule_id = molecule_id_from_structure(&contents, &filename);
-    Ok(LoadedPayload::Structure {
+    Ok(structure_payload(
+        filename,
+        molecule_id,
+        molecule,
+        astra::molecule::SecondarySource::default(),
+    ))
+}
+
+/// Derived data every newly opened structure needs.
+pub(super) fn structure_payload(
+    filename: String,
+    molecule_id: String,
+    molecule: Molecule,
+    secondary_source: astra::molecule::SecondarySource,
+) -> LoadedPayload {
+    let hierarchy = MoleculeHierarchy::from_molecule(&molecule);
+    let secondary_structure =
+        assign_secondary_structure_from(&molecule, &hierarchy, secondary_source);
+    let atom_bvh = AtomBvh::build(&molecule);
+    let mut display = DisplayState::for_molecule(&molecule);
+    display.set_secondary_source(&molecule, secondary_source);
+    LoadedPayload::Structure {
         filename,
         molecule_id,
         molecule: Box::new(molecule),
@@ -774,7 +834,7 @@ pub(super) fn load_in_background(
         secondary_structure,
         atom_bvh,
         display: Box::new(display),
-    })
+    }
 }
 
 pub(super) fn send_job_progress(

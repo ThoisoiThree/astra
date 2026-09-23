@@ -2,6 +2,7 @@ pub mod bitset;
 pub mod camera;
 pub mod command;
 pub mod diagnostics;
+pub mod image_export;
 pub mod measurement;
 pub mod molecule;
 pub mod paths;
@@ -160,6 +161,16 @@ impl AmbientOcclusionSettings {
         }
     }
 
+    pub const fn spacefill_default() -> Self {
+        Self {
+            enabled: true,
+            strength: 1.3,
+            radius: 3.2,
+            bias: 0.05,
+            quality: AmbientOcclusionQuality::Preview,
+        }
+    }
+
     pub const fn toon_default() -> Self {
         Self {
             enabled: true,
@@ -184,23 +195,37 @@ pub enum DisplayMode {
     Cartoon,
     BallAndStick,
     Toon,
+    /// Van der Waals spheres with standard shading.
+    Spacefill,
+    /// Uniform-radius sticks.
+    Licorice,
 }
 
 impl DisplayMode {
-    pub const ALL: [Self; 3] = [Self::Cartoon, Self::BallAndStick, Self::Toon];
+    pub const ALL: [Self; 5] = [
+        Self::Cartoon,
+        Self::BallAndStick,
+        Self::Licorice,
+        Self::Spacefill,
+        Self::Toon,
+    ];
 
     pub const fn label(self) -> &'static str {
         match self {
             Self::Cartoon => "Cartoon",
             Self::BallAndStick => "Ball & stick",
             Self::Toon => "Toon",
+            Self::Spacefill => "Spacefill",
+            Self::Licorice => "Licorice",
         }
     }
 
     pub const fn next(self) -> Self {
         match self {
             Self::Cartoon => Self::BallAndStick,
-            Self::BallAndStick => Self::Toon,
+            Self::BallAndStick => Self::Licorice,
+            Self::Licorice => Self::Spacefill,
+            Self::Spacefill => Self::Toon,
             Self::Toon => Self::Cartoon,
         }
     }
@@ -213,6 +238,8 @@ pub enum ModeOverride {
     Cartoon,
     BallAndStick,
     Toon,
+    Spacefill,
+    Licorice,
 }
 
 impl ModeOverride {
@@ -221,6 +248,8 @@ impl ModeOverride {
             DisplayMode::Cartoon => Self::Cartoon,
             DisplayMode::BallAndStick => Self::BallAndStick,
             DisplayMode::Toon => Self::Toon,
+            DisplayMode::Spacefill => Self::Spacefill,
+            DisplayMode::Licorice => Self::Licorice,
         }
     }
 
@@ -230,6 +259,8 @@ impl ModeOverride {
             Self::Cartoon => Some(DisplayMode::Cartoon),
             Self::BallAndStick => Some(DisplayMode::BallAndStick),
             Self::Toon => Some(DisplayMode::Toon),
+            Self::Spacefill => Some(DisplayMode::Spacefill),
+            Self::Licorice => Some(DisplayMode::Licorice),
         }
     }
 }
@@ -385,6 +416,8 @@ pub struct DisplayStateData {
     uniform_color: DisplayColor,
     ambient_occlusion: AmbientOcclusionSettings,
     ambient_occlusion_customized: bool,
+    bond_orders: bool,
+    secondary_source: molecule::SecondarySource,
     selection: AtomMask,
     representation_overrides: HashMap<usize, RepresentationMask>,
     colors: HierarchyOverrides<DisplayColor>,
@@ -463,6 +496,10 @@ pub struct DisplayState {
     pub uniform_color: DisplayColor,
     pub ambient_occlusion: AmbientOcclusionSettings,
     ambient_occlusion_customized: bool,
+    /// Draw double, triple and aromatic bonds distinctly in stick representations.
+    pub bond_orders: bool,
+    /// Source of secondary structure for ribbons and coloring.
+    pub secondary_source: molecule::SecondarySource,
     base_colors: Vec<DisplayColor>,
     named_colors: Vec<Option<DisplayColor>>,
     named_visibility: Vec<VisibilityOverride>,
@@ -491,6 +528,8 @@ impl DisplayState {
             uniform_color: DEFAULT_UNIFORM_COLOR,
             ambient_occlusion: AmbientOcclusionSettings::default(),
             ambient_occlusion_customized: false,
+            bond_orders: true,
+            secondary_source: molecule::SecondarySource::default(),
             base_colors,
             named_colors: vec![None; atom_count],
             named_visibility: vec![VisibilityOverride::Inherit; atom_count],
@@ -511,6 +550,8 @@ impl DisplayState {
             uniform_color: self.uniform_color,
             ambient_occlusion: self.ambient_occlusion,
             ambient_occlusion_customized: self.ambient_occlusion_customized,
+            bond_orders: self.bond_orders,
+            secondary_source: self.secondary_source,
             selection: self.selection.clone(),
             representation_overrides: self.representation_overrides.clone(),
             colors: self.hierarchy_colors.clone(),
@@ -525,12 +566,19 @@ impl DisplayState {
         self.uniform_color = state.uniform_color;
         self.ambient_occlusion = state.ambient_occlusion;
         self.ambient_occlusion_customized = state.ambient_occlusion_customized;
+        self.bond_orders = state.bond_orders;
+        self.secondary_source = state.secondary_source;
         self.selection = state.selection;
         self.representation_overrides = state.representation_overrides;
         self.hierarchy_colors = state.colors;
         self.hierarchy_visibility = state.visibility;
         self.hierarchy_modes = state.modes;
-        self.base_colors = base_colors(molecule, self.coloring_mode, self.uniform_color);
+        self.base_colors = base_colors(
+            molecule,
+            self.coloring_mode,
+            self.uniform_color,
+            self.secondary_source,
+        );
         self.recompute_all();
     }
 
@@ -589,8 +637,16 @@ impl DisplayState {
 
     pub fn set_coloring_mode(&mut self, molecule: &Molecule, mode: ColoringMode) {
         self.coloring_mode = mode;
-        self.base_colors = base_colors(molecule, mode, self.uniform_color);
+        self.base_colors = base_colors(molecule, mode, self.uniform_color, self.secondary_source);
         self.recompute_colors();
+    }
+
+    /// Chooses computed or deposited secondary structure; recolors when it is displayed.
+    pub fn set_secondary_source(&mut self, molecule: &Molecule, source: molecule::SecondarySource) {
+        self.secondary_source = source;
+        if self.coloring_mode == ColoringMode::SecondaryStructure {
+            self.set_coloring_mode(molecule, ColoringMode::SecondaryStructure);
+        }
     }
 
     pub fn set_uniform_color(&mut self, molecule: &Molecule, color: DisplayColor) {
@@ -766,7 +822,10 @@ impl DisplayState {
         if !self.ambient_occlusion_customized {
             self.ambient_occlusion = match mode {
                 DisplayMode::Cartoon => AmbientOcclusionSettings::default(),
-                DisplayMode::BallAndStick => AmbientOcclusionSettings::ball_and_stick_default(),
+                DisplayMode::BallAndStick | DisplayMode::Licorice => {
+                    AmbientOcclusionSettings::ball_and_stick_default()
+                }
+                DisplayMode::Spacefill => AmbientOcclusionSettings::spacefill_default(),
                 DisplayMode::Toon => AmbientOcclusionSettings::toon_default(),
             };
         }
@@ -1094,6 +1153,7 @@ fn base_colors(
     molecule: &Molecule,
     mode: ColoringMode,
     uniform_color: DisplayColor,
+    secondary_source: molecule::SecondarySource,
 ) -> Vec<DisplayColor> {
     match mode {
         ColoringMode::Element => element_colors(molecule),
@@ -1109,7 +1169,7 @@ fn base_colors(
             .iter()
             .map(|atom| categorical_color(&atom.residue_name))
             .collect(),
-        ColoringMode::SecondaryStructure => secondary_structure_colors(molecule),
+        ColoringMode::SecondaryStructure => secondary_structure_colors(molecule, secondary_source),
         ColoringMode::BFactor => b_factor_colors(molecule),
         ColoringMode::Uniform => vec![uniform_color; molecule.atoms.len()],
     }
@@ -1134,11 +1194,14 @@ fn element_colors(molecule: &Molecule) -> Vec<DisplayColor> {
         .collect()
 }
 
-fn secondary_structure_colors(molecule: &Molecule) -> Vec<DisplayColor> {
-    use molecule::{MoleculeHierarchy, SecondaryStructure, assign_secondary_structure};
+fn secondary_structure_colors(
+    molecule: &Molecule,
+    source: molecule::SecondarySource,
+) -> Vec<DisplayColor> {
+    use molecule::{MoleculeHierarchy, SecondaryStructure, assign_secondary_structure_from};
 
     let hierarchy = MoleculeHierarchy::from_molecule(molecule);
-    let assignments = assign_secondary_structure(molecule, &hierarchy);
+    let assignments = assign_secondary_structure_from(molecule, &hierarchy, source);
     // Ligands, solvent, and ions have no secondary structure; retaining CPK colors makes
     // that distinction explicit instead of incorrectly presenting them as protein coils.
     let mut colors = element_colors(molecule);
@@ -1248,6 +1311,11 @@ pub struct RepresentationMask(u8);
 impl RepresentationMask {
     pub const SPHERES: Self = Self(1 << 0);
     pub const STICKS: Self = Self(1 << 1);
+    /// Contributes to the molecular surface.
+    pub const SURFACE: Self = Self(1 << 2);
+    /// Carries a text label.
+    pub const LABEL: Self = Self(1 << 3);
+    pub const ALL_BITS: u8 = 0b1111;
 
     pub const fn contains(self, representation: Self) -> bool {
         self.0 & representation.0 != 0
@@ -1258,7 +1326,7 @@ impl RepresentationMask {
     }
 
     pub const fn from_bits(bits: u8) -> Self {
-        Self(bits & (Self::SPHERES.0 | Self::STICKS.0))
+        Self(bits & Self::ALL_BITS)
     }
 
     pub fn insert(&mut self, representation: Self) {

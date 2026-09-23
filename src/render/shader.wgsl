@@ -1,15 +1,74 @@
-struct Camera {
-    view_projection: mat4x4<f32>,
-    inverse_view_projection: mat4x4<f32>,
-    eye_position: vec4<f32>,
-    camera_right: vec4<f32>,
-    camera_up: vec4<f32>,
+// Triangle meshes: ribbons and molecular surfaces colored through their nearest atom, and
+// instanced annotation geometry for measurements.
+
+struct MeshInput {
+    @location(0) position: vec3<f32>,
+    @location(1) normal: vec3<f32>,
+    @location(2) atom: u32,
 };
 
-@group(0) @binding(0)
-var<uniform> camera: Camera;
+struct MeshVarying {
+    @builtin(position) clip_position: vec4<f32>,
+    @location(0) world_position: vec3<f32>,
+    @location(1) normal: vec3<f32>,
+    @location(2) @interpolate(flat) atom: u32,
+};
 
-struct VertexInput {
+@vertex
+fn vertex_mesh(input: MeshInput) -> MeshVarying {
+    var output: MeshVarying;
+    output.clip_position = camera.view_projection * vec4<f32>(input.position, 1.0);
+    output.world_position = input.position;
+    output.normal = input.normal;
+    output.atom = input.atom;
+    return output;
+}
+
+fn mesh_color(input: MeshVarying, front_facing: bool) -> vec4<f32> {
+    let base = atom_colors[input.atom];
+    // Ribbons are two-sided; flip the normal on back faces.
+    let normal = select(-input.normal, input.normal, front_facing);
+    return vec4<f32>(
+        shade_surface(normal, input.world_position, base.rgb, atom_selected(input.atom)),
+        base.a,
+    );
+}
+
+struct MeshSceneOutput {
+    @location(0) color: vec4<f32>,
+    @location(1) semantic_ids: vec2<u32>,
+};
+
+@fragment
+fn fragment_mesh_scene(
+    input: MeshVarying,
+    @builtin(front_facing) front_facing: bool,
+) -> MeshSceneOutput {
+    var output: MeshSceneOutput;
+    output.color = mesh_color(input, front_facing);
+    // Meshes are pickable by atom but draw no residue contours in Toon outlines.
+    output.semantic_ids = vec2<u32>(atom_meta[input.atom].x, 0u);
+    return output;
+}
+
+@fragment
+fn fragment_mesh_color(
+    input: MeshVarying,
+    @builtin(front_facing) front_facing: bool,
+) -> @location(0) vec4<f32> {
+    return mesh_color(input, front_facing);
+}
+
+@fragment
+fn fragment_mesh_peel(
+    input: MeshVarying,
+    @builtin(front_facing) front_facing: bool,
+) -> @location(0) vec4<f32> {
+    reject_peeled_fragment(input.clip_position.xy, input.clip_position.z);
+    return mesh_color(input, front_facing);
+}
+
+struct AnnotationInput {
     @location(0) position: vec3<f32>,
     @location(1) normal: vec3<f32>,
     @location(2) model_0: vec4<f32>,
@@ -17,91 +76,31 @@ struct VertexInput {
     @location(4) model_2: vec4<f32>,
     @location(5) model_3: vec4<f32>,
     @location(6) color: vec4<f32>,
-    @location(7) highlight: vec4<f32>,
-    @location(8) semantic_ids: vec4<u32>,
 };
 
-struct VertexOutput {
+struct AnnotationVarying {
     @builtin(position) clip_position: vec4<f32>,
     @location(0) world_position: vec3<f32>,
     @location(1) normal: vec3<f32>,
     @location(2) color: vec4<f32>,
-    @location(3) highlight: f32,
-    @location(4) @interpolate(flat) semantic_ids: vec4<u32>,
-};
-
-struct CartoonVertexInput {
-    @location(0) position: vec3<f32>,
-    @location(1) normal: vec3<f32>,
-    @location(2) semantic_ids: vec4<u32>,
-    @location(3) color: vec4<f32>,
-    @location(4) highlight: vec4<f32>,
 };
 
 @vertex
-fn vertex_main(input: VertexInput) -> VertexOutput {
+fn vertex_annotation(input: AnnotationInput) -> AnnotationVarying {
     let model = mat4x4<f32>(input.model_0, input.model_1, input.model_2, input.model_3);
-    let selected_scale = 1.0 + input.highlight.y;
-    let world = model * vec4<f32>(input.position * selected_scale, 1.0);
-    var output: VertexOutput;
+    let world = model * vec4<f32>(input.position, 1.0);
+    var output: AnnotationVarying;
     output.clip_position = camera.view_projection * world;
     output.world_position = world.xyz;
     output.normal = normalize((model * vec4<f32>(input.normal, 0.0)).xyz);
     output.color = input.color;
-    output.highlight = input.highlight.x;
-    output.semantic_ids = input.semantic_ids;
     return output;
 }
-
-@vertex
-fn cartoon_vertex_main(input: CartoonVertexInput) -> VertexOutput {
-    var output: VertexOutput;
-    output.clip_position = camera.view_projection * vec4<f32>(input.position, 1.0);
-    output.world_position = input.position;
-    output.normal = normalize(input.normal);
-    output.color = input.color;
-    output.highlight = input.highlight.x;
-    output.semantic_ids = input.semantic_ids;
-    return output;
-}
-
-fn shaded_color(input: VertexOutput) -> vec4<f32> {
-    let normal = normalize(input.normal);
-    let light_direction = normalize(vec3<f32>(0.35, 0.65, 0.70));
-    let diffuse = max(dot(normal, light_direction), 0.0);
-    let view_direction = normalize(camera.eye_position.xyz - input.world_position);
-    let half_vector = normalize(light_direction + view_direction);
-    let specular = pow(max(dot(normal, half_vector), 0.0), 28.0) * 0.32;
-    let highlight_color = vec3<f32>(1.0, 0.84, 0.08);
-    let selected_color = mix(input.color.rgb, highlight_color, input.highlight * 0.90);
-    let lit = selected_color * (0.28 + 0.72 * diffuse) + vec3<f32>(specular);
-    let highlight_emission = highlight_color * input.highlight * 0.24;
-    return vec4<f32>(lit + highlight_emission, input.color.a);
-}
-
-struct SceneFragmentOutput {
-    @location(0) color: vec4<f32>,
-    @location(1) semantic_ids: vec2<u32>,
-};
 
 @fragment
-fn fragment_scene(input: VertexOutput) -> SceneFragmentOutput {
-    var output: SceneFragmentOutput;
-    output.color = shaded_color(input);
-    output.semantic_ids = vec2<u32>(
-        input.semantic_ids.x,
-        (input.semantic_ids.z << 20u) | (input.semantic_ids.y & 0xFFFFFu),
+fn fragment_annotation(input: AnnotationVarying) -> @location(0) vec4<f32> {
+    return vec4<f32>(
+        shade_surface(input.normal, input.world_position, input.color.rgb, 0.0),
+        input.color.a,
     );
-    return output;
-}
-
-@fragment
-fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
-    return shaded_color(input);
-}
-
-@fragment
-fn fragment_peel(input: VertexOutput) -> @location(0) vec4<f32> {
-    reject_peeled_fragment(input.clip_position.xy, input.clip_position.z);
-    return shaded_color(input);
 }

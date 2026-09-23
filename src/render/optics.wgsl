@@ -14,6 +14,8 @@ struct PostUniform {
     background: vec4<f32>,
     // Normalized molecular viewport origin and extent within the window.
     viewport: vec4<f32>,
+    // Supersampling factor, transparent background (0/1), FXAA (0/1), unused.
+    output: vec4<f32>,
 };
 
 fn optical_depth(uv: vec2<f32>, depth: f32) -> f32 {

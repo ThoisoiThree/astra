@@ -20,6 +20,7 @@ egui-winit = { version = "0.36", default-features = false, features = ["clipboar
 flate2 = "1"
 glam = "0.33"
 log = "0.4"
+png = "0.18"
 pollster = "1"
 prost = "0.14"
 rfd = "0.17"

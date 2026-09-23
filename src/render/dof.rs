@@ -2,7 +2,7 @@
 use std::borrow::Cow;
 
 use super::{
-    pipelines::{create_cartoon_pipeline, create_scene_geometry_pipeline, create_toon_pipeline},
+    pipelines::{ScenePipelines, SceneTarget},
     postprocess::{PostProcess, create_post_bind_group},
     renderer::{DEPTH_FORMAT, SCENE_FORMAT},
     targets::ColorTarget,
@@ -71,12 +71,10 @@ pub(super) struct DepthOfField {
     shade_bindings: wgpu::BindGroup,
     shade_pipeline: wgpu::RenderPipeline,
     _mask: [wgpu::Texture; 2],
-    pub(super) first_geometry_pipeline: wgpu::RenderPipeline,
-    pub(super) first_cartoon_pipeline: wgpu::RenderPipeline,
-    pub(super) first_toon_pipeline: wgpu::RenderPipeline,
-    pub(super) geometry_pipeline: wgpu::RenderPipeline,
-    pub(super) cartoon_pipeline: wgpu::RenderPipeline,
-    pub(super) toon_pipeline: wgpu::RenderPipeline,
+    /// First layer: plain color output at the peeling resolution.
+    pub(super) first_pipelines: ScenePipelines,
+    /// Later layers reject fragments captured by the previous layer.
+    pub(super) peel_pipelines: ScenePipelines,
     peel_bindings: Vec<wgpu::BindGroup>,
     stages: Vec<ComputeStage>,
 }
@@ -189,6 +187,7 @@ impl DepthOfField {
             &post.ao_filtered.view,
             &post.semantic.view,
             &post.scene.view,
+            &post.overlay.view,
         );
         let mask = std::array::from_fn(|_| {
             device.create_texture(&wgpu::TextureDescriptor {
@@ -245,8 +244,8 @@ impl DepthOfField {
             bind_group_layouts: &[Some(camera_layout), Some(&peel_layout)],
             immediate_size: 0,
         });
-        let geometry_shader = scene_shader(device, include_str!("shader.wgsl"));
-        let toon_shader = scene_shader(device, include_str!("toon_sphere.wgsl"));
+        let impostor_shader = scene_shader(device, include_str!("impostor.wgsl"));
+        let mesh_shader = scene_shader(device, include_str!("shader.wgsl"));
         // An explicit layout requires every listed group at draw time, even when
         // the entry point does not read it. Layer zero must not bind its own
         // depth attachment as a peeling input.
@@ -257,17 +256,20 @@ impl DepthOfField {
         });
         // Every layer is rasterized at the same resolution and sample positions.
         // The first-layer variants omit peeling but share the same vertex paths and shading.
-        let first_geometry_pipeline =
-            create_scene_geometry_pipeline(device, &first_layout, &geometry_shader, false, true);
-        let first_cartoon_pipeline =
-            create_cartoon_pipeline(device, &first_layout, &geometry_shader, false, true);
-        let first_toon_pipeline =
-            create_toon_pipeline(device, &first_layout, &toon_shader, false, true);
-        let geometry_pipeline =
-            create_scene_geometry_pipeline(device, &layout, &geometry_shader, true, true);
-        let cartoon_pipeline =
-            create_cartoon_pipeline(device, &layout, &geometry_shader, true, true);
-        let toon_pipeline = create_toon_pipeline(device, &layout, &toon_shader, true, true);
+        let first_pipelines = ScenePipelines::new(
+            device,
+            &first_layout,
+            &impostor_shader,
+            &mesh_shader,
+            SceneTarget::Color,
+        );
+        let peel_pipelines = ScenePipelines::new(
+            device,
+            &layout,
+            &impostor_shader,
+            &mesh_shader,
+            SceneTarget::Peel,
+        );
         // Inject the host-side layer bound into WGSL so texture allocation and shader
         // traversal cannot silently diverge. post.quality.x may request fewer layers,
         // but the shader clamps it to this allocation bound.
@@ -395,12 +397,8 @@ impl DepthOfField {
             shade_bindings,
             shade_pipeline: post.dof_shade_pipeline.clone(),
             _mask: mask,
-            first_geometry_pipeline,
-            first_cartoon_pipeline,
-            first_toon_pipeline,
-            geometry_pipeline,
-            cartoon_pipeline,
-            toon_pipeline,
+            first_pipelines,
+            peel_pipelines,
             peel_bindings,
             stages,
         }
@@ -587,6 +585,7 @@ pub(super) fn scene_shader(device: &wgpu::Device, source: &str) -> wgpu::ShaderM
             [
                 include_str!("optics.wgsl"),
                 include_str!("peel.wgsl"),
+                include_str!("scene_common.wgsl"),
                 source,
             ]
             .concat(),

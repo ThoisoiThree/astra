@@ -104,6 +104,14 @@ impl UiState {
                     section(ui, "SCENE");
                     actions.save |= item(ui, "Save", "", has_structure, false);
                     actions.save_as |= item(ui, "Save as…", "", has_structure, false);
+                    ui.separator();
+                    section(ui, "IMAGE");
+                    if item(ui, "Export image…", "", has_structure, false) {
+                        self.open_export();
+                    }
+                });
+                ui.menu_button("Structure", |ui| {
+                    self.structure_menu(ui, info, actions);
                 });
                 ui.menu_button("Mode", |ui| {
                     section(ui, "REPRESENTATION");
@@ -193,5 +201,84 @@ impl UiState {
                     }
                 }
             });
+    }
+}
+
+impl UiState {
+    fn structure_menu(&mut self, ui: &mut egui::Ui, info: UiInfo<'_>, actions: &mut UiActions) {
+        let Some(molecule) = info.molecule else {
+            section(ui, "STRUCTURE");
+            ui.weak("     Open a structure first");
+            return;
+        };
+        let structure = &molecule.info;
+        section(ui, "BIOLOGICAL ASSEMBLY");
+        if structure.assemblies.is_empty() {
+            ui.weak("     The file defines no assemblies");
+        }
+        for assembly in &structure.assemblies {
+            let label = format!(
+                "{} · {} chain copies",
+                assembly.label(),
+                assembly.copy_count()
+            );
+            if item(ui, &label, "", true, false) {
+                actions.structure_request = Some(StructureRequest::Assembly(assembly.id.clone()));
+            }
+        }
+        ui.separator();
+        section(ui, "CRYSTAL");
+        let crystal = structure
+            .crystal
+            .as_ref()
+            .filter(|crystal| crystal.cell.is_crystallographic());
+        let label = crystal.map_or_else(
+            || "No crystallographic cell".to_string(),
+            |crystal| {
+                format!(
+                    "{} · {:.1} {:.1} {:.1} Å",
+                    crystal.space_group, crystal.cell.a, crystal.cell.b, crystal.cell.c
+                )
+            },
+        );
+        ui.weak(format!("     {label}"));
+        if item(ui, "Unit cell", "", crystal.is_some(), false) {
+            actions.structure_request = Some(StructureRequest::UnitCell);
+        }
+        if item(
+            ui,
+            "Symmetry mates within 10 Å",
+            "",
+            crystal.is_some(),
+            false,
+        ) {
+            actions.structure_request = Some(StructureRequest::SymmetryMates(10.0));
+        }
+        if item(
+            ui,
+            "Symmetry mates within 20 Å",
+            "",
+            crystal.is_some(),
+            false,
+        ) {
+            actions.structure_request = Some(StructureRequest::SymmetryMates(20.0));
+        }
+        ui.separator();
+        section(ui, "SECONDARY STRUCTURE");
+        if let Some(display) = info.display {
+            for source in astra::molecule::SecondarySource::ALL {
+                let available = source != astra::molecule::SecondarySource::File
+                    || !structure.secondary.is_empty();
+                if item(
+                    ui,
+                    source.label(),
+                    "",
+                    available,
+                    display.secondary_source == source,
+                ) {
+                    actions.manager = Some(ManagerAction::SetSecondarySource(source));
+                }
+            }
+        }
     }
 }

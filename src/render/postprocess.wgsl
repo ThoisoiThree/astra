@@ -12,6 +12,8 @@ var filtered_ao: texture_2d<f32>;
 var semantic_ids: texture_2d<u32>;
 @group(0) @binding(6)
 var dof_color: texture_2d<f32>;
+@group(0) @binding(7)
+var overlay: texture_2d<f32>;
 
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
@@ -113,14 +115,21 @@ fn semantic_at(pixel: vec2<i32>, dimensions: vec2<u32>) -> vec2<u32> {
     ).xy;
 }
 
+fn render_scale() -> f32 {
+    return max(post.output.x, 1.0);
+}
+
 fn toon_outline(pixel: vec2<i32>, dimensions: vec2<u32>) -> f32 {
     let center = semantic_at(pixel, dimensions);
     let dimensions_f = vec2<f32>(dimensions);
     let center_depth = textureLoad(scene_depth, pixel, 0);
     let center_uv = (vec2<f32>(pixel) + 0.5) / dimensions_f;
+    // Contour widths are defined in output pixels; supersampled scenes scale them up.
+    let scale = render_scale();
+    let reach = i32(ceil(2.0 * scale));
     var opacity = 0.0;
-    for (var y: i32 = -2; y <= 2; y += 1) {
-        for (var x: i32 = -2; x <= 2; x += 1) {
+    for (var y: i32 = -reach; y <= reach; y += 1) {
+        for (var x: i32 = -reach; x <= reach; x += 1) {
             if x == 0 && y == 0 {
                 continue;
             }
@@ -173,7 +182,7 @@ fn toon_outline(pixel: vec2<i32>, dimensions: vec2<u32>) -> f32 {
                 }
             }
             if radius > 0.0 {
-                let sample_distance = length(vec2<f32>(f32(x), f32(y)));
+                let sample_distance = length(vec2<f32>(f32(x), f32(y))) / scale;
                 let sample_opacity = edge_strength
                     * (1.0 - smoothstep(radius * 0.72, radius, sample_distance));
                 opacity = max(opacity, sample_opacity);
@@ -209,18 +218,64 @@ fn dof_shade(input: VertexOutput) -> @location(0) vec4<f32> {
     return compose_toon(color, ao, pixel, dimensions);
 }
 
+// Premultiplied alpha: an opaque background keeps alpha 1, a transparent export keeps the
+// coverage of the molecule so edges composite cleanly.
+fn premultiply(color: vec4<f32>) -> vec4<f32> {
+    return vec4<f32>(color.rgb * color.a, color.a);
+}
+
+fn over(top: vec4<f32>, bottom: vec4<f32>) -> vec4<f32> {
+    return top + bottom * (1.0 - top.a);
+}
+
+fn compose_scene_sample(pixel: vec2<i32>, dimensions_u: vec2<u32>, fxaa: bool) -> vec4<f32> {
+    let dimensions = vec2<f32>(dimensions_u);
+    var color = textureLoad(scene_color, pixel, 0);
+    if fxaa {
+        let uv = (vec2<f32>(pixel) + 0.5) / dimensions;
+        color = antialiased_scene(scene_color, uv, dimensions);
+    }
+    let ao = select(1.0, textureLoad(filtered_ao, pixel, 0).r, post.ao.w > 0.5);
+    let composed = premultiply(compose_toon(color, ao, pixel, dimensions_u));
+    let annotation = textureLoad(overlay, pixel, 0);
+    return over(annotation, composed);
+}
+
 @fragment
 fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let dimensions_u = textureDimensions(scene_color);
     let dimensions = vec2<f32>(dimensions_u);
-    let pixel = vec2<i32>(clamp(input.position.xy, vec2<f32>(0.0), dimensions - 1.0));
-    let uv = input.position.xy / dimensions;
+    let scale = i32(round(render_scale()));
+    // Output pixel in the (possibly smaller) composed image.
+    let output_pixel = vec2<i32>(floor(input.position.xy));
     if post.lens.w >= 0.5 && post.lens.z > 0.0 {
         // Rasterized in-focus splats still need edge antialiasing. Apply it to
         // the accumulated image, so color filtering cannot corrupt peel depths.
-        return antialiased_scene(dof_color, uv, vec2<f32>(textureDimensions(dof_color)));
+        let uv = (vec2<f32>(output_pixel * scale) + 0.5 * f32(scale)) / dimensions;
+        var blurred = antialiased_scene(dof_color, uv, vec2<f32>(textureDimensions(dof_color)));
+        blurred.a = 1.0;
+        let scene_pixel = clamp(
+            output_pixel * scale + vec2<i32>(scale / 2),
+            vec2<i32>(0),
+            vec2<i32>(dimensions_u) - 1,
+        );
+        return over(textureLoad(overlay, scene_pixel, 0), blurred);
     }
-    let resolved = antialiased_scene(scene_color, uv, dimensions);
-    let ao = select(1.0, textureLoad(filtered_ao, pixel, 0).r, post.ao.w > 0.5);
-    return compose_toon(resolved, ao, pixel, dimensions_u);
+    if scale <= 1 {
+        let pixel = clamp(output_pixel, vec2<i32>(0), vec2<i32>(dimensions_u) - 1);
+        return compose_scene_sample(pixel, dimensions_u, post.output.z > 0.5);
+    }
+    // Supersampling: box-filter the scale x scale scene samples of this output pixel.
+    var accumulated = vec4<f32>(0.0);
+    for (var y: i32 = 0; y < scale; y += 1) {
+        for (var x: i32 = 0; x < scale; x += 1) {
+            let pixel = clamp(
+                output_pixel * scale + vec2<i32>(x, y),
+                vec2<i32>(0),
+                vec2<i32>(dimensions_u) - 1,
+            );
+            accumulated += compose_scene_sample(pixel, dimensions_u, false);
+        }
+    }
+    return accumulated / f32(scale * scale);
 }
