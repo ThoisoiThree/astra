@@ -20,12 +20,14 @@ mod info;
 mod menu;
 mod mode;
 mod panels;
+mod representations;
 mod selections;
 
 use actions::*;
 use camera::*;
 use hierarchy::*;
 use mode::*;
+pub use representations::RepresentationScope;
 use selections::*;
 
 #[derive(Debug, Default)]
@@ -63,6 +65,8 @@ pub struct UiState {
     focus_atom_serial: String,
     export_open: bool,
     export: ExportForm,
+    representations_open: bool,
+    surface_draft: Option<astra::surface::SurfaceSettings>,
 }
 
 /// Settings of the image export window, kept between exports.
@@ -266,6 +270,13 @@ pub enum ManagerAction {
     SetColoringMode(ColoringMode),
     SetGlobalMode(DisplayMode),
     SetBondOrders(bool),
+    SetSurfaceSettings(astra::surface::SurfaceSettings),
+    SetLabelSettings(astra::labels::LabelSettings),
+    SetRepresentation {
+        representation: astra::RepresentationMask,
+        scope: RepresentationScope,
+        shown: bool,
+    },
     SetSecondarySource(astra::molecule::SecondarySource),
     SetAmbientOcclusion(AmbientOcclusionSettings),
     SetUniformColor(DisplayColor),
@@ -427,6 +438,8 @@ pub struct UiInfo<'a> {
     /// Molecular viewport size in physical pixels.
     pub viewport_pixels: [u32; 2],
     pub max_texture_dimension: u32,
+    /// Labels of the active document in molecular coordinates.
+    pub labels: &'a [astra::labels::LabelItem],
 }
 
 impl UiState {
@@ -531,11 +544,22 @@ impl UiState {
                 });
         }
         let viewport = root.available_rect_before_wrap();
+        if let Some(display) = info.display {
+            astra::labels::paint_labels(
+                root.painter(),
+                viewport,
+                info.camera.view_projection(),
+                info.labels,
+                &display.labels,
+                1.0,
+            );
+        }
         measurement_labels(root.painter(), viewport, info);
         if self.performance_overlay {
             performance_overlay(root.ctx(), viewport, info.render_stats);
         }
         self.mode_window(root.ctx(), info, &mut actions);
+        self.representations_window(root.ctx(), info, &mut actions);
         self.coloring_window(root.ctx(), info, &mut actions);
         self.camera_window(root.ctx(), info, &mut actions);
         self.actions_window(root.ctx(), info, &mut actions);

@@ -23,6 +23,8 @@ Batch rendering (renders STRUCTURE and exits):
   --dpi N                  resolution recorded in the PNG (default 300)
   --mode MODE              cartoon, ball-and-stick, licorice, spacefill or toon
   --assembly ID            render biological assembly ID instead of the file's model
+  --command CMD            run an Astra command before rendering; repeatable, for example
+                           --command \"show surface, protein\" --command \"show labels, ligand\"
 
   -h, --help               show this help
   -V, --version            show the version";
@@ -39,6 +41,8 @@ pub struct BatchExport {
     pub request: ExportRequest,
     pub mode: Option<DisplayMode>,
     pub assembly: Option<String>,
+    /// Commands such as `show surface, protein`, run in order before rendering.
+    pub commands: Vec<String>,
 }
 
 pub enum Parsed {
@@ -60,6 +64,7 @@ pub fn parse(arguments: impl IntoIterator<Item = std::ffi::OsString>) -> Result<
     };
     let mut mode = None;
     let mut assembly = None;
+    let mut commands = Vec::new();
     let mut batch_option_used = false;
     let mut arguments = arguments.into_iter();
     while let Some(argument) = arguments.next() {
@@ -129,6 +134,13 @@ pub fn parse(arguments: impl IntoIterator<Item = std::ffi::OsString>) -> Result<
                 assembly = Some(value("--assembly")?);
                 batch_option_used = true;
             }
+            "--command" => {
+                let command = value("--command")?;
+                astra::command::parse_command(&command)
+                    .with_context(|| format!("invalid --command '{command}'"))?;
+                commands.push(command);
+                batch_option_used = true;
+            }
             option if option.starts_with("--") => bail!("unknown option '{option}'\n\n{USAGE}"),
             _ => {
                 if options.path.is_some() {
@@ -148,6 +160,7 @@ pub fn parse(arguments: impl IntoIterator<Item = std::ffi::OsString>) -> Result<
                 request,
                 mode,
                 assembly,
+                commands,
             });
         }
         None if batch_option_used => bail!("rendering options require --export"),
@@ -181,6 +194,8 @@ mod tests {
             "spacefill",
             "--assembly",
             "1",
+            "--command",
+            "show surface, protein",
         ])
         .unwrap();
         assert_eq!(options.path, Some(PathBuf::from("1abc.cif")));
@@ -192,6 +207,17 @@ mod tests {
         );
         assert_eq!(batch.mode, Some(DisplayMode::Spacefill));
         assert_eq!(batch.assembly.as_deref(), Some("1"));
+        assert_eq!(batch.commands, ["show surface, protein"]);
+        assert!(
+            run(&[
+                "a.pdb",
+                "--export",
+                "b.png",
+                "--command",
+                "show nothing, all"
+            ])
+            .is_err()
+        );
     }
 
     #[test]

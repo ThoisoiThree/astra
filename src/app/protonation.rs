@@ -161,6 +161,7 @@ impl Runtime {
         if let (Some(m), Some(d)) = (&self.molecule, &self.display) {
             self.renderer.update_instances(m, d);
         }
+        self.refresh_labels();
         self.renderer.update_measurements(&self.measurement_lines);
         self.needs_cartoon_refresh = false;
         self.window.request_redraw();

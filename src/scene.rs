@@ -769,6 +769,22 @@ fn display_to_wire(display: &DisplayState) -> Result<wire::DisplayV1, SceneError
             SecondarySource::Dssp => 0,
             SecondarySource::File => 1,
         },
+        surface: Some(wire::SurfaceSettings {
+            kind: display.surface.kind.code(),
+            probe_radius: display.surface.probe_radius,
+            resolution: display.surface.resolution,
+            cavities: display.surface.cavities,
+        }),
+        labels: Some(wire::LabelSettings {
+            content: display.labels.content.code(),
+            size: display.labels.size,
+            color: display
+                .labels
+                .color
+                .iter()
+                .fold(0, |value, channel| (value << 8) | u32::from(*channel)),
+            background: display.labels.background,
+        }),
     })
 }
 
@@ -784,6 +800,26 @@ fn display_from_wire(
     )?;
     let mut display = DisplayState::for_molecule(molecule);
     display.bond_orders = wire.bond_orders.unwrap_or(true);
+    if let Some(surface) = &wire.surface {
+        display.surface = crate::surface::SurfaceSettings {
+            kind: crate::surface::SurfaceKind::from_code(surface.kind)
+                .ok_or_else(|| invalid(format!("unknown surface kind {}", surface.kind)))?,
+            probe_radius: surface.probe_radius,
+            resolution: surface.resolution,
+            cavities: surface.cavities,
+        }
+        .sanitized();
+    }
+    if let Some(labels) = &wire.labels {
+        display.labels = crate::labels::LabelSettings {
+            content: crate::labels::LabelContent::from_code(labels.content)
+                .ok_or_else(|| invalid(format!("unknown label content {}", labels.content)))?,
+            size: labels.size,
+            color: [16, 8, 0].map(|shift| ((labels.color >> shift) & 0xff) as u8),
+            background: labels.background,
+        }
+        .sanitized();
+    }
     display.secondary_source = match wire.secondary_source {
         0 => SecondarySource::Dssp,
         1 => SecondarySource::File,
@@ -1372,6 +1408,35 @@ mod tests {
                 assert_eq!(restored.display.coloring_mode, coloring_mode);
             }
         }
+    }
+
+    #[test]
+    fn surface_and_label_settings_round_trip() {
+        let mut original = document();
+        original.display.surface = crate::surface::SurfaceSettings {
+            kind: crate::surface::SurfaceKind::SolventAccessible,
+            probe_radius: 1.2,
+            resolution: 0.35,
+            cavities: true,
+        };
+        original.display.labels = crate::labels::LabelSettings {
+            content: crate::labels::LabelContent::Full,
+            size: 20.0,
+            color: [0x12, 0xab, 0xef],
+            background: false,
+        };
+        original.display.set_representation(
+            [0],
+            crate::RepresentationMask::SURFACE | crate::RepresentationMask::LABEL,
+            true,
+        );
+        let restored = decode(&encode(&original).unwrap()).unwrap();
+        assert_eq!(restored.display.surface, original.display.surface);
+        assert_eq!(restored.display.labels, original.display.labels);
+        assert_eq!(
+            restored.display.representations[0],
+            original.display.representations[0]
+        );
     }
 
     #[test]

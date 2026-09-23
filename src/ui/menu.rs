@@ -141,6 +141,9 @@ impl UiState {
                     if item(ui, "Render settings…", "", has_structure, false) {
                         self.mode_open = true;
                     }
+                    if item(ui, "Surface & labels…", "", has_structure, false) {
+                        self.representations_open = true;
+                    }
                 });
                 ui.menu_button("Coloring", |ui| {
                     section(ui, "COLOR SCHEME");

@@ -713,16 +713,27 @@ pub(super) fn background_worker(
                 let result = if cancel.load(Ordering::Relaxed) {
                     Ok(JobOutput::Cancelled)
                 } else {
-                    let prepared = prepare_cartoon_cached(
+                    let has_surface = display.has_representation(RepresentationMask::SURFACE);
+                    if has_surface {
+                        send_job_progress(
+                            &events,
+                            &window,
+                            id,
+                            "Building ribbons and molecular surface",
+                            0.3,
+                        );
+                    }
+                    match prepare_cartoon_cached(
                         &molecule,
                         &display,
                         &hierarchy,
                         &secondary_structure,
-                    );
-                    if cancel.load(Ordering::Relaxed) {
-                        Ok(JobOutput::Cancelled)
-                    } else {
-                        Ok(JobOutput::Cartoon(prepared))
+                        &cancel,
+                    ) {
+                        Some(prepared) if !cancel.load(Ordering::Relaxed) => {
+                            Ok(JobOutput::Cartoon(prepared))
+                        }
+                        _ => Ok(JobOutput::Cancelled),
                     }
                 };
                 (id, result)

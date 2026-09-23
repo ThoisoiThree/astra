@@ -298,8 +298,8 @@ number of atoms.
 select <expression>
 select <name>: <expression>
 color <name-or-#RRGGBB>, <expression>
-show spheres|sticks, <expression>
-hide spheres|sticks, <expression>
+show spheres|sticks|surface|labels, <expression>
+hide spheres|sticks|surface|labels, <expression>
 ```
 
 For example:
@@ -313,6 +313,44 @@ hide spheres, element H
 
 Named colors include red, green, blue, yellow, orange, magenta, cyan, white, and
 gray/grey. Syntax errors include the position of the invalid input.
+
+### Molecular surfaces and labels
+
+`show surface, protein` wraps the chosen atoms in a molecular surface colored by
+the nearest atom, so coloring, selection highlighting and picking work on it.
+**View → Surface & labels…** selects the surface type and quality:
+
+- **Solvent excluded** (default): the Connolly surface a 1.4 Å probe touches,
+  with smooth reentrant patches in crevices.
+- **Solvent accessible**: the surface traced by the probe center.
+- **van der Waals**: the union of atomic spheres.
+
+The probe radius, grid spacing and internal cavities are adjustable. Surfaces
+are built on a background thread and cached, so color and selection edits do not
+rebuild them. A 17 000-atom nucleosome takes about 1.5 s at 0.5 Å on four
+cores; very large structures coarsen the grid automatically to bound memory.
+
+`show labels, byres within 4 of ligand` labels residues (or atom names, full
+chain/residue/atom paths, or elements). Labels have adjustable size, color and
+background and appear in exported images at the same relative size.
+
+## Image export
+
+**File → Export image…** renders the current view offscreen at any size up to
+the GPU texture limit, with 1–4× supersampling, a viewport, white, black or
+transparent background, and the DPI recorded in the PNG.
+
+The same renderer runs from the command line without showing a window:
+
+```text
+astra 1hvr.pdb --export figure.png --size 2400x1800 --supersampling 3 \
+      --background white --command "show surface, protein" \
+      --command "show labels, byres around 4 of ligand and name CA"
+```
+
+`--mode` sets the display mode, `--assembly ID` renders a biological assembly,
+and each `--command` runs an ordinary Astra command before rendering.
+`astra --help` lists every option.
 
 ## Measurements and interaction analysis
 

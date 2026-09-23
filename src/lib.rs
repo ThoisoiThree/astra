@@ -3,6 +3,7 @@ pub mod camera;
 pub mod command;
 pub mod diagnostics;
 pub mod image_export;
+pub mod labels;
 pub mod measurement;
 pub mod molecule;
 pub mod paths;
@@ -10,6 +11,7 @@ pub mod picking;
 pub mod render;
 pub mod scene;
 pub mod selection;
+pub mod surface;
 
 use std::collections::HashMap;
 
@@ -418,6 +420,8 @@ pub struct DisplayStateData {
     ambient_occlusion_customized: bool,
     bond_orders: bool,
     secondary_source: molecule::SecondarySource,
+    surface: surface::SurfaceSettings,
+    labels: labels::LabelSettings,
     selection: AtomMask,
     representation_overrides: HashMap<usize, RepresentationMask>,
     colors: HierarchyOverrides<DisplayColor>,
@@ -500,6 +504,10 @@ pub struct DisplayState {
     pub bond_orders: bool,
     /// Source of secondary structure for ribbons and coloring.
     pub secondary_source: molecule::SecondarySource,
+    /// Molecular surface drawn over atoms with the surface representation.
+    pub surface: surface::SurfaceSettings,
+    /// Text labels drawn at atoms with the label representation.
+    pub labels: labels::LabelSettings,
     base_colors: Vec<DisplayColor>,
     named_colors: Vec<Option<DisplayColor>>,
     named_visibility: Vec<VisibilityOverride>,
@@ -530,6 +538,8 @@ impl DisplayState {
             ambient_occlusion_customized: false,
             bond_orders: true,
             secondary_source: molecule::SecondarySource::default(),
+            surface: surface::SurfaceSettings::default(),
+            labels: labels::LabelSettings::default(),
             base_colors,
             named_colors: vec![None; atom_count],
             named_visibility: vec![VisibilityOverride::Inherit; atom_count],
@@ -552,6 +562,8 @@ impl DisplayState {
             ambient_occlusion_customized: self.ambient_occlusion_customized,
             bond_orders: self.bond_orders,
             secondary_source: self.secondary_source,
+            surface: self.surface,
+            labels: self.labels,
             selection: self.selection.clone(),
             representation_overrides: self.representation_overrides.clone(),
             colors: self.hierarchy_colors.clone(),
@@ -568,6 +580,8 @@ impl DisplayState {
         self.ambient_occlusion_customized = state.ambient_occlusion_customized;
         self.bond_orders = state.bond_orders;
         self.secondary_source = state.secondary_source;
+        self.surface = state.surface;
+        self.labels = state.labels;
         self.selection = state.selection;
         self.representation_overrides = state.representation_overrides;
         self.hierarchy_colors = state.colors;
@@ -619,6 +633,34 @@ impl DisplayState {
             );
             self.representations[index] = value;
         }
+    }
+
+    /// Spheres of the visible atoms that carry the surface representation.
+    pub fn surface_spheres(&self, molecule: &Molecule) -> Vec<surface::SurfaceSphere> {
+        molecule
+            .atoms
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| {
+                self.visible.contains(*index)
+                    && self
+                        .representations
+                        .get(*index)
+                        .is_some_and(|mask| mask.contains(RepresentationMask::SURFACE))
+            })
+            .map(|(index, atom)| surface::SurfaceSphere {
+                center: atom.position,
+                radius: atom.element.van_der_waals_radius(),
+                atom: index as u32,
+            })
+            .collect()
+    }
+
+    pub fn has_representation(&self, representation: RepresentationMask) -> bool {
+        self.representations
+            .iter()
+            .enumerate()
+            .any(|(index, mask)| mask.contains(representation) && self.visible.contains(index))
     }
 
     pub fn load_representations(&mut self, values: Vec<RepresentationMask>) {

@@ -134,6 +134,26 @@ message Display {
   optional bool bond_orders = 33;
   // 0 DSSP, 1 deposited annotations.
   uint32 secondary_source = 34;
+  // Absent means the defaults.
+  SurfaceSettings surface = 35;
+  LabelSettings labels = 36;
+}
+
+message SurfaceSettings {
+  // 0 solvent excluded, 1 solvent accessible, 2 van der Waals.
+  uint32 kind = 1;
+  float probe_radius = 2;
+  float resolution = 3;
+  bool cavities = 4;
+}
+
+message LabelSettings {
+  // 0 residue, 1 atom name, 2 chain/residue/atom, 3 element.
+  uint32 content = 1;
+  float size = 2;
+  // sRGB as 0xRRGGBB.
+  uint32 color = 3;
+  bool background = 4;
 }
 
 message AmbientOcclusion {

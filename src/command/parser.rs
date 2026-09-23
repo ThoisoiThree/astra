@@ -6,6 +6,8 @@ use crate::selection::{SelectionExpr, SelectionParseError, parse_selection};
 pub enum Representation {
     Spheres,
     Sticks,
+    Surface,
+    Labels,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -43,7 +45,7 @@ pub enum CommandError {
         command: &'static str,
         usage: &'static str,
     },
-    #[error("unknown representation '{0}'; expected spheres or sticks")]
+    #[error("unknown representation '{0}'; expected spheres, sticks, surface, or labels")]
     UnknownRepresentation(String),
     #[error("invalid color '{0}'; use a name such as red or #RRGGBB")]
     InvalidColor(String),
@@ -175,6 +177,8 @@ fn parse_representation(value: &str) -> Result<Representation, CommandError> {
     match value.to_ascii_lowercase().as_str() {
         "spheres" => Ok(Representation::Spheres),
         "sticks" => Ok(Representation::Sticks),
+        "surface" => Ok(Representation::Surface),
+        "labels" | "label" => Ok(Representation::Labels),
         _ => Err(CommandError::UnknownRepresentation(value.to_string())),
     }
 }
@@ -292,6 +296,31 @@ mod tests {
                 selection: SelectionExpr::Element(Element::H),
             }
         );
+    }
+
+    #[test]
+    fn parses_surface_and_label_representations() {
+        assert_eq!(
+            parse_command("show surface, protein").unwrap(),
+            Command::Show {
+                representation: Representation::Surface,
+                selection: SelectionExpr::Protein,
+            }
+        );
+        assert_eq!(
+            parse_command("hide labels, all").unwrap(),
+            Command::Hide {
+                representation: Representation::Labels,
+                selection: SelectionExpr::All,
+            }
+        );
+        assert!(matches!(
+            parse_command("show label, byres within 4 of ligand").unwrap(),
+            Command::Show {
+                representation: Representation::Labels,
+                selection: SelectionExpr::ByResidue(_),
+            }
+        ));
     }
 
     #[test]

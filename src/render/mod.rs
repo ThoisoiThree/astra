@@ -14,6 +14,7 @@ mod viewport_cache;
 pub use renderer::{
     ExportBackground, ImageExport, MAX_RENDER_SCALE, PreparedCartoon, RenderError, RenderStats,
     RenderedImage, Renderer, SurfaceIssue, prepare_cartoon, prepare_cartoon_cached,
+    prepare_surface,
 };
 
 #[cfg(test)]

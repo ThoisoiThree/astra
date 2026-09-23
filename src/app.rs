@@ -76,7 +76,8 @@ static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 use crate::ui::{
     CameraUpdate, CloseAction, FocusRequest, HierarchySelectionGesture, InspectionTarget,
-    ManagerAction, PivotRequest, RecoveryAction, SessionTab, UiActions, UiInfo, UiState,
+    ManagerAction, PivotRequest, RecoveryAction, RepresentationScope, SessionTab, UiActions,
+    UiInfo, UiState,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -146,6 +147,7 @@ impl Runtime {
             named_selection_styles: BTreeMap::new(),
             named_selection_statuses: BTreeMap::new(),
             measurement_lines: Vec::new(),
+            label_items: Vec::new(),
             next_measurement_id: 1,
             hierarchy_names: BTreeMap::new(),
             inspection: None,
@@ -404,6 +406,7 @@ impl Runtime {
             named_selection_styles: &self.named_selection_styles,
             named_selection_statuses: &self.named_selection_statuses,
             measurement_lines: &self.measurement_lines,
+            labels: &self.label_items,
             hierarchy_names: &self.hierarchy_names,
             inspection: self.inspection,
             hierarchy_selection: &self.hierarchy_selection,
@@ -829,6 +832,7 @@ impl Runtime {
             let display = DisplayState::for_molecule(&molecule);
             self.renderer.update_instances(&molecule, &display);
         }
+        self.refresh_labels();
         self.renderer.update_measurements(&self.measurement_lines);
         self.ui.document_changed();
         self.ui.latest_error = None;
@@ -836,6 +840,7 @@ impl Runtime {
 
     /// Empties the active tab's document before a new structure is loaded into it.
     fn clear_active_document(&mut self) {
+        self.label_items.clear();
         self.molecule = None;
         self.hierarchy = None;
         self.secondary_structure = None;
@@ -964,6 +969,7 @@ impl Runtime {
                             {
                                 self.renderer
                                     .update_prepared_cartoon(molecule, display, prepared);
+                                self.refresh_labels();
                             }
                         }
                         Ok(JobOutput::Protonated(prepared)) => {
@@ -1571,6 +1577,7 @@ impl Runtime {
             if let (Some(m), Some(d)) = (&self.molecule, &self.display) {
                 self.renderer.update_instances(m, d);
             }
+            self.refresh_labels();
             self.needs_cartoon_refresh = false;
         }
         self.renderer.update_measurements(&self.measurement_lines);

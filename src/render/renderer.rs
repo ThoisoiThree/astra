@@ -1,5 +1,9 @@
 use std::{
-    sync::{Arc, mpsc},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     time::Instant,
 };
 
@@ -17,6 +21,7 @@ use crate::{
     diagnostics::StartupTrace,
     measurement::MeasurementLine,
     molecule::{Molecule, MoleculeHierarchy, SecondaryStructure},
+    surface::{SurfaceMesh, compute_surface_cached},
 };
 
 #[cfg(test)]
@@ -275,6 +280,7 @@ pub struct Renderer {
     bond_count: u32,
     cartoon_index_count: u32,
     surface_index_count: u32,
+    surface_mesh: Arc<SurfaceMesh>,
     measurement_instance_count: u32,
     cartoon_data: CartoonRenderData,
     frame: FrameTargets,
@@ -288,24 +294,49 @@ pub struct Renderer {
     cpu_stages_ms: [f32; 5],
 }
 
-pub struct PreparedCartoon(CartoonRenderData);
-
-pub fn prepare_cartoon(molecule: &Molecule, display: &DisplayState) -> PreparedCartoon {
-    PreparedCartoon(cartoon_render_data(molecule, display))
+/// Geometry built off the render thread: ribbons, bases and the molecular surface.
+pub struct PreparedCartoon {
+    cartoon: CartoonRenderData,
+    surface: Arc<SurfaceMesh>,
 }
 
+pub fn prepare_cartoon(molecule: &Molecule, display: &DisplayState) -> PreparedCartoon {
+    PreparedCartoon {
+        cartoon: cartoon_render_data(molecule, display),
+        surface: prepare_surface(molecule, display, &AtomicBool::new(false)).unwrap_or_default(),
+    }
+}
+
+/// Like [`prepare_cartoon`], reusing cached ribbons and surfaces; `None` if cancelled.
 pub fn prepare_cartoon_cached(
     molecule: &Molecule,
     display: &DisplayState,
     hierarchy: &MoleculeHierarchy,
     secondary_structure: &[Vec<SecondaryStructure>],
-) -> PreparedCartoon {
-    PreparedCartoon(cartoon_render_data_cached(
-        molecule,
-        display,
-        hierarchy,
-        secondary_structure,
-    ))
+    cancel: &AtomicBool,
+) -> Option<PreparedCartoon> {
+    let cartoon = cartoon_render_data_cached(molecule, display, hierarchy, secondary_structure);
+    if cancel.load(Ordering::Relaxed) {
+        return None;
+    }
+    Some(PreparedCartoon {
+        cartoon,
+        surface: prepare_surface(molecule, display, cancel)?,
+    })
+}
+
+/// Surface over the visible atoms with the surface representation; empty when there are
+/// none. `None` if cancelled.
+pub fn prepare_surface(
+    molecule: &Molecule,
+    display: &DisplayState,
+    cancel: &AtomicBool,
+) -> Option<Arc<SurfaceMesh>> {
+    let spheres = display.surface_spheres(molecule);
+    if spheres.is_empty() {
+        return Some(Arc::default());
+    }
+    compute_surface_cached(&spheres, &display.surface, cancel)
 }
 
 fn scene_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
@@ -529,6 +560,7 @@ impl Renderer {
             bond_count: 0,
             cartoon_index_count: 0,
             surface_index_count: 0,
+            surface_mesh: Arc::default(),
             measurement_instance_count: 0,
             cartoon_data: CartoonRenderData::default(),
             frame,
@@ -703,8 +735,9 @@ impl Renderer {
         display: &DisplayState,
         prepared: PreparedCartoon,
     ) {
-        self.cartoon_data = prepared.0;
+        self.cartoon_data = prepared.cartoon;
         self.upload_cartoon_geometry();
+        self.upload_surface(prepared.surface);
         self.update_atom_buffers(molecule, display, true);
     }
 
@@ -712,7 +745,8 @@ impl Renderer {
     pub fn update_cartoon_geometry(&mut self, prepared: PreparedCartoon) {
         let atomic = std::mem::take(&mut self.cartoon_data.atomic);
         let semantic_ids = std::mem::take(&mut self.cartoon_data.semantic_ids);
-        self.cartoon_data = prepared.0;
+        self.cartoon_data = prepared.cartoon;
+        self.upload_surface(prepared.surface);
         // The ribbon/atomic split and semantic ids depend only on the topology.
         if self.cartoon_data.atomic.len() != atomic.len() {
             self.cartoon_data.atomic = atomic;
@@ -749,25 +783,24 @@ impl Renderer {
         self.viewport_cache.revision.invalidate();
     }
 
-    /// Replaces the molecular surface mesh; empty slices remove it.
-    pub fn update_surface(
-        &mut self,
-        positions: &[Vec3],
-        normals: &[Vec3],
-        atoms: &[u32],
-        indices: &[u32],
-    ) {
-        let vertices: Vec<MeshVertex> = positions
+    /// Replaces the molecular surface mesh unless it is the one already uploaded.
+    fn upload_surface(&mut self, surface: Arc<SurfaceMesh>) {
+        if Arc::ptr_eq(&surface, &self.surface_mesh) {
+            return;
+        }
+        let vertices: Vec<MeshVertex> = surface
+            .positions
             .iter()
-            .zip(normals)
-            .zip(atoms)
+            .zip(&surface.normals)
+            .zip(&surface.atoms)
             .map(|((position, normal), atom)| MeshVertex::new(*position, *normal, *atom as usize))
             .collect();
         self.surface_vertices
             .write(&self.device, &self.queue, &vertices);
         self.surface_indices
-            .write(&self.device, &self.queue, indices);
-        self.surface_index_count = indices.len() as u32;
+            .write(&self.device, &self.queue, &surface.indices);
+        self.surface_index_count = surface.indices.len() as u32;
+        self.surface_mesh = surface;
         self.viewport_cache.revision.invalidate();
     }
 

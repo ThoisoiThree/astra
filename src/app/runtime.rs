@@ -119,6 +119,8 @@ pub(super) struct Runtime {
     pub(super) named_selection_styles: BTreeMap<String, NamedSelectionStyle>,
     pub(super) named_selection_statuses: BTreeMap<String, SelectionStatus>,
     pub(super) measurement_lines: Vec<MeasurementLine>,
+    /// Derived from the display state; refreshed whenever geometry is rebuilt.
+    pub(super) label_items: Vec<astra::labels::LabelItem>,
     pub(super) next_measurement_id: u64,
     pub(super) hierarchy_names: BTreeMap<InspectionTarget, String>,
     pub(super) inspection: Option<InspectionTarget>,

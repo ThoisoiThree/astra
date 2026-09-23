@@ -38,10 +38,32 @@ impl Runtime {
         if self.molecule.is_none() {
             anyhow::bail!("open a structure before exporting an image");
         }
-        let image = self
+        let mut image = self
             .renderer
             .render_image(&self.camera, self.display.as_ref(), &request.image)
             .context("could not render the image")?;
+        if let Some(display) = &self.display
+            && !self.label_items.is_empty()
+        {
+            // Labels keep the size they have relative to the viewport height.
+            let points_high = self.viewport.height / self.window.scale_factor() as f32;
+            let scale = if points_high > 1.0 {
+                image.height as f32 / points_high
+            } else {
+                1.0
+            };
+            let mut camera = self.camera.clone();
+            camera.aspect = image.width as f32 / image.height as f32;
+            astra::labels::draw_labels_on_image(
+                &mut image.rgba,
+                image.width,
+                image.height,
+                camera.view_projection(),
+                &self.label_items,
+                &display.labels,
+                scale,
+            );
+        }
         if image.supersampling < request.image.supersampling {
             log::info!(
                 "Export supersampling reduced from {}× to {}× by the GPU texture limit",
@@ -169,9 +191,19 @@ impl Runtime {
             }
             BatchStage::Deriving => {
                 let mode = batch.export.mode;
+                let commands = batch.export.commands.clone();
                 self.set_batch_stage(BatchStage::Configuring);
                 if let Some(mode) = mode {
                     self.handle_manager_action(crate::ui::ManagerAction::SetGlobalMode(mode));
+                }
+                for command in commands {
+                    let result = astra::command::parse_command(&command)
+                        .map_err(anyhow::Error::from)
+                        .and_then(|parsed| self.apply_command(parsed));
+                    if let Err(error) = result {
+                        self.finish_batch(Err(format!("command '{command}' failed: {error:#}")));
+                        return;
+                    }
                 }
             }
             BatchStage::Configuring => self.set_batch_stage(BatchStage::Rendering),

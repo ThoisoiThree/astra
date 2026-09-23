@@ -321,6 +321,37 @@ impl Runtime {
                 }
                 self.rebuild_named_display_layers();
             }
+            ManagerAction::SetSurfaceSettings(settings) => {
+                if let Some(display) = &mut self.display {
+                    display.surface = settings.sanitized();
+                }
+                self.refresh_instances();
+            }
+            ManagerAction::SetLabelSettings(settings) => {
+                if let Some(display) = &mut self.display {
+                    display.labels = settings.sanitized();
+                }
+                self.refresh_labels();
+                self.window.request_redraw();
+            }
+            ManagerAction::SetRepresentation {
+                representation,
+                scope,
+                shown,
+            } => {
+                if let Some(display) = &mut self.display {
+                    let indices: Vec<usize> = match scope {
+                        RepresentationScope::Selection => display.selection.indices().collect(),
+                        RepresentationScope::All => (0..display.representations.len()).collect(),
+                    };
+                    if indices.is_empty() {
+                        self.ui.latest_error = Some("select atoms first".into());
+                    } else {
+                        display.set_representation(indices, representation, shown);
+                        self.refresh_instances();
+                    }
+                }
+            }
             ManagerAction::SetBondOrders(enabled) => {
                 if let Some(display) = &mut self.display {
                     display.bond_orders = enabled;
@@ -899,6 +930,14 @@ impl Runtime {
         }
     }
 
+    /// Recomputes label anchors and text after display or coordinate changes.
+    pub(super) fn refresh_labels(&mut self) {
+        self.label_items = match (&self.molecule, &self.display) {
+            (Some(molecule), Some(display)) => astra::labels::label_items(molecule, display),
+            _ => Vec::new(),
+        };
+    }
+
     pub(super) fn refresh_instances(&mut self) {
         self.needs_cartoon_refresh = true;
         self.renderer.update_measurements(&self.measurement_lines);
@@ -1038,6 +1077,8 @@ pub(super) fn representation_mask(representation: Representation) -> Representat
     match representation {
         Representation::Spheres => RepresentationMask::SPHERES,
         Representation::Sticks => RepresentationMask::STICKS,
+        Representation::Surface => RepresentationMask::SURFACE,
+        Representation::Labels => RepresentationMask::LABEL,
     }
 }
 
